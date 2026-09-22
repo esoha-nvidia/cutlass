@@ -551,7 +551,9 @@ int main(int argc, const char *arg[]) {
   //
 
   // GEMM problem dimensions.
-  int problem[3] = { 128, 128, 128 };
+  // CUTLASS threadblock tile is 128x128x8, so a 128^3 problem launches 1 CTA.
+  // 4096x4096 uses a 32x32 grid (1024 CTAs). K does not change CTA count.
+  int problem[3] = { 4096, 4096, 1024 };
 
   for (int i = 1; i < argc && i < 4; ++i) {
     std::stringstream ss(arg[i]);
@@ -569,6 +571,13 @@ int main(int argc, const char *arg[]) {
   //
   // Run the CUTLASS GEMM test.
   //
+
+  std::cout << "Running GEMM: M=" << problem[0]
+            << " N=" << problem[1]
+            << " K=" << problem[2]
+            << " (CUTLASS tile 128x128 => "
+            << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
+            << " CTAs)" << std::endl;
 
   cudaError_t result = TestCutlassGemm(
     problem[0],     // GEMM M dimension

@@ -58,6 +58,9 @@
 #include <sstream>
 #include <vector>
 
+#include <cublas_v2.h>
+#include <nvtx3/nvToolsExt.h>
+
 // Helper methods to check for errors
 #include "helper.h"
 
@@ -129,8 +132,11 @@ cudaError_t CutlassSgemmNN(
   //
   // Launch the CUTLASS GEMM kernel.
   //
-  
+
+  nvtxRangePushA("cutlass_gemm");
   cutlass::Status status = gemm_operator(args);
+  cudaError_t sync_status = cudaDeviceSynchronize();
+  nvtxRangePop();
 
   //
   // Return a cudaError_t if the CUTLASS GEMM operator returned an error code.
@@ -140,8 +146,54 @@ cudaError_t CutlassSgemmNN(
     return cudaErrorUnknown;
   }
 
-  // Return success, if no errors were encountered.
-  return cudaSuccess;
+  return sync_status;
+}
+
+/// Column-major SGEMM via cuBLAS. NVTX covers only the GEMM launch.
+cudaError_t CublasSgemmNN(
+  int M,
+  int N,
+  int K,
+  float alpha,
+  float const *A,
+  int lda,
+  float const *B,
+  int ldb,
+  float beta,
+  float *C,
+  int ldc) {
+
+  cublasHandle_t handle;
+  cublasStatus_t status = cublasCreate(&handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+
+  nvtxRangePushA("cublas_gemm");
+  status = cublasSgemm(
+    handle,
+    CUBLAS_OP_N,
+    CUBLAS_OP_N,
+    M,
+    N,
+    K,
+    &alpha,
+    A,
+    lda,
+    B,
+    ldb,
+    &beta,
+    C,
+    ldc);
+  cudaError_t sync_status = cudaDeviceSynchronize();
+  nvtxRangePop();
+
+  cublasDestroy(handle);
+
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+  return sync_status;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -275,8 +327,14 @@ cudaError_t ReferenceGemm(
     (N + block.y - 1) / block.y
   );
 
+  nvtxRangePushA("reference_gemm");
   ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+  cudaError_t sync_status = cudaDeviceSynchronize();
+  nvtxRangePop();
 
+  if (sync_status != cudaSuccess) {
+    return sync_status;
+  }
   return cudaGetLastError();
 }
 
@@ -343,6 +401,40 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
 
   if (result != cudaSuccess) {
     std::cerr << "Failed to copy C_cutlass matrix to C_reference: "
+      << cudaGetErrorString(result) << std::endl;
+
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
+
+    return result;
+  }
+
+  //
+  // Launch cuBLAS GEMM (NVTX range "cublas_gemm" is inside CublasSgemmNN).
+  //
+
+  result = CublasSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+
+  if (result != cudaSuccess) {
+    std::cerr << "cuBLAS GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
+
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
+
+    return result;
+  }
+
+  // Restore C_reference to the original C so the naive kernel remains the
+  // correctness check for CUTLASS (not TF32 cuBLAS).
+  result = cudaMemcpy(C_reference, C_cutlass, sizeof_C, cudaMemcpyDeviceToDevice);
+
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to restore C_reference after cuBLAS: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);

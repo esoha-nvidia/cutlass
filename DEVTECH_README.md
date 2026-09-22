@@ -33,3 +33,22 @@ python ./cutlass_test.py
 #   --stats=true -o cutlass_gemm \
 #   python ./cutlass_test.py
 ```
+
+From c++:
+```
+cd /home/esoha/cutlass
+mkdir -p build && cd build
+
+export CUDACXX=$(which nvcc)   # usually /usr/local/cuda/bin/nvcc
+
+cmake .. \
+  -DCUTLASS_NVCC_ARCHS=100a \
+  -DCUTLASS_ENABLE_TESTS=OFF
+
+make 00_basic_gemm -j$(nproc)
+
+./examples/00_basic_gemm/00_basic_gemm
+
+../../nsight-systems-2026.4.1/bin/nsys profile ./examples/00_basic_gemm/00_basic_gemm
+```
+

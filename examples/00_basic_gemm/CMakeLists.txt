@@ -32,4 +32,6 @@ cutlass_example_add_executable(
   00_basic_gemm
   basic_gemm.cu
 )
+
+target_link_libraries(00_basic_gemm PRIVATE cublas)
   

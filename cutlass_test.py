@@ -19,6 +19,19 @@ def nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
+@contextmanager
+def profile_range(name: str):
+    """NVTX label plus cudaProfilerStart/Stop (nsys --capture-range=cudaProfilerApi)."""
+    torch.cuda.nvtx.range_push(name)
+    torch.cuda.profiler.start()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        torch.cuda.profiler.stop()
+        torch.cuda.nvtx.range_pop()
+
+
 # --- 1. cuBLAS TF32 GEMM (no CUTLASS JIT) ---
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
@@ -77,7 +90,7 @@ operator = ops.get_operators(args, target_sm=target_sm, limit=1)[0]
 operator.run(args)
 torch.cuda.synchronize()
 
-with nvtx_range("cutlass_gemm"):
+with profile_range("cutlass_gemm"):
     operator.run(args)
 
 D_ref, Aux_ref = my_epilogue(A @ B, C, alpha, beta, extra_scalar)

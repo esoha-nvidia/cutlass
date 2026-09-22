@@ -17,11 +17,19 @@ python -c "import cutlass; import torch; print(cutlass.__version__, torch.cuda.i
 cd /home/esoha/cutlass
 python ./cutlass_test.py
 
-# Capture only the NVTX range around the GEMM (skips JIT / setup).
-# Use -c cutlass_gemm or -c cublas_gemm.
+# Capture only the CUTLASS GEMM (JIT/setup happen before cudaProfilerStart).
+# torch.cuda.nvtx uses unregistered strings; nsys --capture-range=nvtx ignores
+# those unless NSYS_NVTX_PROFILER_REGISTER_ONLY=0. cudaProfilerApi is reliable.
 ../nsight-systems-2026.4.1/bin/nsys profile \
   -t cuda,nvtx,cublas \
-  --capture-range=nvtx --nvtx-capture=cutlass_gemm --capture-range-end=stop \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
   --stats=true -o cutlass_gemm \
   python ./cutlass_test.py
+
+# NVTX capture (plain torch.cuda.nvtx strings) — needs this env var:
+# NSYS_NVTX_PROFILER_REGISTER_ONLY=0 ../nsight-systems-2026.4.1/bin/nsys profile \
+#   -t cuda,nvtx,cublas \
+#   --capture-range=nvtx --nvtx-capture=cutlass_gemm --capture-range-end=stop \
+#   --stats=true -o cutlass_gemm \
+#   python ./cutlass_test.py
 ```

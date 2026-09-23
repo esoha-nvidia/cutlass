@@ -55,6 +55,7 @@
 
 // Standard Library includes
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -73,14 +74,17 @@
 
 // Defines cutlass::gemm::device::Gemm, the generic Gemm computation template class.
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Tile-level ANS via nvCOMPDx
+// Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMPDx
 //
 // LinearCombination is a per-thread functor and never holds a whole 128x128 tile. After it writes
-// D, a follow-up kernel (one CTA per CUTLASS tile, 8 warps) packs the strided column-major tile
-// into a contiguous 64 KiB chunk and runs block-level ANS with nvCOMPDx.
+// D, the same CTA packs that strided column-major tile into a contiguous 64 KiB chunk and runs
+// block-level ANS. device::Gemm launches Kernel<GemmKernel> with no hook after the epilogue, so
+// this example launches Kernel<GemmFusedAns> itself (same grid, 256 threads, dynamic smem reused
+// after the epilogue).
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -110,67 +114,163 @@ static size_t align_up_bytes(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
-/// Pack one CUTLASS output tile, then ANS-compress it. All 256 threads must call execute().
-template <typename Compressor>
-__global__ void compress_cutlass_tiles_nvcompdx_kernel(
-    float const *C,
-    int ldc,
-    int M,
-    int N,
-    float *packed_tiles,
-    size_t packed_stride_elems,
-    char *compressed_tiles,
-    size_t compressed_stride,
-    unsigned long long *comp_sizes,
-    unsigned char *tmp_global) {
-  NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(Compressor);
+/// LinearCombination plus device pointers so the fused kernel can ANS-compress
+/// the CTA's output tile after the GEMM epilogue.
+struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float, 1, float, float> {
+  using Base = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
 
-  int const tile_m = static_cast<int>(blockIdx.x);
-  int const tile_n = static_cast<int>(blockIdx.y);
-  int const tiles_m = static_cast<int>(gridDim.x);
-  int const m0 = tile_m * kAnsTileM;
-  int const n0 = tile_n * kAnsTileN;
-  int const remain_m = M - m0;
-  int const remain_n = N - n0;
-  int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
-  int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
-  size_t const tile_id =
-      static_cast<size_t>(tile_m) + static_cast<size_t>(tile_n) * static_cast<size_t>(tiles_m);
+  struct Params : public Base::Params {
+    float *packed = nullptr;
+    size_t packed_stride_elems = 0;
+    char *compressed = nullptr;
+    size_t compressed_stride = 0;
+    unsigned long long *comp_sizes = nullptr;
+    unsigned char *tmp = nullptr;
+    int orig_M = 0;
+    int orig_N = 0;
 
-  float *packed = packed_tiles + tile_id * packed_stride_elems;
-  int const tile_elems = kAnsTileM * kAnsTileN;
-  for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
-    int const row = i % kAnsTileM;
-    int const col = i / kAnsTileM;
-    float value = 0.f;
-    if (row < rows && col < cols) {
-      value = C[(m0 + row) + (n0 + col) * ldc];
+    CUTLASS_HOST_DEVICE
+    Params() = default;
+
+    CUTLASS_HOST_DEVICE
+    Params(float alpha, float beta = 0.f) : Base::Params(alpha, beta) {}
+  };
+
+  CUTLASS_HOST_DEVICE
+  AnsEpilogueOp() : Base(Params()) {}
+
+  CUTLASS_HOST_DEVICE
+  AnsEpilogueOp(Params const &params) : Base(params) {}
+
+  CUTLASS_HOST_DEVICE
+  AnsEpilogueOp(Params const &params, int group_idx) : Base(params, group_idx) {}
+};
+
+// Column-major device::Gemm swaps A/B and treats C/D as RowMajor with problem {N, M, K}.
+using CutlassGemm = cutlass::gemm::device::Gemm<
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::ColumnMajor,
+    float,
+    cutlass::arch::OpClassSimt,
+    cutlass::arch::Sm70,
+    cutlass::gemm::GemmShape<128, 128, 8>,
+    cutlass::gemm::GemmShape<32, 64, 8>,
+    cutlass::gemm::GemmShape<1, 1, 1>,
+    AnsEpilogueOp>;
+
+using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
+static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
+              "nvCOMPDx BlockWarp<8> requires the 256-thread CUTLASS GEMM CTA");
+
+/// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile and ANS-compress it.
+struct GemmFusedAns {
+  using Params = typename CutlassGemmKernel::Params;
+  using SharedStorage = typename CutlassGemmKernel::SharedStorage;
+  static int const kThreadCount = CutlassGemmKernel::kThreadCount;
+
+  CUTLASS_DEVICE
+  void compress_tile(Params const &params, unsigned char *shared_scratch) {
+    NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(AnsCompressor);
+
+    typename CutlassGemmKernel::ThreadblockSwizzle threadblock_swizzle;
+    cutlass::gemm::GemmCoord tb =
+        threadblock_swizzle.get_tile_offset(params.swizzle_log_tile);
+
+    // After the ColumnMajor A/B swap, tb.m() walks original columns and tb.n() original rows.
+    int const m0 = tb.n() * kAnsTileM;
+    int const n0 = tb.m() * kAnsTileN;
+    size_t const tile_id =
+        static_cast<size_t>(tb.m()) +
+        static_cast<size_t>(tb.n()) * static_cast<size_t>(params.grid_tiled_shape.m());
+
+    AnsEpilogueOp::Params const &ans = params.output_op;
+    float *packed = ans.packed + tile_id * ans.packed_stride_elems;
+    float const *C = params.ref_D.data();
+    int const ldc = static_cast<int>(params.ref_D.stride(0));
+    int const remain_m = ans.orig_M - m0;
+    int const remain_n = ans.orig_N - n0;
+    int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
+    int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
+    int const tile_elems = kAnsTileM * kAnsTileN;
+
+    for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
+      int const row = i % kAnsTileM;
+      int const col = i / kAnsTileM;
+      float value = 0.f;
+      if (row < rows && col < cols) {
+        value = C[(m0 + row) + (n0 + col) * ldc];
+      }
+      packed[row + col * kAnsTileM] = value;
     }
-    packed[row + col * kAnsTileM] = value;
-  }
-  __syncthreads();
 
-  auto compressor = Compressor();
-  extern __shared__ __align__(Compressor::shmem_alignment()) unsigned char shared_scratch[];
-  unsigned char *tmp = tmp_global;
-  if (tmp != nullptr && compressor.tmp_size_group() > 0) {
-    tmp += compressor.tmp_size_group() * tile_id;
+    __syncthreads();
+
+    uintptr_t const align = static_cast<uintptr_t>(AnsCompressor::shmem_alignment());
+    uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(shared_scratch);
+    if (align > 1) {
+      scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
+    }
+    unsigned char *aligned_scratch = reinterpret_cast<unsigned char *>(scratch_addr);
+
+    auto compressor = AnsCompressor();
+    unsigned char *tmp = ans.tmp;
+    if (tmp != nullptr && compressor.tmp_size_group() > 0) {
+      tmp += compressor.tmp_size_group() * tile_id;
+    }
+
+    compressor.execute(
+        packed,
+        ans.compressed + tile_id * ans.compressed_stride,
+        kAnsChunkBytes,
+        ans.comp_sizes + tile_id,
+        aligned_scratch,
+        tmp);
   }
 
-  compressor.execute(
-      packed,
-      compressed_tiles + tile_id * compressed_stride,
-      kAnsChunkBytes,
-      comp_sizes + tile_id,
-      shared_scratch,
-      tmp);
-}
+  CUTLASS_DEVICE
+  void operator()(Params const &params, SharedStorage &shared_storage) {
+    CutlassGemmKernel gemm;
+    gemm(params, shared_storage);
 
-/// ANS-compress every CUTLASS output tile with nvCOMPDx. C is left unchanged for the GEMM check.
-cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
-  if (M <= 0 || N <= 0) {
-    return cudaSuccess;
+    typename CutlassGemmKernel::ThreadblockSwizzle threadblock_swizzle;
+    cutlass::gemm::GemmCoord tb =
+        threadblock_swizzle.get_tile_offset(params.swizzle_log_tile);
+
+    if (params.grid_tiled_shape.m() <= tb.m() ||
+        params.grid_tiled_shape.n() <= tb.n()) {
+      return;
+    }
+
+    __syncthreads();
+    compress_tile(params, reinterpret_cast<unsigned char *>(&shared_storage));
   }
+};
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// This function defines a CUTLASS GEMM kernel instantiation, constructs its parameters object,
+// and launches it on the CUDA device.
+//
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Define a CUTLASS GEMM template and launch a GEMM kernel fused with per-tile ANS.
+cudaError_t CutlassSgemmNN(
+  int M,
+  int N,
+  int K,
+  float alpha,
+  float const *A,
+  int lda,
+  float const *B,
+  int ldb,
+  float beta,
+  float *C,
+  int ldc) {
+
+  // Same 128x128x8 SIMT SGEMM as the 6-arg ColumnMajor device::Gemm, plus AnsEpilogueOp so
+  // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
+  // and launches a RowMajor kernel on problem {N, M, K}.
 
   int device = 0;
   cudaError_t err = cudaGetDevice(&device);
@@ -193,13 +293,33 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
     return cudaErrorInvalidDevice;
   }
 
-  int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
-  int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
-  size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
+  using ThreadblockSwizzle = typename CutlassGemmKernel::ThreadblockSwizzle;
+  ThreadblockSwizzle threadblock_swizzle;
+
+  CutlassGemm::Arguments args({M, N, K},
+                              {A, lda},
+                              {B, ldb},
+                              {C, ldc},
+                              {C, ldc},
+                              {alpha, beta});
+
+  auto underlying_args = CutlassGemm::to_underlying_arguments(args);
+  cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape(
+      underlying_args.problem_size,
+      {CutlassGemm::ThreadblockShape::kM,
+       CutlassGemm::ThreadblockShape::kN,
+       CutlassGemm::ThreadblockShape::kK},
+      underlying_args.split_k_slices);
+
+  size_t const num_chunks =
+      static_cast<size_t>(grid_tiled_shape.m()) * static_cast<size_t>(grid_tiled_shape.n());
 
   auto compressor = AnsCompressor();
   size_t const chunk_bytes = kAnsChunkBytes;
-  size_t const shmem_bytes = static_cast<size_t>(compressor.shmem_size_group());
+  size_t const nvcomp_shmem = static_cast<size_t>(compressor.shmem_size_group());
+  size_t const gemm_shmem = sizeof(typename CutlassGemmKernel::SharedStorage);
+  size_t const shmem_align = static_cast<size_t>(compressor.shmem_alignment());
+  size_t const dyn_smem = std::max(gemm_shmem, nvcomp_shmem + shmem_align);
   size_t const tmp_bytes = static_cast<size_t>(compressor.tmp_size_total(num_chunks));
   size_t const packed_stride = align_up_bytes(
       chunk_bytes, std::max(static_cast<size_t>(compressor.input_alignment()), size_t(256)));
@@ -241,28 +361,49 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
     }
   }
 
-  err = cudaFuncSetAttribute(
-      compress_cutlass_tiles_nvcompdx_kernel<AnsCompressor>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shmem_bytes));
+  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(unsigned long long));
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
 
-  nvtxRangePushA("nvcompdx_ans_tiles");
-  compress_cutlass_tiles_nvcompdx_kernel<AnsCompressor>
-      <<<dim3(tiles_m, tiles_n), kAnsThreads, shmem_bytes>>>(
-          C,
-          ldc,
-          M,
-          N,
-          d_packed,
-          packed_stride / sizeof(float),
-          d_compressed,
-          compressed_stride,
-          d_comp_sizes,
-          d_temp);
+  args.epilogue.packed = d_packed;
+  args.epilogue.packed_stride_elems = packed_stride / sizeof(float);
+  args.epilogue.compressed = d_compressed;
+  args.epilogue.compressed_stride = compressed_stride;
+  args.epilogue.comp_sizes = d_comp_sizes;
+  args.epilogue.tmp = d_temp;
+  args.epilogue.orig_M = M;
+  args.epilogue.orig_N = N;
+  underlying_args = CutlassGemm::to_underlying_arguments(args);
+
+  typename CutlassGemmKernel::Params params{
+      underlying_args.problem_size,
+      grid_tiled_shape,
+      underlying_args.ref_A.non_const_ref(),
+      underlying_args.ref_B.non_const_ref(),
+      underlying_args.ref_C.non_const_ref(),
+      underlying_args.ref_D,
+      underlying_args.epilogue,
+      nullptr,
+      underlying_args.gather_A_indices,
+      underlying_args.gather_B_indices,
+      underlying_args.scatter_D_indices};
+
+  err = cudaFuncSetAttribute(
+      cutlass::Kernel<GemmFusedAns>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(dyn_smem));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+
+  dim3 grid = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
+  dim3 block(CutlassGemmKernel::kThreadCount, 1, 1);
+
+  nvtxRangePushA("cutlass_gemm");
+  cutlass::Kernel<GemmFusedAns><<<grid, block, dyn_smem>>>(params);
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     nvtxRangePop();
@@ -292,7 +433,7 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
     compressed_bytes += static_cast<size_t>(h_comp_sizes[i]);
   }
   size_t const uncompressed_bytes = num_chunks * chunk_bytes;
-  std::cout << "nvCOMPDx ANS: " << num_chunks
+  std::cout << "nvCOMPDx ANS (fused): " << num_chunks
             << " tiles of " << chunk_bytes << " B, uncompressed "
             << uncompressed_bytes << " B, compressed " << compressed_bytes
             << " B, ratio "
@@ -301,84 +442,6 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
 
   free_all();
   return cudaSuccess;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// This function defines a CUTLASS GEMM kernel instantiation, constructs its parameters object,
-// and launches it on the CUDA device.
-//
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Define a CUTLASS GEMM template and launch a GEMM kernel.
-cudaError_t CutlassSgemmNN(
-  int M,
-  int N,
-  int K,
-  float alpha,
-  float const *A,
-  int lda,
-  float const *B,
-  int ldb,
-  float beta,
-  float *C,
-  int ldc) {
-
-  // Define type definition for single-precision CUTLASS GEMM with column-major
-  // input matrices and 128x128x8 threadblock tile size (chosen by default).
-  //
-  // To keep the interface manageable, several helpers are defined for plausible compositions
-  // including the following example for single-precision GEMM. Typical values are used as
-  // default template arguments. See `cutlass/gemm/device/default_gemm_configuration.h` for more details.
-  //
-  // To view the full gemm device API interface, see `cutlass/gemm/device/gemm.h`
-
-  using ColumnMajor = cutlass::layout::ColumnMajor;
-
-  using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
-                                                  ColumnMajor,  // Layout of A matrix
-                                                  float,        // Data-type of B matrix
-                                                  ColumnMajor,  // Layout of B matrix
-                                                  float,        // Data-type of C matrix
-                                                  ColumnMajor>; // Layout of C matrix
-
-  // Define a CUTLASS GEMM type
-  CutlassGemm gemm_operator;
-
-  // Construct the CUTLASS GEMM arguments object.
-  //
-  // One of CUTLASS's design patterns is to define gemm argument objects that are constructible
-  // in host code and passed to kernels by value. These may include pointers, strides, scalars,
-  // and other arguments needed by Gemm and its components.
-  //
-  // The benefits of this pattern are (1.) a structured, composable strategy for passing host-constructible
-  // arguments to kernels and (2.) minimized initialization overhead on kernel entry.
-  //
-  CutlassGemm::Arguments args({M , N, K},  // Gemm Problem dimensions
-                              {A, lda},    // Tensor-ref for source matrix A
-                              {B, ldb},    // Tensor-ref for source matrix B
-                              {C, ldc},    // Tensor-ref for source matrix C
-                              {C, ldc},    // Tensor-ref for destination matrix D (may be different memory than source C matrix)
-                              {alpha, beta}); // Scalars used in the Epilogue
-
-  //
-  // Launch the CUTLASS GEMM kernel.
-  //
-
-  nvtxRangePushA("cutlass_gemm");
-  cutlass::Status status = gemm_operator(args);
-  cudaError_t sync_status = cudaDeviceSynchronize();
-  nvtxRangePop();
-
-  //
-  // Return a cudaError_t if the CUTLASS GEMM operator returned an error code.
-  //
-
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorUnknown;
-  }
-
-  return sync_status;
 }
 
 /// Column-major SGEMM via cuBLAS. NVTX covers only the GEMM launch.
@@ -685,20 +748,6 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
 
   if (result != cudaSuccess) {
     std::cerr << "CUTLASS GEMM kernel failed: "
-      << cudaGetErrorString(result) << std::endl;
-
-    cudaFree(C_reference);
-    cudaFree(C_cutlass);
-    cudaFree(B);
-    cudaFree(A);
-
-    return result;
-  }
-
-  result = CompressOutputTilesAns(M, N, C_cutlass, ldc);
-
-  if (result != cudaSuccess) {
-    std::cerr << "nvCOMPDx ANS tile compression failed: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);

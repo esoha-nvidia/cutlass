@@ -34,4 +34,55 @@ cutlass_example_add_executable(
 )
 
 target_link_libraries(00_basic_gemm PRIVATE cublas)
+
+set(NVCOMP_ROOT "/home/esoha/nvcomp-dev/nvcomp" CACHE PATH "nvCOMP source or install prefix")
+
+find_package(nvcomp QUIET HINTS
+  "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp"
+  /usr/local
+)
+
+if(TARGET nvcomp::nvcomp)
+  target_link_libraries(00_basic_gemm PRIVATE nvcomp::nvcomp)
+  get_target_property(_nvcomp_loc nvcomp::nvcomp IMPORTED_LOCATION)
+  if(NOT _nvcomp_loc)
+    get_target_property(_nvcomp_loc nvcomp::nvcomp IMPORTED_LOCATION_RELEASE)
+  endif()
+  if(_nvcomp_loc)
+    get_filename_component(_nvcomp_lib_dir "${_nvcomp_loc}" DIRECTORY)
+    set_property(TARGET 00_basic_gemm APPEND PROPERTY BUILD_RPATH "${_nvcomp_lib_dir}")
+  endif()
+else()
+  find_path(NVCOMP_INCLUDE_DIR nvcomp.h
+    HINTS
+      "${NVCOMP_ROOT}/include"
+      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/include"
+      /usr/local/include
+  )
+  find_path(NVCOMP_GENERATED_INCLUDE_DIR nvcomp_export.h
+    HINTS
+      "${NVCOMP_ROOT}/build/include"
+      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/include"
+      /usr/local/include
+      "${NVCOMP_INCLUDE_DIR}"
+  )
+  find_library(NVCOMP_LIBRARY nvcomp
+    HINTS
+      "${NVCOMP_ROOT}/build/lib"
+      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/lib"
+      /usr/local/lib
+      /usr/local/lib64
+  )
+  if(NOT NVCOMP_INCLUDE_DIR OR NOT NVCOMP_LIBRARY)
+    message(FATAL_ERROR
+      "nvCOMP not found. Set -DNVCOMP_ROOT=... (source tree with build/lib, or install prefix).")
+  endif()
+  target_include_directories(00_basic_gemm PRIVATE
+    ${NVCOMP_INCLUDE_DIR}
+    ${NVCOMP_GENERATED_INCLUDE_DIR}
+  )
+  target_link_libraries(00_basic_gemm PRIVATE ${NVCOMP_LIBRARY})
+  get_filename_component(_nvcomp_lib_dir "${NVCOMP_LIBRARY}" DIRECTORY)
+  set_property(TARGET 00_basic_gemm APPEND PROPERTY BUILD_RPATH "${_nvcomp_lib_dir}")
+endif()
   

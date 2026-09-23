@@ -54,6 +54,7 @@
 */
 
 // Standard Library includes
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -64,6 +65,7 @@
 
 // Helper methods to check for errors
 #include "helper.h"
+#include "nvcomp/ans.h"
 
 //
 // CUTLASS includes needed for single-precision GEMM kernel
@@ -71,73 +73,240 @@
 
 // Defines cutlass::gemm::device::Gemm, the generic Gemm computation template class.
 #include "cutlass/gemm/device/gemm.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Custom epilogue: same as LinearCombination (D = alpha * accum + beta * C), then printf
-// the first value stored for this CTA's output tile.
+// Tile-level ANS "epilogue"
+//
+// CUTLASS 2.x LinearCombination is a per-thread functor on register fragments. It never holds a
+// whole 128x128 output tile, and nvCOMP's ANS API is a host-launched batch of kernels (this tree
+// was built with BUILD_NVCOMPDX=OFF, so there is no in-kernel execute()).
+//
+// After LinearCombination writes D, pack each CUTLASS output tile into a contiguous 64 KiB chunk
+// (column-major C is strided by ldc, so a tile is not a single pointer) and run batched rANS.
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct PrintTileEpilogue
-    : public cutlass::epilogue::thread::LinearCombination<float, 1, float, float> {
-
-  using Base = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
-  using Params = typename Base::Params;
-  using FragmentOutput = typename Base::FragmentOutput;
-  using FragmentSource = typename Base::FragmentSource;
-  using FragmentAccumulator = typename Base::FragmentAccumulator;
-
-  CUTLASS_HOST_DEVICE
-  PrintTileEpilogue() : Base(Params()), printed_(false) {}
-
-  CUTLASS_HOST_DEVICE
-  explicit PrintTileEpilogue(Params const &params) : Base(params), printed_(false) {}
-
-  CUTLASS_HOST_DEVICE
-  PrintTileEpilogue(Params const &params, int group_idx)
-      : Base(params, group_idx), printed_(false) {}
-
-  CUTLASS_HOST_DEVICE
-  FragmentOutput operator()(
-      FragmentAccumulator const &accumulator,
-      FragmentSource const &source) const {
-    FragmentOutput result = Base::operator()(accumulator, source);
-    print_first_tile_value(result);
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  FragmentOutput operator()(FragmentAccumulator const &accumulator) const {
-    FragmentOutput result = Base::operator()(accumulator);
-    print_first_tile_value(result);
-    return result;
-  }
-
-private:
-  // One print per CTA: thread 0's first epilogue fragment (typically the tile's first element).
-  mutable bool printed_;
-
-  CUTLASS_HOST_DEVICE
-  void print_first_tile_value(FragmentOutput const &result) const {
-#if defined(__CUDA_ARCH__)
-    if (printed_) {
-      return;
-    }
-    // 4096x4096 with 128x128 tiles is 1024 CTAs; print a few tiles so stdout stays usable.
-    unsigned tile_id = blockIdx.y * gridDim.x + blockIdx.x;
-    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && tile_id < 8) {
-      printed_ = true;
-      printf(
-          "CUTLASS epilogue: CTA (%u, %u) output tile first value = %f\n",
-          blockIdx.x,
-          blockIdx.y,
-          float(result[0]));
-    }
-#endif
-  }
+enum {
+  kAnsTileM = 128,
+  kAnsTileN = 128
 };
+
+static size_t align_up_bytes(size_t value, size_t alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
+
+static cudaError_t check_nvcomp(nvcompStatus_t status, char const *what) {
+  if (status == nvcompSuccess) {
+    return cudaSuccess;
+  }
+  std::cerr << what << " failed: " << nvcompGetStatusString(status) << std::endl;
+  return cudaErrorUnknown;
+}
+
+/// Pack one 128x128 (zero-padded) column-major output tile per CTA.
+__global__ void pack_cutlass_output_tiles_kernel(
+    float const *C,
+    int ldc,
+    int M,
+    int N,
+    float *packed_tiles,
+    size_t tile_stride_elems) {
+
+  int const tile_m = static_cast<int>(blockIdx.x);
+  int const tile_n = static_cast<int>(blockIdx.y);
+  int const tiles_m = static_cast<int>(gridDim.x);
+  int const m0 = tile_m * kAnsTileM;
+  int const n0 = tile_n * kAnsTileN;
+  int const remain_m = M - m0;
+  int const remain_n = N - n0;
+  int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
+  int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
+  float *dst = packed_tiles +
+      (static_cast<size_t>(tile_m) + static_cast<size_t>(tile_n) * static_cast<size_t>(tiles_m)) *
+          tile_stride_elems;
+
+  int const tile_elems = kAnsTileM * kAnsTileN;
+  for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
+    int const row = i % kAnsTileM;
+    int const col = i / kAnsTileM;
+    float value = 0.f;
+    if (row < rows && col < cols) {
+      value = C[(m0 + row) + (n0 + col) * ldc];
+    }
+    dst[row + col * kAnsTileM] = value;
+  }
+}
+
+/// ANS-compress every CUTLASS output tile. C is left unchanged for the GEMM check.
+cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc) {
+  if (M <= 0 || N <= 0) {
+    return cudaSuccess;
+  }
+
+  int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
+  int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
+  size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
+  size_t const chunk_bytes = static_cast<size_t>(kAnsTileM) * kAnsTileN * sizeof(float);
+
+  nvcompBatchedANSCompressOpts_t compress_opts = nvcompBatchedANSCompressDefaultOpts;
+
+  nvcompAlignmentRequirements_t alignment{};
+  cudaError_t err = check_nvcomp(
+      nvcompBatchedANSCompressGetRequiredAlignments(compress_opts, &alignment),
+      "nvcompBatchedANSCompressGetRequiredAlignments");
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  size_t max_compressed_bytes = 0;
+  err = check_nvcomp(
+      nvcompBatchedANSCompressGetMaxOutputChunkSize(
+          chunk_bytes, compress_opts, &max_compressed_bytes),
+      "nvcompBatchedANSCompressGetMaxOutputChunkSize");
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  size_t temp_bytes = 0;
+  err = check_nvcomp(
+      nvcompBatchedANSCompressGetTempSizeAsync(
+          num_chunks,
+          chunk_bytes,
+          compress_opts,
+          &temp_bytes,
+          num_chunks * chunk_bytes),
+      "nvcompBatchedANSCompressGetTempSizeAsync");
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  size_t const packed_stride = align_up_bytes(
+      chunk_bytes, std::max(alignment.input, static_cast<size_t>(256)));
+  size_t const compressed_stride = align_up_bytes(
+      max_compressed_bytes, std::max(alignment.output, static_cast<size_t>(256)));
+
+  float *d_packed = nullptr;
+  char *d_compressed = nullptr;
+  void **d_uncomp_ptrs = nullptr;
+  void **d_comp_ptrs = nullptr;
+  size_t *d_uncomp_sizes = nullptr;
+  size_t *d_comp_sizes = nullptr;
+  nvcompStatus_t *d_status = nullptr;
+  void *d_temp = nullptr;
+
+  auto free_all = [&]() {
+    cudaFree(d_packed);
+    cudaFree(d_compressed);
+    cudaFree(d_uncomp_ptrs);
+    cudaFree(d_comp_ptrs);
+    cudaFree(d_uncomp_sizes);
+    cudaFree(d_comp_sizes);
+    cudaFree(d_status);
+    cudaFree(d_temp);
+  };
+
+  err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  if (err != cudaSuccess) { return err; }
+  err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMalloc(&d_uncomp_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMalloc(&d_comp_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMalloc(&d_uncomp_sizes, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMalloc(&d_status, num_chunks * sizeof(nvcompStatus_t));
+  if (err != cudaSuccess) { free_all(); return err; }
+  if (temp_bytes) {
+    err = cudaMalloc(&d_temp, temp_bytes);
+    if (err != cudaSuccess) { free_all(); return err; }
+  }
+
+  std::vector<void *> h_uncomp_ptrs(num_chunks);
+  std::vector<void *> h_comp_ptrs(num_chunks);
+  std::vector<size_t> h_uncomp_sizes(num_chunks, chunk_bytes);
+  for (size_t i = 0; i < num_chunks; ++i) {
+    h_uncomp_ptrs[i] = reinterpret_cast<char *>(d_packed) + i * packed_stride;
+    h_comp_ptrs[i] = d_compressed + i * compressed_stride;
+  }
+
+  err = cudaMemcpy(d_uncomp_ptrs, h_uncomp_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMemcpy(d_comp_ptrs, h_comp_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMemcpy(d_uncomp_sizes, h_uncomp_sizes.data(), num_chunks * sizeof(size_t), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) { free_all(); return err; }
+
+  nvtxRangePushA("nvcomp_ans_tiles");
+
+  pack_cutlass_output_tiles_kernel<<<dim3(tiles_m, tiles_n), 256>>>(
+      C, ldc, M, N, d_packed, packed_stride / sizeof(float));
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    nvtxRangePop();
+    free_all();
+    return err;
+  }
+
+  err = check_nvcomp(
+      nvcompBatchedANSCompressAsync(
+          d_uncomp_ptrs,
+          d_uncomp_sizes,
+          chunk_bytes,
+          num_chunks,
+          d_temp,
+          temp_bytes,
+          d_comp_ptrs,
+          d_comp_sizes,
+          compress_opts,
+          d_status,
+          0),
+      "nvcompBatchedANSCompressAsync");
+  if (err != cudaSuccess) {
+    nvtxRangePop();
+    free_all();
+    return err;
+  }
+
+  err = cudaDeviceSynchronize();
+  nvtxRangePop();
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+
+  std::vector<nvcompStatus_t> h_status(num_chunks);
+  std::vector<size_t> h_comp_sizes(num_chunks);
+  err = cudaMemcpy(h_status.data(), d_status, num_chunks * sizeof(nvcompStatus_t), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) { free_all(); return err; }
+  err = cudaMemcpy(h_comp_sizes.data(), d_comp_sizes, num_chunks * sizeof(size_t), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) { free_all(); return err; }
+
+  size_t compressed_bytes = 0;
+  for (size_t i = 0; i < num_chunks; ++i) {
+    if (h_status[i] != nvcompSuccess) {
+      std::cerr << "nvCOMP ANS failed on tile " << i << ": "
+                << nvcompGetStatusString(h_status[i]) << std::endl;
+      free_all();
+      return cudaErrorUnknown;
+    }
+    compressed_bytes += h_comp_sizes[i];
+  }
+
+  size_t const uncompressed_bytes = num_chunks * chunk_bytes;
+  std::cout << "nvCOMP ANS: " << num_chunks
+            << " tiles of " << chunk_bytes << " B, uncompressed "
+            << uncompressed_bytes << " B, compressed " << compressed_bytes
+            << " B, ratio "
+            << (compressed_bytes ? static_cast<double>(uncompressed_bytes) / compressed_bytes : 0.0)
+            << std::endl;
+
+  free_all();
+  return cudaSuccess;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -171,21 +340,12 @@ cudaError_t CutlassSgemmNN(
 
   using ColumnMajor = cutlass::layout::ColumnMajor;
 
-  // Same SIMT SGEMM as the defaults, with PrintTileEpilogue instead of LinearCombination.
-  using CutlassGemm = cutlass::gemm::device::Gemm<
-      float,
-      ColumnMajor,
-      float,
-      ColumnMajor,
-      float,
-      ColumnMajor,
-      float,
-      cutlass::arch::OpClassSimt,
-      cutlass::arch::Sm70,
-      cutlass::gemm::GemmShape<128, 128, 8>,
-      cutlass::gemm::GemmShape<32, 64, 8>,
-      cutlass::gemm::GemmShape<1, 1, 1>,
-      PrintTileEpilogue>;
+  using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
+                                                  ColumnMajor,  // Layout of A matrix
+                                                  float,        // Data-type of B matrix
+                                                  ColumnMajor,  // Layout of B matrix
+                                                  float,        // Data-type of C matrix
+                                                  ColumnMajor>; // Layout of C matrix
 
   // Define a CUTLASS GEMM type
   CutlassGemm gemm_operator;
@@ -530,6 +690,20 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
 
   if (result != cudaSuccess) {
     std::cerr << "CUTLASS GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
+
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
+
+    return result;
+  }
+
+  result = CompressOutputTilesAns(M, N, C_cutlass, ldc);
+
+  if (result != cudaSuccess) {
+    std::cerr << "nvCOMP ANS tile compression failed: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);

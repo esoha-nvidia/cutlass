@@ -54,6 +54,7 @@
 */
 
 // Standard Library includes
+#include <cstdio>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -70,6 +71,73 @@
 
 // Defines cutlass::gemm::device::Gemm, the generic Gemm computation template class.
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Custom epilogue: same as LinearCombination (D = alpha * accum + beta * C), then printf
+// the first value stored for this CTA's output tile.
+//
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct PrintTileEpilogue
+    : public cutlass::epilogue::thread::LinearCombination<float, 1, float, float> {
+
+  using Base = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
+  using Params = typename Base::Params;
+  using FragmentOutput = typename Base::FragmentOutput;
+  using FragmentSource = typename Base::FragmentSource;
+  using FragmentAccumulator = typename Base::FragmentAccumulator;
+
+  CUTLASS_HOST_DEVICE
+  PrintTileEpilogue() : Base(Params()), printed_(false) {}
+
+  CUTLASS_HOST_DEVICE
+  explicit PrintTileEpilogue(Params const &params) : Base(params), printed_(false) {}
+
+  CUTLASS_HOST_DEVICE
+  PrintTileEpilogue(Params const &params, int group_idx)
+      : Base(params, group_idx), printed_(false) {}
+
+  CUTLASS_HOST_DEVICE
+  FragmentOutput operator()(
+      FragmentAccumulator const &accumulator,
+      FragmentSource const &source) const {
+    FragmentOutput result = Base::operator()(accumulator, source);
+    print_first_tile_value(result);
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const &accumulator) const {
+    FragmentOutput result = Base::operator()(accumulator);
+    print_first_tile_value(result);
+    return result;
+  }
+
+private:
+  // One print per CTA: thread 0's first epilogue fragment (typically the tile's first element).
+  mutable bool printed_;
+
+  CUTLASS_HOST_DEVICE
+  void print_first_tile_value(FragmentOutput const &result) const {
+#if defined(__CUDA_ARCH__)
+    if (printed_) {
+      return;
+    }
+    // 4096x4096 with 128x128 tiles is 1024 CTAs; print a few tiles so stdout stays usable.
+    unsigned tile_id = blockIdx.y * gridDim.x + blockIdx.x;
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && tile_id < 8) {
+      printed_ = true;
+      printf(
+          "CUTLASS epilogue: CTA (%u, %u) output tile first value = %f\n",
+          blockIdx.x,
+          blockIdx.y,
+          float(result[0]));
+    }
+#endif
+  }
+};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -103,12 +171,21 @@ cudaError_t CutlassSgemmNN(
 
   using ColumnMajor = cutlass::layout::ColumnMajor;
 
-  using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
-                                                  ColumnMajor,  // Layout of A matrix
-                                                  float,        // Data-type of B matrix
-                                                  ColumnMajor,  // Layout of B matrix
-                                                  float,        // Data-type of C matrix
-                                                  ColumnMajor>; // Layout of C matrix
+  // Same SIMT SGEMM as the defaults, with PrintTileEpilogue instead of LinearCombination.
+  using CutlassGemm = cutlass::gemm::device::Gemm<
+      float,
+      ColumnMajor,
+      float,
+      ColumnMajor,
+      float,
+      ColumnMajor,
+      float,
+      cutlass::arch::OpClassSimt,
+      cutlass::arch::Sm70,
+      cutlass::gemm::GemmShape<128, 128, 8>,
+      cutlass::gemm::GemmShape<32, 64, 8>,
+      cutlass::gemm::GemmShape<1, 1, 1>,
+      PrintTileEpilogue>;
 
   // Define a CUTLASS GEMM type
   CutlassGemm gemm_operator;

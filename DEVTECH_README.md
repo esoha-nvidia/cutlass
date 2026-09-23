@@ -1,4 +1,4 @@
-```
+```bash
 srun -A coreai_devtech_all -N1 -p gb200 -J coreai_devtech_all-esoha.nvcomp \
   --container-image="nvcr.io/nvidia/pytorch:26.08-py3" \
   --container-mounts="/home/esoha" --pty bash
@@ -34,8 +34,23 @@ python ./cutlass_test.py
 #   python ./cutlass_test.py
 ```
 
-From c++:
+## Build and install nvCOMP from source
+
+The container is missing several tools. Install them first. `python3.10-dev` provides `python3.10-config`, which nvCOMP needs to build the Python extension. `patchelf` is required by `auditwheel` when repairing wheels. The `wheel` package is required for `bdist_wheel`. Configure and build with the aarch64 CMake 4.3.3 binary. `BUILD_PYTHON` and `BUILD_WHEEL` are required for the Python module; a default C++ `make install` does not install it. Install the wheels from `build/python/` (CUDA 13 names; use `cu12` if `nvcc --version` reports CUDA 12). The import is `from nvidia import nvcomp`, not `import nvcomp`.
+
+```bash
+apt-get update && apt-get install -y git python3.10-dev python3-pip patchelf nano git cmake
+python3 -m pip install --upgrade pip setuptools wheel
+mkdir -p /home/esoha/nvcomp-dev/nvcomp/build && cd /home/esoha/nvcomp-dev/nvcomp/build
+../../../cmake-4.3.3-linux-aarch64/bin/cmake .. -DBUILD_PYTHON=ON -DBUILD_WHEEL=ON
+make -j 20
+make install
+python3 -m pip install --force --no-index --find-links=/home/esoha/nvcomp-dev/nvcomp/build/python nvidia-libnvcomp-cu13 nvidia-nvcomp-cu13
+python3 -c "from nvidia import nvcomp; print(nvcomp.__version__, nvcomp.__cuda_version__)"
 ```
+
+For c++:
+```bash
 cd /home/esoha/cutlass
 mkdir -p build && cd build
 

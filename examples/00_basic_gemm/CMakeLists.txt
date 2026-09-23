@@ -35,54 +35,21 @@ cutlass_example_add_executable(
 
 target_link_libraries(00_basic_gemm PRIVATE cublas)
 
-set(NVCOMP_ROOT "/home/esoha/nvcomp-dev/nvcomp" CACHE PATH "nvCOMP source or install prefix")
+set(MATHDX_ROOT "/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06"
+    CACHE PATH "MathDx prefix (contains include/nvcompdx.hpp)")
+set(mathdx_CUTLASS_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "CUTLASS root for MathDx find_package")
 
-find_package(nvcomp QUIET HINTS
-  "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp"
-  /usr/local
-)
+find_package(mathdx REQUIRED COMPONENTS nvcompdx CONFIG
+  PATHS "${MATHDX_ROOT}"
+  NO_DEFAULT_PATH)
 
-if(TARGET nvcomp::nvcomp)
-  target_link_libraries(00_basic_gemm PRIVATE nvcomp::nvcomp)
-  get_target_property(_nvcomp_loc nvcomp::nvcomp IMPORTED_LOCATION)
-  if(NOT _nvcomp_loc)
-    get_target_property(_nvcomp_loc nvcomp::nvcomp IMPORTED_LOCATION_RELEASE)
-  endif()
-  if(_nvcomp_loc)
-    get_filename_component(_nvcomp_lib_dir "${_nvcomp_loc}" DIRECTORY)
-    set_property(TARGET 00_basic_gemm APPEND PROPERTY BUILD_RPATH "${_nvcomp_lib_dir}")
-  endif()
+# aarch64 (GB200): fatbin, not libnvcompdx.a (x86_64).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  target_link_libraries(00_basic_gemm PRIVATE mathdx::nvcompdx_fatbin)
 else()
-  find_path(NVCOMP_INCLUDE_DIR nvcomp.h
-    HINTS
-      "${NVCOMP_ROOT}/include"
-      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/include"
-      /usr/local/include
-  )
-  find_path(NVCOMP_GENERATED_INCLUDE_DIR nvcomp_export.h
-    HINTS
-      "${NVCOMP_ROOT}/build/include"
-      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/include"
-      /usr/local/include
-      "${NVCOMP_INCLUDE_DIR}"
-  )
-  find_library(NVCOMP_LIBRARY nvcomp
-    HINTS
-      "${NVCOMP_ROOT}/build/lib"
-      "${NVCOMP_ROOT}/build/python/libnvcomp/nvidia/libnvcomp/lib"
-      /usr/local/lib
-      /usr/local/lib64
-  )
-  if(NOT NVCOMP_INCLUDE_DIR OR NOT NVCOMP_LIBRARY)
-    message(FATAL_ERROR
-      "nvCOMP not found. Set -DNVCOMP_ROOT=... (source tree with build/lib, or install prefix).")
-  endif()
-  target_include_directories(00_basic_gemm PRIVATE
-    ${NVCOMP_INCLUDE_DIR}
-    ${NVCOMP_GENERATED_INCLUDE_DIR}
-  )
-  target_link_libraries(00_basic_gemm PRIVATE ${NVCOMP_LIBRARY})
-  get_filename_component(_nvcomp_lib_dir "${NVCOMP_LIBRARY}" DIRECTORY)
-  set_property(TARGET 00_basic_gemm APPEND PROPERTY BUILD_RPATH "${_nvcomp_lib_dir}")
+  target_link_libraries(00_basic_gemm PRIVATE mathdx::nvcompdx)
 endif()
-  
+
+set_target_properties(00_basic_gemm PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  INTERPROCEDURAL_OPTIMIZATION ON)

@@ -45,7 +45,6 @@ In-kernel nvCOMPDx is already in the MathDx tarball at
 (nvCOMPDx 0.1.4, `include/nvcompdx.hpp`, `lib/libnvcompdx.fatbin`). On aarch64 (GB200) link **`mathdx::nvcompdx_fatbin`**, not `libnvcompdx.a` (that static lib is x86_64). Device code still needs separable compilation and `-dlto`.
 
 ```bash
-apt-get update && apt-get install -y git python3.10-dev python3-pip patchelf nano git cmake
 python3 -m pip install --upgrade pip setuptools wheel
 mkdir -p /home/esoha/nvcomp-dev/nvcomp/build && cd /home/esoha/nvcomp-dev/nvcomp/build
 ../../../cmake-4.3.3-linux-aarch64/bin/cmake .. -DBUILD_PYTHON=ON -DBUILD_WHEEL=ON

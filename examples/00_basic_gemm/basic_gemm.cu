@@ -115,6 +115,59 @@ static size_t align_up_bytes(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
+static cudaError_t CheckNvcompdxSm() {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  int major = 0;
+  int minor = 0;
+  err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  if (major != 10) {
+    std::cerr << "nvCOMPDx kernel in this example is compiled for SM100 (GB200), got SM"
+              << major << minor << std::endl;
+    return cudaErrorInvalidDevice;
+  }
+  return cudaSuccess;
+}
+
+static cudaError_t PrintAnsRatio(
+    unsigned long long const *d_comp_sizes,
+    size_t num_chunks,
+    size_t chunk_bytes,
+    char const *label) {
+  std::vector<unsigned long long> h_comp_sizes(num_chunks);
+  cudaError_t err = cudaMemcpy(
+      h_comp_sizes.data(),
+      d_comp_sizes,
+      num_chunks * sizeof(unsigned long long),
+      cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  size_t compressed_bytes = 0;
+  for (size_t i = 0; i < num_chunks; ++i) {
+    compressed_bytes += static_cast<size_t>(h_comp_sizes[i]);
+  }
+  size_t const uncompressed_bytes = num_chunks * chunk_bytes;
+  std::cout << label << ": " << num_chunks
+            << " tiles of " << chunk_bytes << " B, uncompressed "
+            << uncompressed_bytes << " B, compressed " << compressed_bytes
+            << " B, ratio "
+            << (compressed_bytes ? static_cast<double>(uncompressed_bytes) / compressed_bytes : 0.0)
+            << std::endl;
+  return cudaSuccess;
+}
+
 /// LinearCombination plus device pointers so the fused kernel can ANS-compress
 /// the CTA's output tile after the GEMM epilogue.
 struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float, 1, float, float> {
@@ -248,6 +301,169 @@ struct GemmFusedAns {
   }
 };
 
+/// Pack one column-major 128x128 tile and ANS-compress it. No GEMM.
+template <typename Compressor>
+__global__ void compress_tiles_nvcompdx_kernel(
+    float const *C,
+    int ldc,
+    int M,
+    int N,
+    float *packed_tiles,
+    size_t packed_stride_elems,
+    char *compressed_tiles,
+    size_t compressed_stride,
+    unsigned long long *comp_sizes,
+    unsigned char *tmp_global) {
+  NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(Compressor);
+
+  int const tile_m = static_cast<int>(blockIdx.x);
+  int const tile_n = static_cast<int>(blockIdx.y);
+  int const tiles_m = static_cast<int>(gridDim.x);
+  int const m0 = tile_m * kAnsTileM;
+  int const n0 = tile_n * kAnsTileN;
+  int const remain_m = M - m0;
+  int const remain_n = N - n0;
+  int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
+  int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
+  size_t const tile_id =
+      static_cast<size_t>(tile_m) + static_cast<size_t>(tile_n) * static_cast<size_t>(tiles_m);
+
+  float *packed = packed_tiles + tile_id * packed_stride_elems;
+  int const tile_elems = kAnsTileM * kAnsTileN;
+  for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
+    int const row = i % kAnsTileM;
+    int const col = i / kAnsTileM;
+    float value = 0.f;
+    if (row < rows && col < cols) {
+      value = C[(m0 + row) + (n0 + col) * ldc];
+    }
+    packed[row + col * kAnsTileM] = value;
+  }
+  __syncthreads();
+
+  auto compressor = Compressor();
+  extern __shared__ __align__(Compressor::shmem_alignment()) unsigned char shared_scratch[];
+  unsigned char *tmp = tmp_global;
+  if (tmp != nullptr && compressor.tmp_size_group() > 0) {
+    tmp += compressor.tmp_size_group() * tile_id;
+  }
+
+  compressor.execute(
+      packed,
+      compressed_tiles + tile_id * compressed_stride,
+      kAnsChunkBytes,
+      comp_sizes + tile_id,
+      shared_scratch,
+      tmp);
+}
+
+/// ANS-compress every 128x128 tile of C. C is not modified.
+cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int iterations) {
+  if (M <= 0 || N <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = CheckNvcompdxSm();
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
+  int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
+  size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
+
+  auto compressor = AnsCompressor();
+  size_t const chunk_bytes = kAnsChunkBytes;
+  size_t const shmem_bytes = static_cast<size_t>(compressor.shmem_size_group());
+  size_t const tmp_bytes = static_cast<size_t>(compressor.tmp_size_total(num_chunks));
+  size_t const packed_stride = align_up_bytes(
+      chunk_bytes, std::max(static_cast<size_t>(compressor.input_alignment()), size_t(256)));
+  size_t const compressed_stride = align_up_bytes(
+      static_cast<size_t>(compressor.max_comp_chunk_size()),
+      std::max(static_cast<size_t>(compressor.output_alignment()), size_t(256)));
+
+  float *d_packed = nullptr;
+  char *d_compressed = nullptr;
+  unsigned long long *d_comp_sizes = nullptr;
+  unsigned char *d_temp = nullptr;
+
+  auto free_all = [&]() {
+    cudaFree(d_packed);
+    cudaFree(d_compressed);
+    cudaFree(d_comp_sizes);
+    cudaFree(d_temp);
+  };
+
+  err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(unsigned long long));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  if (tmp_bytes) {
+    err = cudaMalloc(&d_temp, tmp_bytes);
+    if (err != cudaSuccess) {
+      free_all();
+      return err;
+    }
+  }
+
+  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(unsigned long long));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+
+  err = cudaFuncSetAttribute(
+      compress_tiles_nvcompdx_kernel<AnsCompressor>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shmem_bytes));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+
+  nvtxRangePushA("nvcompdx_ans_tiles");
+  for (int iter = 0; iter < iterations; ++iter) {
+    compress_tiles_nvcompdx_kernel<AnsCompressor>
+        <<<dim3(tiles_m, tiles_n), kAnsThreads, shmem_bytes>>>(
+            C,
+            ldc,
+            M,
+            N,
+            d_packed,
+            packed_stride / sizeof(float),
+            d_compressed,
+            compressed_stride,
+            d_comp_sizes,
+            d_temp);
+  }
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    nvtxRangePop();
+    free_all();
+    return err;
+  }
+  err = cudaDeviceSynchronize();
+  nvtxRangePop();
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+
+  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMPDx ANS (only)");
+  free_all();
+  return err;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // This function defines a CUTLASS GEMM kernel instantiation, constructs its parameters object,
@@ -269,7 +485,8 @@ cudaError_t CutlassSgemmNN(
   float beta,
   float *C,
   int ldc,
-  bool fuse_nvcomp) {
+  bool fuse_nvcomp,
+  int iterations) {
 
   if (!fuse_nvcomp) {
     using ColumnMajor = cutlass::layout::ColumnMajor;
@@ -283,7 +500,13 @@ cudaError_t CutlassSgemmNN(
                                          {C, ldc},
                                          {alpha, beta});
     nvtxRangePushA("cutlass_gemm");
-    cutlass::Status status = gemm_operator(args);
+    cutlass::Status status = cutlass::Status::kSuccess;
+    for (int iter = 0; iter < iterations; ++iter) {
+      status = gemm_operator(args);
+      if (status != cutlass::Status::kSuccess) {
+        break;
+      }
+    }
     cudaError_t sync_status = cudaDeviceSynchronize();
     nvtxRangePop();
     if (status != cutlass::Status::kSuccess) {
@@ -296,25 +519,9 @@ cudaError_t CutlassSgemmNN(
   // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
   // and launches a RowMajor kernel on problem {N, M, K}.
 
-  int device = 0;
-  cudaError_t err = cudaGetDevice(&device);
+  cudaError_t err = CheckNvcompdxSm();
   if (err != cudaSuccess) {
     return err;
-  }
-  int major = 0;
-  int minor = 0;
-  err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  if (major != 10) {
-    std::cerr << "nvCOMPDx kernel in this example is compiled for SM100 (GB200), got SM"
-              << major << minor << std::endl;
-    return cudaErrorInvalidDevice;
   }
 
   using ThreadblockSwizzle = typename CutlassGemmKernel::ThreadblockSwizzle;
@@ -427,7 +634,9 @@ cudaError_t CutlassSgemmNN(
   dim3 block(CutlassGemmKernel::kThreadCount, 1, 1);
 
   nvtxRangePushA("cutlass_gemm");
-  cutlass::Kernel<GemmFusedAns><<<grid, block, dyn_smem>>>(params);
+  for (int iter = 0; iter < iterations; ++iter) {
+    cutlass::Kernel<GemmFusedAns><<<grid, block, dyn_smem>>>(params);
+  }
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     nvtxRangePop();
@@ -441,31 +650,9 @@ cudaError_t CutlassSgemmNN(
     return err;
   }
 
-  std::vector<unsigned long long> h_comp_sizes(num_chunks);
-  err = cudaMemcpy(
-      h_comp_sizes.data(),
-      d_comp_sizes,
-      num_chunks * sizeof(unsigned long long),
-      cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-
-  size_t compressed_bytes = 0;
-  for (size_t i = 0; i < num_chunks; ++i) {
-    compressed_bytes += static_cast<size_t>(h_comp_sizes[i]);
-  }
-  size_t const uncompressed_bytes = num_chunks * chunk_bytes;
-  std::cout << "nvCOMPDx ANS (fused): " << num_chunks
-            << " tiles of " << chunk_bytes << " B, uncompressed "
-            << uncompressed_bytes << " B, compressed " << compressed_bytes
-            << " B, ratio "
-            << (compressed_bytes ? static_cast<double>(uncompressed_bytes) / compressed_bytes : 0.0)
-            << std::endl;
-
+  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMPDx ANS (fused)");
   free_all();
-  return cudaSuccess;
+  return err;
 }
 
 /// Column-major SGEMM via cuBLAS. NVTX covers only the GEMM launch.
@@ -480,7 +667,8 @@ cudaError_t CublasSgemmNN(
   int ldb,
   float beta,
   float *C,
-  int ldc) {
+  int ldc,
+  int iterations) {
 
   cublasHandle_t handle;
   cublasStatus_t status = cublasCreate(&handle);
@@ -489,21 +677,26 @@ cudaError_t CublasSgemmNN(
   }
 
   nvtxRangePushA("cublas_gemm");
-  status = cublasSgemm(
-    handle,
-    CUBLAS_OP_N,
-    CUBLAS_OP_N,
-    M,
-    N,
-    K,
-    &alpha,
-    A,
-    lda,
-    B,
-    ldb,
-    &beta,
-    C,
-    ldc);
+  for (int iter = 0; iter < iterations; ++iter) {
+    status = cublasSgemm(
+      handle,
+      CUBLAS_OP_N,
+      CUBLAS_OP_N,
+      M,
+      N,
+      K,
+      &alpha,
+      A,
+      lda,
+      B,
+      ldb,
+      &beta,
+      C,
+      ldc);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      break;
+    }
+  }
   cudaError_t sync_status = cudaDeviceSynchronize();
   nvtxRangePop();
 
@@ -638,7 +831,8 @@ cudaError_t ReferenceGemm(
   int ldb,
   float beta,
   float *C,
-  int ldc) {
+  int ldc,
+  int iterations) {
 
   dim3 block(16, 16);
   dim3 grid(
@@ -647,7 +841,9 @@ cudaError_t ReferenceGemm(
   );
 
   nvtxRangePushA("reference_gemm");
-  ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+  for (int iter = 0; iter < iterations; ++iter) {
+    ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+  }
   cudaError_t sync_status = cudaDeviceSynchronize();
   nvtxRangePop();
 
@@ -660,9 +856,28 @@ cudaError_t ReferenceGemm(
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Allocate several matrices in GPU device memory and call a single-precision
-/// CUTLASS GEMM kernel.
-cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool fuse_nvcomp) {
+/// CUTLASS GEMM kernel. --nvcomp-only skips GEMM and compresses an M x N matrix.
+cudaError_t TestCutlassGemm(
+    int M,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    bool fuse_nvcomp,
+    bool nvcomp_only,
+    int iterations) {
   cudaError_t result;
+
+  if (nvcomp_only) {
+    float *C = nullptr;
+    result = AllocateMatrix(&C, M, N, 101);
+    if (result != cudaSuccess) {
+      return result;
+    }
+    result = CompressOutputTilesAns(M, N, C, M, iterations);
+    cudaFree(C);
+    return result;
+  }
 
   //
   // Define several matrices to be used as operands to GEMM kernels.
@@ -734,7 +949,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool f
   // Launch cuBLAS GEMM (NVTX range "cublas_gemm" is inside CublasSgemmNN).
   //
 
-  result = CublasSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+  result = CublasSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc, iterations);
 
   if (result != cudaSuccess) {
     std::cerr << "cuBLAS GEMM kernel failed: "
@@ -768,7 +983,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool f
   // Launch CUTLASS GEMM.
   //
 
-  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, fuse_nvcomp);
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, fuse_nvcomp, iterations);
 
   if (result != cudaSuccess) {
     std::cerr << "CUTLASS GEMM kernel failed: "
@@ -787,7 +1002,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool f
   //
 
   // Launch reference GEMM
-  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc, iterations);
 
   if (result != cudaSuccess) {
     std::cerr << "Reference GEMM kernel failed: "
@@ -861,8 +1076,19 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool f
 //
 // usage:
 //
-//   00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]
+//   00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp] [--nvcomp-only] [--iters N]
 //
+static bool is_opt(const char *arg, const char *hyphen, const char *underscore) {
+  return std::strcmp(arg, hyphen) == 0 || std::strcmp(arg, underscore) == 0;
+}
+
+static void PrintUsage(std::ostream &os) {
+  os << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [options]\n"
+     << "  --fuse-nvcomp   ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA\n"
+     << "  --nvcomp-only   Run only tile ANS (no GEMM); uses M x N as the matrix\n"
+     << "  --iters N       Launch each kernel N times (default 10)\n";
+}
+
 int main(int argc, const char *arg[]) {
 
   //
@@ -875,21 +1101,49 @@ int main(int argc, const char *arg[]) {
   int problem[3] = { 4096, 4096, 1024 };
   float scalars[2] = { 1, 0 };
   bool fuse_nvcomp = false;
+  bool nvcomp_only = false;
+  int iterations = 10;
   int positional = 0;
 
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(arg[i], "--fuse-nvcomp") == 0) {
+    if (is_opt(arg[i], "--fuse-nvcomp", "--fuse_nvcomp")) {
       fuse_nvcomp = true;
       continue;
     }
-    if (std::strcmp(arg[i], "--help") == 0 || std::strcmp(arg[i], "-h") == 0) {
-      std::cout << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]\n"
-                << "  --fuse-nvcomp  ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA\n";
+    if (is_opt(arg[i], "--nvcomp-only", "--nvcomp_only")) {
+      nvcomp_only = true;
+      continue;
+    }
+    if (is_opt(arg[i], "--iters", "--iterations")) {
+      if (i + 1 >= argc) {
+        std::cerr << arg[i] << " requires an integer argument\n";
+        PrintUsage(std::cerr);
+        return -1;
+      }
+      std::stringstream ss(arg[++i]);
+      ss >> iterations;
+      if (ss.fail() || iterations < 1) {
+        std::cerr << "Invalid --iters value\n";
+        return -1;
+      }
+      continue;
+    }
+    if (std::strncmp(arg[i], "--iters=", 8) == 0) {
+      std::stringstream ss(arg[i] + 8);
+      ss >> iterations;
+      if (ss.fail() || iterations < 1) {
+        std::cerr << "Invalid --iters value\n";
+        return -1;
+      }
+      continue;
+    }
+    if (is_opt(arg[i], "--help", "-h") || std::strcmp(arg[i], "-h") == 0) {
+      PrintUsage(std::cout);
       return 0;
     }
     if (arg[i][0] == '-') {
-      std::cerr << "Unknown option: " << arg[i] << "\n"
-                << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]\n";
+      std::cerr << "Unknown option: " << arg[i] << "\n";
+      PrintUsage(std::cerr);
       return -1;
     }
     std::stringstream ss(arg[i]);
@@ -901,17 +1155,31 @@ int main(int argc, const char *arg[]) {
     ++positional;
   }
 
+  if (fuse_nvcomp && nvcomp_only) {
+    std::cerr << "--fuse-nvcomp and --nvcomp-only are mutually exclusive\n";
+    return -1;
+  }
+
   //
   // Run the CUTLASS GEMM test.
   //
 
-  std::cout << "Running GEMM: M=" << problem[0]
-            << " N=" << problem[1]
-            << " K=" << problem[2]
-            << " (CUTLASS tile 128x128 => "
-            << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
-            << " CTAs, nvCOMP fusion "
-            << (fuse_nvcomp ? "on" : "off") << ")" << std::endl;
+  if (nvcomp_only) {
+    std::cout << "Running nvCOMP only: M=" << problem[0]
+              << " N=" << problem[1]
+              << " (tiles 128x128 => "
+              << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
+              << " CTAs, iters=" << iterations << ")" << std::endl;
+  } else {
+    std::cout << "Running GEMM: M=" << problem[0]
+              << " N=" << problem[1]
+              << " K=" << problem[2]
+              << " (CUTLASS tile 128x128 => "
+              << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
+              << " CTAs, nvCOMP fusion "
+              << (fuse_nvcomp ? "on" : "off")
+              << ", iters=" << iterations << ")" << std::endl;
+  }
 
   cudaError_t result = TestCutlassGemm(
     problem[0],     // GEMM M dimension
@@ -919,7 +1187,9 @@ int main(int argc, const char *arg[]) {
     problem[2],     // GEMM K dimension
     scalars[0],     // alpha
     scalars[1],     // beta
-    fuse_nvcomp
+    fuse_nvcomp,
+    nvcomp_only,
+    iterations
   );
 
   if (result == cudaSuccess) {

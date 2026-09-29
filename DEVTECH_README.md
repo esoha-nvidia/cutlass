@@ -83,9 +83,9 @@ make 00_basic_gemm -j$(nproc)
 ./examples/00_basic_gemm/00_basic_gemm
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
-  --stats=true -o cutlass_gemm ./examples/00_basic_gemm/00_basic_gemm
+  -o cutlass_gemm --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
-  --stats=true -o cutlass_gemm_nvcomp ./examples/00_basic_gemm/00_basic_gemm --fuse_nvcomp
+  -o cutlass_gemm_nvcomp --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
 ```
 

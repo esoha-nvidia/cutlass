@@ -64,6 +64,7 @@
 
 #include <cublas_v2.h>
 #include <nvtx3/nvToolsExt.h>
+#include <nvcomp/ans.h>
 #include <nvcompdx.hpp>
 
 // Helper methods to check for errors
@@ -103,15 +104,6 @@ using AnsCompressor = decltype(
     nvcompdx::Algorithm<nvcompdx::algorithm::ans>() +
     nvcompdx::DataType<nvcompdx::datatype::uint8>() +
     nvcompdx::Direction<nvcompdx::direction::compress>() +
-    nvcompdx::MaxUncompChunkSize<kAnsChunkBytes>() +
-    nvcompdx::Block() +
-    nvcompdx::BlockWarp<kAnsWarps, true>() +
-    nvcompdx::SM<1000>());
-
-using AnsDecompressor = decltype(
-    nvcompdx::Algorithm<nvcompdx::algorithm::ans>() +
-    nvcompdx::DataType<nvcompdx::datatype::uint8>() +
-    nvcompdx::Direction<nvcompdx::direction::decompress>() +
     nvcompdx::MaxUncompChunkSize<kAnsChunkBytes>() +
     nvcompdx::Block() +
     nvcompdx::BlockWarp<kAnsWarps, true>() +
@@ -366,51 +358,14 @@ __global__ void compress_tiles_nvcompdx_kernel(
       tmp);
 }
 
-/// Decompress one ANS chunk. One CTA per tile; all 256 threads must call execute().
-template <typename Decompressor>
-__global__ void decompress_tiles_nvcompdx_kernel(
-    char const *compressed_tiles,
-    size_t compressed_stride,
-    unsigned long long const *comp_sizes,
-    unsigned char *decompressed_tiles,
-    size_t decompressed_stride,
-    unsigned long long *decomp_sizes,
-    unsigned char *tmp_global) {
-  NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(Decompressor);
-
-  size_t const tile_id = static_cast<size_t>(blockIdx.x);
-  unsigned long long const comp_bytes = comp_sizes[tile_id];
-  if (comp_bytes == 0) {
-    if (threadIdx.x == 0) {
-      decomp_sizes[tile_id] = 0;
-    }
-    return;
-  }
-
-  auto decompressor = Decompressor();
-  extern __shared__ __align__(Decompressor::shmem_alignment()) unsigned char decomp_shared_scratch[];
-  unsigned char *tmp = tmp_global;
-  if (tmp != nullptr && decompressor.tmp_size_group() > 0) {
-    tmp += decompressor.tmp_size_group() * tile_id;
-  }
-
-  decompressor.execute(
-      compressed_tiles + tile_id * compressed_stride,
-      decompressed_tiles + tile_id * decompressed_stride,
-      comp_bytes,
-      decomp_sizes + tile_id,
-      decomp_shared_scratch,
-      tmp);
-}
-
 __global__ void count_ans_tile_mismatches_kernel(
     unsigned char const *packed,
     size_t packed_stride,
     unsigned char const *decompressed,
     size_t decompressed_stride,
-    unsigned long long const *decomp_sizes,
+    size_t const *decomp_sizes,
     size_t num_chunks,
-    unsigned long long chunk_bytes,
+    size_t chunk_bytes,
     unsigned long long *mismatch_chunks) {
   size_t const tile_id = static_cast<size_t>(blockIdx.x);
   if (tile_id >= num_chunks) {
@@ -425,7 +380,7 @@ __global__ void count_ans_tile_mismatches_kernel(
 
   unsigned char const *ref = packed + tile_id * packed_stride;
   unsigned char const *got = decompressed + tile_id * decompressed_stride;
-  for (unsigned long long i = threadIdx.x; i < chunk_bytes; i += blockDim.x) {
+  for (size_t i = threadIdx.x; i < chunk_bytes; i += blockDim.x) {
     if (ref[i] != got[i]) {
       tile_mismatch = 1;
     }
@@ -436,7 +391,7 @@ __global__ void count_ans_tile_mismatches_kernel(
   }
 }
 
-/// After compress iterations: decompress each tile with nvCOMPDx and compare to the packed input.
+/// After compress iterations: nvCOMP LLIF batched ANS decompress, then compare to packed tiles.
 cudaError_t ValidateAnsCompression(
     void const *packed,
     size_t packed_stride,
@@ -449,19 +404,41 @@ cudaError_t ValidateAnsCompression(
     return cudaSuccess;
   }
 
-  size_t const shmem_bytes = static_cast<size_t>(AnsDecompressor::shmem_size_group());
-  size_t const tmp_bytes = static_cast<size_t>(AnsDecompressor::tmp_size_total(num_chunks));
+  nvcompBatchedANSDecompressOpts_t const opts = nvcompBatchedANSDecompressDefaultOpts;
+  size_t temp_bytes = 0;
+  nvcompStatus_t nvst = nvcompBatchedANSDecompressGetTempSizeAsync(
+      num_chunks,
+      chunk_bytes,
+      opts,
+      &temp_bytes,
+      num_chunks * chunk_bytes);
+  if (nvst != nvcompSuccess) {
+    std::cerr << "nvcompBatchedANSDecompressGetTempSizeAsync failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
+    return cudaErrorUnknown;
+  }
+
   size_t const decompressed_stride = align_up_bytes(
-      chunk_bytes, std::max(static_cast<size_t>(AnsDecompressor::output_alignment()), size_t(256)));
+      chunk_bytes, std::max(nvcompANSRequiredDecompressionAlignment, size_t(256)));
 
   unsigned char *d_decompressed = nullptr;
-  unsigned long long *d_decomp_sizes = nullptr;
-  unsigned char *d_temp = nullptr;
+  size_t *d_decomp_sizes = nullptr;
+  size_t *d_comp_bytes = nullptr;
+  size_t *d_out_caps = nullptr;
+  void **d_in_ptrs = nullptr;
+  void **d_out_ptrs = nullptr;
+  void *d_temp = nullptr;
+  nvcompStatus_t *d_statuses = nullptr;
   unsigned long long *d_mismatches = nullptr;
 
   auto free_all = [&]() {
     cudaFree(d_mismatches);
+    cudaFree(d_statuses);
     cudaFree(d_temp);
+    cudaFree(d_out_ptrs);
+    cudaFree(d_in_ptrs);
+    cudaFree(d_out_caps);
+    cudaFree(d_comp_bytes);
     cudaFree(d_decomp_sizes);
     cudaFree(d_decompressed);
   };
@@ -470,7 +447,32 @@ cudaError_t ValidateAnsCompression(
   if (err != cudaSuccess) {
     return err;
   }
-  err = cudaMalloc(&d_decomp_sizes, num_chunks * sizeof(unsigned long long));
+  err = cudaMalloc(&d_decomp_sizes, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_comp_bytes, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_out_caps, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_in_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_out_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_statuses, num_chunks * sizeof(nvcompStatus_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -480,14 +482,55 @@ cudaError_t ValidateAnsCompression(
     free_all();
     return err;
   }
-  if (tmp_bytes) {
-    err = cudaMalloc(&d_temp, tmp_bytes);
+  if (temp_bytes) {
+    err = cudaMalloc(&d_temp, temp_bytes);
     if (err != cudaSuccess) {
       free_all();
       return err;
     }
   }
-  err = cudaMemset(d_decomp_sizes, 0, num_chunks * sizeof(unsigned long long));
+
+  std::vector<unsigned long long> h_comp_ull(num_chunks);
+  err = cudaMemcpy(
+      h_comp_ull.data(),
+      comp_sizes,
+      num_chunks * sizeof(unsigned long long),
+      cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  std::vector<size_t> h_comp_bytes(num_chunks);
+  std::vector<size_t> h_out_caps(num_chunks, chunk_bytes);
+  std::vector<void *> h_in_ptrs(num_chunks);
+  std::vector<void *> h_out_ptrs(num_chunks);
+  char *comp_base = static_cast<char *>(const_cast<void *>(compressed));
+  for (size_t i = 0; i < num_chunks; ++i) {
+    h_comp_bytes[i] = static_cast<size_t>(h_comp_ull[i]);
+    h_in_ptrs[i] = comp_base + i * compressed_stride;
+    h_out_ptrs[i] = d_decompressed + i * decompressed_stride;
+  }
+  err = cudaMemcpy(d_comp_bytes, h_comp_bytes.data(), num_chunks * sizeof(size_t), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemcpy(d_out_caps, h_out_caps.data(), num_chunks * sizeof(size_t), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemcpy(d_in_ptrs, h_in_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemcpy(d_out_ptrs, h_out_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemset(d_decomp_sizes, 0, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -498,30 +541,25 @@ cudaError_t ValidateAnsCompression(
     return err;
   }
 
-  err = cudaFuncSetAttribute(
-      decompress_tiles_nvcompdx_kernel<AnsDecompressor>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shmem_bytes));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-
-  nvtxRangePushA("nvcompdx_ans_validate");
-  decompress_tiles_nvcompdx_kernel<AnsDecompressor>
-      <<<static_cast<unsigned>(num_chunks), kAnsThreads, shmem_bytes>>>(
-          static_cast<char const *>(compressed),
-          compressed_stride,
-          comp_sizes,
-          d_decompressed,
-          decompressed_stride,
-          d_decomp_sizes,
-          d_temp);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
+  nvtxRangePushA("nvcomp_ans_validate");
+  nvst = nvcompBatchedANSDecompressAsync(
+      reinterpret_cast<const void *const *>(d_in_ptrs),
+      d_comp_bytes,
+      d_out_caps,
+      d_decomp_sizes,
+      num_chunks,
+      d_temp,
+      temp_bytes,
+      d_out_ptrs,
+      opts,
+      d_statuses,
+      0);
+  if (nvst != nvcompSuccess) {
     nvtxRangePop();
+    std::cerr << "nvcompBatchedANSDecompressAsync failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
     free_all();
-    return err;
+    return cudaErrorUnknown;
   }
   count_ans_tile_mismatches_kernel<<<static_cast<unsigned>(num_chunks), kAnsThreads>>>(
       static_cast<unsigned char const *>(packed),
@@ -545,6 +583,22 @@ cudaError_t ValidateAnsCompression(
     return err;
   }
 
+  std::vector<nvcompStatus_t> h_statuses(num_chunks);
+  err = cudaMemcpy(
+      h_statuses.data(), d_statuses, num_chunks * sizeof(nvcompStatus_t), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  for (size_t i = 0; i < num_chunks; ++i) {
+    if (h_statuses[i] != nvcompSuccess) {
+      std::cerr << "nvCOMP LLIF decompress status tile " << i << ": "
+                << nvcompGetStatusString(h_statuses[i]) << std::endl;
+      free_all();
+      return cudaErrorUnknown;
+    }
+  }
+
   unsigned long long mismatches = 0;
   err = cudaMemcpy(&mismatches, d_mismatches, sizeof(mismatches), cudaMemcpyDeviceToHost);
   free_all();
@@ -557,7 +611,8 @@ cudaError_t ValidateAnsCompression(
               << " tiles did not round-trip" << std::endl;
     return cudaErrorUnknown;
   }
-  std::cout << "ANS decompress validation: passed (" << num_chunks << " tiles)" << std::endl;
+  std::cout << "ANS decompress validation (nvCOMP LLIF): passed (" << num_chunks
+            << " tiles)" << std::endl;
   return cudaSuccess;
 }
 

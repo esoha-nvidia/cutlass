@@ -81,6 +81,8 @@ cmake .. \
 make 00_basic_gemm -j$(nproc)
 
 ./examples/00_basic_gemm/00_basic_gemm
+./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
+./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
   -o cutlass_gemm --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm

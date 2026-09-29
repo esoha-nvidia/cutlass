@@ -35,6 +35,13 @@ cutlass_example_add_executable(
 
 target_link_libraries(00_basic_gemm PRIVATE cublas)
 
+set(NVCOMP_ROOT "/home/esoha/nvcomp-dev/nvcomp"
+    CACHE PATH "nvCOMP source prefix (include/nvcomp/ans.h)")
+set(NVCOMP_LIBRARY_DIR "${NVCOMP_ROOT}/build/lib"
+    CACHE PATH "Directory containing libnvcomp.so")
+target_include_directories(00_basic_gemm PRIVATE "${NVCOMP_ROOT}/include")
+target_link_libraries(00_basic_gemm PRIVATE "${NVCOMP_LIBRARY_DIR}/libnvcomp.so")
+
 set(MATHDX_ROOT "/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06"
     CACHE PATH "MathDx prefix (contains include/nvcompdx.hpp)")
 set(mathdx_CUTLASS_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "CUTLASS root for MathDx find_package")
@@ -52,4 +59,6 @@ endif()
 
 set_target_properties(00_basic_gemm PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
-  INTERPROCEDURAL_OPTIMIZATION ON)
+  INTERPROCEDURAL_OPTIMIZATION ON
+  BUILD_RPATH "${NVCOMP_LIBRARY_DIR}"
+  INSTALL_RPATH "${NVCOMP_LIBRARY_DIR}")

@@ -90,5 +90,7 @@ make 00_basic_gemm -j$(nproc)
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
   -o cutlass_nvcomp_only --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
+
+
 ```
 

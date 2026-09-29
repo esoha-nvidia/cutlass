@@ -1,0 +1,1697 @@
+/*
+ * Copyright (c) 2018-2020, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/** @file gpuinflate.cu
+
+  Derived from zlib's contrib/puff.c, original copyright notice below
+
+**/
+
+/*
+Copyright (C) 2002-2013 Mark Adler, all rights reserved
+version 2.3, 21 Jan 2013
+
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the author be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+claim that you wrote the original software. If you use this software
+in a product, an acknowledgment in the product documentation would be
+appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+Mark Adler    madler@alumni.caltech.edu
+*/
+
+#pragma once
+
+#include <cuda/atomic>
+
+#include <type_traits>
+
+#include "block_utils.cuh"
+#include "CorrectnessChecks.cuh"
+#include "CudaConstants.h"
+#include "gdeflate/gzip_util.cuh"
+#include "LZ77_decomp.cuh"
+#include "nvcomp/utils.hpp"
+#include "nvcomp_device_common.cuh"
+
+#include <stdint.h>
+
+namespace nvcomp_deflate
+{
+// Note: currently ENABLE_PREFETCH is broken
+#define ENABLE_PREFETCH 0
+
+#if ENABLE_PREFETCH
+#define NUMTHREADS (3 * WARP_SIZE) // Threads per block
+#else
+#define NUMTHREADS (2 * WARP_SIZE) // Threads per block
+#endif // ENABLE_PREFETCH
+
+#define MAX_CHUNK_SIZE 65536
+
+#define MAXBITS 15 // maximum bits in a code
+#define MAXLCODES 288 // 286                     // maximum number of literal/length codes
+#define MAXDCODES 32 // 30                     // maximum number of distance codes
+#define MAXCODES (MAXLCODES + MAXDCODES) // maximum codes lengths to read
+#define FIXLCODES 288 // number of fixed literal/length codes
+
+#define LOG2LENLUT 10
+#define LOG2DISTLUT 8
+#define ALPHABET_SIZE 19
+
+/**
+ * @brief Input parameters for the decompression interface
+ **/
+struct gpu_inflate_input_s
+{
+  const void *srcDevice;
+  uint64_t srcSize;
+  void *dstDevice;
+  uint64_t dstSize;
+};
+
+/**
+ * @brief Output parameters for the decompression interface
+ **/
+struct gpu_inflate_status_s
+{
+  uint64_t bytes_written;
+  deflateStatus_t status;
+  uint32_t reserved;
+};
+
+/**
+ * @brief Intermediate arrays for building huffman tables
+ **/
+struct scratch_arr
+{
+  int16_t lengths[MAXCODES]; ///< descriptor code lengths
+  int16_t offs[MAXBITS + 1]; ///< offset in symbol table for each length (scratch)
+};
+
+/**
+ * @brief Huffman LUTs for length and distance codes
+ **/
+struct lut_arr
+{
+  int32_t lenlut
+    [1 << LOG2LENLUT]; ///< LUT for length decoding, for each codeword, every possible combination of (10 - symbol_len) after the codeword
+  // is saved in the table: 1024 = 8*24 + 4*152 + 2*112
+  int32_t distlut[1 << LOG2DISTLUT]; ///< LUT for fast distance decoding
+};
+
+/// 2 batches of 32 symbols
+#define SEQ_BATCH_NUM 2
+
+/**
+ * @brief Inter-warp communication queue
+ **/
+struct xwarp_s
+{
+  int16_t _seq_len[SEQ_BATCH_NUM]; //< Length of each batch - <0:end, 0:not ready, >0:symbol count
+  // Note: We have 2 sequence batches, in which warp0 (thread/lane 0), and warp1 communicates.
+  //       While warp 1 processes one sequence batch, thread 0 is filling/decoding the other sequence batch.
+  // 0..15 bits represent distance, 16..31 bits represent match length, 32..65 bits represent output buffer offset.
+  uint64_t _sequences[WARP_SIZE * SEQ_BATCH_NUM];
+
+  __device__ cuda::atomic_ref<int16_t, cuda::thread_scope_block> seq_len(int ix)
+  {
+    return cuda::atomic_ref<int16_t, cuda::thread_scope_block>{_seq_len[ix]};
+  }
+
+  __device__ cuda::atomic_ref<uint64_t, cuda::thread_scope_block> sequences(int ix)
+  {
+    return cuda::atomic_ref<uint64_t, cuda::thread_scope_block>{_sequences[ix]};
+  }
+};
+
+#if ENABLE_PREFETCH
+#define LOG2_PREFETCH_SIZE 9 // Must be at least LOG2_WARP_SIZE+3
+static_assert(LOG2_PREFETCH_SIZE >= (LOG2_WARP_SIZE + 3), "LOG2_PREFETCH_SIZE must be at least LOG2_WARP_SIZE+3");
+#define PREFETCH_SIZE (1 << LOG2_PREFETCH_SIZE)
+
+#define PREFETCH_ADDR32(q, p) (uint32_t *)(&q.pref_data[(PREFETCH_SIZE - 4) & (size_t)(p)])
+/// @brief Prefetcher state
+struct prefetch_queue_s
+{
+  const uint8_t *cur_p; ///< Prefetch location
+  int run; ///< prefetcher will exit when run=0
+  uint8_t pref_data[PREFETCH_SIZE];
+};
+
+#endif // ENABLE_PREFETCH
+
+/**
+ * @brief Inflate decompressor state
+ **/
+struct inflate_state_s
+{
+  // output state
+  uint8_t *out; ///< output buffer
+  uint8_t *outbase; ///< start of output buffer
+  uint8_t *outmid; ///< intermediate output position for the LZ process.
+  uint8_t *outend; ///< end of output buffer
+  // Input state
+  uint8_t *cur; ///< input buffer
+  uint8_t *end; ///< end of input buffer
+
+  uint2 bitbuf; ///< bit buffer (64-bit)
+  uint32_t bitpos; ///< position in bit buffer
+
+  deflateStatus_t err; ///< Error status
+  int btype; ///< current block type
+  int blast; ///< last block
+  uint32_t stored_blk_len; ///< length of stored (uncompressed) block
+
+  uint16_t first_slow_len; ///< first code not in fast LUT
+  uint16_t index_slow_len;
+  uint16_t first_slow_dist;
+  uint16_t index_slow_dist;
+
+  xwarp_s x;
+#if ENABLE_PREFETCH
+  volatile prefetch_queue_s pref;
+#endif
+
+  int16_t lencnt[MAXBITS + 1]; // Contains the number of codes of each length
+  int16_t lensym[FIXLCODES]; // Assumes FIXLCODES >= MAXLCODES, contains the codewords in lexicographical order, e.g.:
+  // for BT1: lensym[0] = #256, lensym[24] = 0x00, lensym[168] = #280
+  int16_t distcnt[MAXBITS + 1];
+  int16_t distsym[MAXDCODES];
+
+  union
+  {
+    scratch_arr scratch;
+    lut_arr lut;
+  } u;
+  inflate_state_s() = default;
+};
+
+inline __device__ unsigned int bfe(unsigned int source, unsigned int bit_start, unsigned int num_bits)
+{
+  unsigned int bits;
+  asm("bfe.u32 %0, %1, %2, %3;" : "=r"(bits) : "r"(source), "r"(bit_start), "r"(num_bits));
+  return bits;
+};
+
+using nvcomp::loadUpTo4Bytes;
+
+inline __device__ uint32_t showbits(inflate_state_s *s, uint32_t n)
+{
+  uint32_t next32 = __funnelshift_rc(s->bitbuf.x, s->bitbuf.y, s->bitpos);
+  return (next32 & ((1 << n) - 1));
+}
+
+inline __device__ uint32_t nextbits32(inflate_state_s *s)
+{
+  return __funnelshift_rc(s->bitbuf.x, s->bitbuf.y, s->bitpos);
+}
+
+inline __device__ void skipbits(inflate_state_s *s, uint32_t n)
+{
+  uint32_t bitpos = s->bitpos + n;
+  if (bitpos >= 32)
+  {
+    uint8_t *cur = s->cur + 8;
+    s->bitbuf.x = s->bitbuf.y;
+    s->bitbuf.y = loadUpTo4Bytes(cur, s->end - cur);
+    s->cur = cur - 4;
+    bitpos &= 0x1f;
+  }
+  s->bitpos = bitpos;
+}
+
+template <bool CORRECTNESS_CHECK>
+__device__ uint32_t
+getbits(inflate_state_s *s, uint32_t n, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *correctness_checker)
+{
+  DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+    s->cur + nvcomp::roundUpDiv((s->bitpos + n), 8U) > s->end,
+    DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+    __LINE__,
+    __func__,
+    correctness_checker
+  );
+  uint32_t v = showbits(s, n);
+  skipbits(s, n);
+  return v;
+}
+
+/**
+ * @brief Decode a code from the stream s using huffman table {symbols,counts}.
+ * Return the symbol or a negative value if there is an error.
+ * If all of the lengths are zero, i.e. an empty code, or if the code is
+ * incomplete and an invalid code is received, then -10 is returned after
+ * reading MAXBITS bits.
+ *
+ * Format notes:
+ *
+ * - The codes as stored in the compressed data are bit-reversed relative to
+ *   a simple integer ordering of codes of the same lengths.  Hence below the
+ *   bits are pulled from the compressed data one at a time and used to
+ *   build the code value reversed from what is in the stream in order to
+ *   permit simple integer comparisons for decoding.  A table-based decoding
+ *   scheme (as used in zlib) does not need to do this reversal.
+ *
+ * - The first code for the shortest length is all zeros.  Subsequent codes of
+ *   the same length are simply integer increments of the previous code.  When
+ *   moving up a length, a zero bit is appended to the code.  For a complete
+ *   code, the last code of the longest length will be all ones.
+ *
+ * - Incomplete codes are handled by this decoder, since they are permitted
+ *   in the deflate format.  See the format notes for fixed() and dynamic().
+ **/
+template <bool CORRECTNESS_CHECK>
+__device__ int decode(
+  inflate_state_s *s,
+  const int16_t *counts,
+  const int16_t *symbols,
+  DeflateCorrectnessChecker<CORRECTNESS_CHECK> *correctness_checker
+)
+{
+  unsigned int len; // current number of bits in code
+  unsigned int code; // len bits being decoded
+  unsigned int first; // first code of length len
+  unsigned int count; // number of codes of length len
+  uint32_t next32r = __brev(nextbits32(s));
+
+  first = 0;
+  for (len = 1; len <= MAXBITS; len++)
+  {
+    code = (next32r >> (32 - len)) - first;
+    count = counts[len];
+    if (code < count) // if length len, return symbol
+    {
+      skipbits(s, len);
+      return symbols[code];
+    }
+    symbols += count; // else update for next length
+    first += count;
+    first <<= 1;
+  }
+  return -10; // ran out of codes
+}
+
+/**
+ * @brief Given the list of code lengths length[0..n-1] representing a canonical
+ * Huffman code for n symbols, construct the tables required to decode those
+ * codes.  Those tables are the number of codes of each length, and the symbols
+ * sorted by length, retaining their original order within each length.  The
+ * return value is zero for a complete code set, negative for an over-
+ * subscribed code set, and positive for an incomplete code set.  The tables
+ * can be used if the return value is zero or positive, but they cannot be used
+ * if the return value is negative.  If the return value is zero, it is not
+ * possible for decode() using that table to return an error--any stream of
+ * enough bits will resolve to a symbol.  If the return value is positive, then
+ * it is possible for decode() using that table to return an error for received
+ * codes past the end of the incomplete lengths.
+ *
+ * Not used by decode(), but used for error checking, count[0] is the number
+ * of the n symbols not in the code.  So n - count[0] is the number of
+ * codes.  This is useful for checking for incomplete codes that have more than
+ * one symbol, which is an error in a dynamic block.
+ *
+ * Assumption: for all i in 0..n-1, 0 <= length[i] <= MAXBITS
+ * This is assured by the construction of the length arrays in dynamic() and
+ * fixed() and is not verified by construct().
+ *
+ * Format notes:
+ *
+ * - Permitted and expected examples of incomplete codes are one of the fixed
+ *   codes and any code with a single symbol which in deflate is coded as one
+ *   bit instead of zero bits.  See the format notes for fixed() and dynamic().
+ *
+ * - Within a given code length, the symbols are kept in ascending order for
+ *   the code bits definition.
+ **/
+
+template <bool CORRECTNESS_CHECK = false>
+__device__ int construct(
+  inflate_state_s *s,
+  int16_t *counts,
+  int16_t *symbols,
+  const int16_t *length,
+  int n,
+  DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker = nullptr
+)
+{
+  int symbol; // current symbol when stepping through length[]
+  int len; // current length when stepping through counts[]
+  int left; // number of possible codes left of current length
+  int16_t *offs = s->u.scratch.offs;
+
+  // count number of codes of each length
+  for (len = 0; len <= MAXBITS; len++)
+  {
+    counts[len] = 0;
+  }
+  for (symbol = 0; symbol < n; symbol++)
+  {
+    (counts[length[symbol]])++; // assumes lengths are within bounds
+  }
+  if (counts[0] == n) // no codes!
+  {
+    return 0;
+  }
+
+  // check for an over-subscribed or incomplete set of lengths
+  left = 1; // one possible code of zero length
+  for (len = 1; len <= MAXBITS; len++)
+  {
+    left <<= 1; // one more bit, double codes left
+    left -= counts[len]; // deduct count from possible codes
+    if (left < 0)
+    { // over-subscribed--return negative
+      DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+        DeflateCorrectnessErrorTypes::OVERSUBSCRIBED_DYNAMIC_HUFFMAN_TABLE,
+        __LINE__,
+        __func__,
+        checker
+      );
+      return left; // left > 0 means incomplete
+    }
+  }
+
+  // generate offsets into symbol table for each length for sorting
+  offs[1] = 0;
+  for (len = 1; len < MAXBITS; len++)
+  {
+    offs[len + 1] = offs[len] + counts[len];
+  }
+
+  // put symbols in table sorted by length, by symbol order within each length
+  for (symbol = 0; symbol < n; symbol++)
+  {
+    if (length[symbol] != 0)
+    {
+      symbols[offs[length[symbol]]++] = symbol;
+    }
+  }
+
+  //return zero for complete set, positive for incomplete set
+  return left;
+}
+
+/// permutation of code length codes
+static const __device__ __constant__ uint8_t g_code_order[ALPHABET_SIZE + 1] = {16, 17, 18, 0, 8,  7, 9,  6, 10, 5,
+                                                                                11, 4,  12, 3, 13, 2, 14, 1, 15, 0xff};
+
+/// Dynamic block (custom huffman tables)
+template <bool CORRECTNESS_CHECK>
+__device__ deflateStatus_t init_dynamic(inflate_state_s *s, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+{
+  int nlen, ndist, ncode; /* number of lengths in descriptor */
+  int index; /* index of lengths[] */
+  int err; /* construct() return value */
+  int16_t *lengths = s->u.scratch.lengths;
+  // get number of lengths in each table, check lengths
+  nlen = getbits<CORRECTNESS_CHECK>(s, 5, checker) + 257;
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+  {
+    return deflateErrorCannotDecompress;
+  }
+  ndist = getbits<CORRECTNESS_CHECK>(s, 5, checker) + 1;
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+  {
+    return deflateErrorCannotDecompress;
+  }
+  ncode = getbits<CORRECTNESS_CHECK>(s, 4, checker) + 4;
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+  {
+    return deflateErrorCannotDecompress;
+  }
+  // Note:
+  // - nlen valid range: up to 1-286 (inclusive)
+  // - ndist valid range: According to the RFC (RFC1951 ), distance codes 30-31 will never actually occur
+  //                      in the compressed data, therefore the usable range of ndist actually reduces to 1-30 (inclusive)
+  if (nlen > (MAXLCODES - 2) || ndist > (MAXDCODES - 2))
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::HCLEN_HDIST_TOO_BIG,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorInvalidValue; // bad counts
+  }
+  // read code length code lengths (really), missing lengths are zero
+  for (index = 0; index < ncode; index++)
+  {
+    lengths[g_code_order[index]] = getbits<CORRECTNESS_CHECK>(s, 3, checker);
+    if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+    {
+      return deflateErrorCannotDecompress;
+    }
+  }
+  for (; index < ALPHABET_SIZE; index++)
+  {
+    lengths[g_code_order[index]] = 0;
+  }
+
+  // build huffman table for code lengths codes (use lencode temporarily)
+  err = construct<CORRECTNESS_CHECK>(s, s->lencnt, s->lensym, lengths, ALPHABET_SIZE, checker);
+  if (err != 0) // require complete code set here
+  {
+    return deflateErrorCannotDecompress;
+  }
+
+  // read length/literal and distance code length tables
+  index = 0;
+  while (index < nlen + ndist)
+  {
+    int symbol = decode<CORRECTNESS_CHECK>(s, s->lencnt, s->lensym, checker);
+    if (symbol < 0)
+    {
+      DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+        DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+        __LINE__,
+        __func__,
+        checker
+      );
+      return deflateErrorInvalidValue; // invalid symbol
+    }
+    if (symbol < 16) // length in 0..15
+    {
+      lengths[index++] = symbol;
+    }
+    else
+    { // repeat instruction
+      int len = 0; // last length to repeat, assume repeating zeros
+      if (symbol == 16)
+      { // repeat last length 3..6 times
+        if (index == 0)
+        {
+          DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+            DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+            __LINE__,
+            __func__,
+            checker
+          );
+          return deflateErrorInvalidValue; // no last length!
+        }
+        len = lengths[index - 1]; // last length
+        symbol = 3 + getbits<CORRECTNESS_CHECK>(s, 2, checker);
+        if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+        {
+          return deflateErrorCannotDecompress;
+        }
+      }
+      else if (symbol == 17)
+      { // repeat zero 3..10 times
+        symbol = 3 + getbits<CORRECTNESS_CHECK>(s, 3, checker);
+        if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+        {
+          return deflateErrorCannotDecompress;
+        }
+      }
+      else
+      { // == 18, repeat zero 11..138 times
+        symbol = 11 + getbits<CORRECTNESS_CHECK>(s, 7, checker);
+        if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+        {
+          return deflateErrorCannotDecompress;
+        }
+      }
+      if (index + symbol > nlen + ndist)
+      {
+        DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+          DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+          __LINE__,
+          __func__,
+          checker
+        );
+        return deflateErrorInvalidValue; // too many lengths!
+      }
+      while (symbol--) // repeat last or zero symbol times
+      {
+        lengths[index++] = len;
+      }
+    }
+  }
+
+  // check for end-of-block code -- there better be one!
+  if (lengths[256] == 0)
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorInvalidValue;
+  }
+
+  // build huffman table for literal/length codes
+  err = construct<CORRECTNESS_CHECK>(s, s->lencnt, s->lensym, lengths, nlen, checker);
+  if (err && (err < 0 || nlen != s->lencnt[0] + s->lencnt[1]))
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorInvalidValue; // incomplete code ok only for single length 1 code
+  }
+
+  // build huffman table for distance codes
+  err = construct<CORRECTNESS_CHECK>(s, s->distcnt, s->distsym, &lengths[nlen], ndist, checker);
+  if (err && (err < 0 || ndist != s->distcnt[0] + s->distcnt[1]))
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::INVALID_DYNAMIC_HUFFMAN_TABLE,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorInvalidValue; // incomplete code ok only for single length 1 code
+  }
+
+  return deflateSuccess;
+}
+
+/**
+ * @brief Initializes a fixed codes block.
+ *
+ * Format notes:
+ *
+ * - This block type can be useful for compressing small amounts of data for
+ *   which the size of the code descriptions in a dynamic block exceeds the
+ *   benefit of custom codes for that block.  For fixed codes, no bits are
+ *   spent on code descriptions.  Instead the code lengths for literal/length
+ *   codes and distance codes are fixed.  The specific lengths for each symbol
+ *   can be seen in the "for" loops below.
+ *
+ * - The literal/length code is complete, but has two symbols that are invalid
+ *   and should result in an error if received.  This cannot be implemented
+ *   simply as an incomplete code since those two symbols are in the "middle"
+ *   of the code.  They are eight bits long and the longest literal/length\
+ *   code is nine bits.  Therefore the code must be constructed with those
+ *   symbols, and the invalid symbols must be detected after decoding.
+ *
+ * - The fixed distance codes also have two invalid symbols that should result
+ *   in an error if received.  Since all of the distance codes are the same
+ *   length, this can be implemented as an incomplete code.  Then the invalid
+ *   codes are detected while decoding.
+ **/
+__device__ deflateStatus_t init_fixed(inflate_state_s *s)
+{
+  int16_t *lengths = s->u.scratch.lengths;
+  int symbol;
+
+  // literal/length table
+  for (symbol = 0; symbol < 144; symbol++)
+  {
+    lengths[symbol] = 8;
+  }
+  for (; symbol < 256; symbol++)
+  {
+    lengths[symbol] = 9;
+  }
+  for (; symbol < 280; symbol++)
+  {
+    lengths[symbol] = 7;
+  }
+  for (; symbol < FIXLCODES; symbol++)
+  {
+    lengths[symbol] = 8;
+  }
+  construct(s, s->lencnt, s->lensym, lengths, FIXLCODES);
+
+  // distance table
+  for (symbol = 0; symbol < MAXDCODES; symbol++)
+  {
+    lengths[symbol] = 5;
+  }
+
+  // build huffman table for distance codes
+  construct(s, s->distcnt, s->distsym, lengths, MAXDCODES);
+
+  return deflateSuccess;
+}
+
+/**
+ * @brief Decode literal/length and distance codes until an end-of-block code.
+ *
+ * Format notes:
+ *
+ * - Compressed data that is after the block type if fixed or after the code
+ *   description if dynamic is a combination of literals and length/distance
+ *   pairs terminated by and end-of-block code.  Literals are simply Huffman
+ *   coded bytes.  A length/distance pair is a coded length followed by a
+ *   coded distance to represent a string that occurs earlier in the
+ *   uncompressed data that occurs again at the current location.
+ *
+ * - Literals, lengths, and the end-of-block code are combined into a single
+ *   code of up to 286 symbols. But will reserve space for 288 symbols. They 
+ *   are 256 literals (0..255), 29 length symbols (257..285), and the 
+ *   end-of-block symbol (256).
+ *
+ * - There are 256 possible lengths (3..258), and so 29 symbols are not enough
+ *   to represent all of those.  Lengths 3..10 and 258 are in fact represented
+ *   by just a length symbol.  Lengths 11..257 are represented as a symbol and
+ *   some number of extra bits that are added as an integer to the base length
+ *   of the length symbol.  The number of extra bits is determined by the base
+ *   length symbol.  These are in the static arrays below, lens[] for the base
+ *   lengths and lext[] for the corresponding number of extra bits.
+ *
+ * - The reason that 258 gets its own symbol is that the longest length is used
+ *   often in highly redundant files.  Note that 258 can also be coded as the
+ *   base value 227 plus the maximum extra value of 31.  While a good deflate
+ *   should never do this, it is not an error, and should be decoded properly.
+ *
+ * - If a length is decoded, including its extra bits if any, then it is
+ *   followed a distance code.  There are up to 30 distance symbols.  Again
+ *   there are many more possible distances (1..32768), so extra bits are added
+ *   to a base value represented by the symbol.  The distances 1..4 get their
+ *   own symbol, but the rest require extra bits.  The base distances and
+ *   corresponding number of extra bits are below in the static arrays dist[]
+ *   and dext[].
+ *
+ * - Literal bytes are simply written to the output.  A length/distance pair is
+ *   an instruction to copy previously uncompressed bytes to the output.  The
+ *   copy is from distance bytes back in the output stream, copying for length
+ *   bytes.
+ *
+ * - Distances pointing before the beginning of the output data are not
+ *   permitted.
+ *
+ * - Overlapped copies, where the length is greater than the distance, are
+ *   allowed and common.  For example, a distance of one and a length of 258
+ *   simply copies the last byte 258 times.  A distance of four and a length of
+ *   twelve copies the last four bytes three times.  A simple forward copy
+ *   ignoring whether the length is greater than the distance or not implements
+ *   this correctly.  You should not use memcpy() since its behavior is not
+ *   defined for overlapped arrays.  You should not use memmove() or bcopy()
+ *   since though their behavior -is- defined for overlapping arrays, it is
+ *   defined to do the wrong thing in this case.
+ **/
+
+/// permutation of code length codes
+static const __device__ __constant__ uint16_t g_lens[31] = { // Size base for length codes 257..287
+  3,  4,  5,  6,  7,  8,  9,  10,  11,  13,  15,  17,  19,  23, 27, 31,
+  35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 1,  1
+};
+static const __device__ __constant__ uint16_t g_lext[31] = { // Extra bits for length codes 257..287
+  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0
+};
+
+static const __device__ __constant__ uint16_t g_dists[32] = { // Offset base for distance codes 0..31
+  1,   2,   3,   4,   5,    7,    9,    13,   17,   25,   33,   49,    65,    97,    129,        193,
+  257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, UINT16_MAX, UINT16_MAX
+};
+static const __device__ __constant__ uint16_t g_dext[32] = { // Extra bits for distance codes 0..31
+  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 0, 0
+};
+
+/// @brief Thread 0 only: decode bitstreams and output symbols into the symbol queue
+template <bool should_output, bool CORRECTNESS_CHECK>
+__device__ void general_decode_symbols(inflate_state_s *s, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+{
+  uint32_t bitpos = s->bitpos;
+  uint2 bitbuf = s->bitbuf;
+  uint8_t *cur = s->cur;
+  uint8_t *end = s->end;
+  int32_t batch = 0;
+  uint8_t *out = s->out;
+  uint32_t offset = 0;
+  int32_t sym;
+
+  do
+  {
+    uint64_t sequence = 0;
+    // Wait for the next batch entry to be empty
+#if ENABLE_PREFETCH
+    // Wait for prefetcher to fetch a worst-case of 48 bits per symbol
+    while ((*(volatile int32_t *)&s->pref.cur_p - (int32_t)cur < WARP_SIZE * 6) ||
+           (s->x.seq_len(batch).load(cuda::std::memory_order_relaxed) != 0))
+#else
+    while (s->x.seq_len(batch).load(cuda::std::memory_order_acquire) != 0)
+#endif
+    {
+      __nanosleep(1);
+    }
+
+    int8_t seq_index = 0;
+#if ENABLE_PREFETCH
+    if (cur + (bitpos >> 3) >= end)
+    {
+      s->err = deflateErrorNotSupported;
+      break;
+    }
+#endif
+    // Inner loop decoding symbols
+    do
+    {
+      uint32_t next32 = __funnelshift_rc(bitbuf.x, bitbuf.y, bitpos); // nextbits32(s);
+      uint32_t len;
+      sym = s->u.lut.lenlut[next32 & ((1 << LOG2LENLUT) - 1)];
+      if ((uint32_t)sym < (uint32_t)(0x100 << 5))
+      {
+        // We can lookup a second symbol if this was a short literal
+        len = sym & 0x1f;
+        sym >>= 5;
+        if (should_output)
+        {
+          if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+                (out + offset) >= s->outend,
+                DeflateCorrectnessErrorTypes::OUTPUT_BUFFER_TOO_SMALL,
+                __LINE__,
+                __func__,
+                checker
+              ))
+          {
+            s->err = deflateErrorOutputBufferTooSmall;
+            return;
+          }
+          out[offset++] = sym;
+        }
+        else
+        {
+          offset++;
+        }
+        next32 >>= len;
+        bitpos += len;
+        sym = s->u.lut.lenlut[next32 & ((1 << LOG2LENLUT) - 1)];
+      }
+      if (sym > 0) // short symbol
+      {
+        len = sym & 0x1f;
+        sym = ((sym >> 5) & 0x3ff) + ((next32 >> (sym >> 24)) & ((sym >> 16) & 0x1f));
+      }
+      else
+      {
+        // Slow length path
+        uint32_t next32r = __brev(next32);
+        const int16_t *symbols = &s->lensym[s->index_slow_len];
+        unsigned int first = s->first_slow_len;
+        int lext;
+#pragma unroll 1
+        for (len = LOG2LENLUT + 1; len <= MAXBITS; len++)
+        {
+          unsigned int code = (next32r >> (32 - len)) - first;
+          unsigned int count = s->lencnt[len];
+          if (code < count) // if length len, return symbol
+          {
+            sym = symbols[code];
+            break;
+          }
+          symbols += count; // else update for next length
+          first += count;
+          first <<= 1;
+        }
+        if (len > MAXBITS)
+        {
+          DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+            DeflateCorrectnessErrorTypes::HUFFMAN_CODE_TOO_LONG,
+            __LINE__,
+            __func__,
+            checker
+          );
+          s->err = deflateErrorInvalidValue;
+          sym = 256;
+          len = 0;
+        }
+        if (sym > 256)
+        {
+          sym -= 257;
+          lext = g_lext[sym];
+          sym = 256 + g_lens[sym] + bfe(next32, len, lext);
+          len += lext;
+        }
+      }
+      if (sym > 256)
+      {
+        int dist, dext;
+        // skipbits(s, len) inlined - no limit check
+        bitpos += len;
+        if (bitpos >= 32)
+        {
+          bitbuf.x = bitbuf.y;
+#if ENABLE_PREFETCH
+          bitbuf.y = *PREFETCH_ADDR32(s->pref, cur + 8);
+          cur += 4;
+#else
+          cur += 8;
+          bitbuf.y = loadUpTo4Bytes(cur, end - cur);
+          cur -= 4;
+#endif
+          bitpos &= 0x1f;
+        }
+        // get distance
+        next32 = __funnelshift_rc(bitbuf.x, bitbuf.y, bitpos); // nextbits32(s);
+        dist = s->u.lut.distlut[next32 & ((1 << LOG2DISTLUT) - 1)];
+        if (dist > 0)
+        {
+          len = dist & 0x1f;
+          dext = bfe(dist, 20, 5);
+          dist = bfe(dist, 5, 15);
+          sequence = dist + bfe(next32, len, dext);
+          len += dext;
+        }
+        else
+        {
+          uint32_t next32r = __brev(next32);
+          const int16_t *symbols = &s->distsym[s->index_slow_dist];
+          unsigned int first = s->first_slow_dist;
+#pragma unroll 1
+          for (len = LOG2DISTLUT + 1; len <= MAXBITS; len++)
+          {
+            unsigned int code = (next32r >> (32 - len)) - first;
+            unsigned int count = s->distcnt[len];
+            if (code < count) // if length len, return symbol
+            {
+              dist = symbols[code];
+              break;
+            }
+            symbols += count; // else update for next length
+            first += count;
+            first <<= 1;
+          }
+          if (len > MAXBITS)
+          {
+            DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+              DeflateCorrectnessErrorTypes::HUFFMAN_CODE_TOO_LONG,
+              __LINE__,
+              __func__,
+              checker
+            );
+            s->err = deflateErrorInvalidValue;
+            sym = 256;
+            len = 0;
+          }
+          else
+          {
+            dext = g_dext[dist];
+            sequence = g_dists[dist] + bfe(next32, len, dext);
+            len += dext;
+          }
+        }
+        if (not DeflateCorrectnessChecker<CORRECTNESS_CHECK>::isValidMatch(
+              (s->outmid - s->outbase) + offset,
+              sym - 256,
+              sequence,
+              __LINE__,
+              __func__,
+              checker
+            ))
+        {
+          s->err = deflateErrorInvalidValue;
+          return;
+        }
+        // 0..15 bits represent distance, 16..31 bits represent match length, 32..65 bits represent output buffer offset.
+        sequence |= (uint64_t((sym - 256) << 16) | uint64_t(offset) << 32);
+        offset += sym - 256; // match length
+        s->x.sequences(batch * WARP_SIZE + (seq_index++)).store(sequence, cuda::std::memory_order_relaxed);
+        sequence = 0;
+      }
+      // skipbits(s, len) inlined with added error check for reading past the end of the input
+      // buffer
+      bitpos += len;
+      if (bitpos >= 32)
+      {
+        bitbuf.x = bitbuf.y;
+#if ENABLE_PREFETCH
+        bitbuf.y = *PREFETCH_ADDR32(s->pref, cur + 8);
+        cur += 4;
+#else
+        cur += 8;
+        if (cur < end)
+        {
+          bitbuf.y = loadUpTo4Bytes(cur, end - cur);
+          cur -= 4;
+        }
+        else
+        {
+          bitbuf.y = 0;
+          cur -= 4;
+          if (cur > end)
+          {
+            DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+              DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+              __LINE__,
+              __func__,
+              checker
+            );
+            s->err = deflateErrorCannotDecompress;
+            sym = 256;
+          }
+        }
+#endif
+        bitpos &= 0x1f;
+      }
+      if (sym < 256)
+      {
+        if (should_output)
+        {
+          if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+                (out + offset) >= s->outend,
+                DeflateCorrectnessErrorTypes::OUTPUT_BUFFER_TOO_SMALL,
+                __LINE__,
+                __func__,
+                checker
+              ))
+          {
+            s->err = deflateErrorOutputBufferTooSmall;
+            return;
+          }
+          out[offset++] = sym;
+        }
+        else
+        {
+          offset++;
+        }
+      }
+      if (sym == 256)
+      {
+        s->x.sequences(batch * WARP_SIZE + (seq_index++)).store(0, cuda::std::memory_order_relaxed);
+        break;
+      }
+    } while (seq_index < WARP_SIZE - 1);
+    // in the current batch, we have `seq_index` number of sequences that warp1 can further process/write out
+    s->x.seq_len(batch).store(seq_index, cuda::std::memory_order_release);
+#if ENABLE_PREFETCH
+    ((volatile inflate_state_s *)s)->cur = cur;
+#endif
+    if (seq_index != 0)
+    {
+      batch = (batch + 1) & (SEQ_BATCH_NUM - 1);
+    }
+  } while (sym != 256); // until end of block (according to RFC), or error
+
+  s->out += offset;
+  s->bitbuf = bitbuf;
+  s->bitpos = bitpos;
+#if !ENABLE_PREFETCH
+  s->cur = cur;
+#endif
+}
+
+/**
+ * @brief Build lookup tables for faster decode
+ * LUT format is symbols*16+length
+ * Saves information about the symbols, like match length, distance, and extra bits.
+ * The symbol itself is not explicitly stored.
+ **/
+__device__ void init_length_lut(inflate_state_s *s, int t)
+{
+  int32_t *lut = s->u.lut.lenlut;
+
+  for (uint32_t bits = t; bits < (1 << LOG2LENLUT); bits += NUMTHREADS)
+  {
+    const int16_t *cnt = s->lencnt;
+    const int16_t *symbols = s->lensym;
+    int sym = -10 << 5;
+    unsigned int first = 0;
+    unsigned int rbits = __brev(bits) >> (32 - LOG2LENLUT); // Get the 10 bottom bits of "bits" reversed
+    for (unsigned int len = 1; len <= LOG2LENLUT; len++)
+    {
+      unsigned int code = (rbits >> (LOG2LENLUT - len)) - first;
+      unsigned int count = cnt[len];
+      if (code < count)
+      {
+        sym = symbols[code];
+        if (sym > 256)
+        {
+          int lext = g_lext[sym - 257];
+          // Match length | extra bits | code length
+          sym = (256 + g_lens[sym - 257]) | (((1 << lext) - 1) << (16 - 5)) | (len << (24 - 5));
+          len += lext;
+        }
+        // Code + extra bits length
+        sym = (sym << 5) | len;
+        break;
+      }
+      symbols += count; // else update for next length
+      first += count;
+      first <<= 1;
+    }
+    lut[bits] = sym;
+  }
+  if (t == 0)
+  {
+    unsigned int first = 0;
+    unsigned int index = 0;
+    const int16_t *cnt = s->lencnt;
+    for (unsigned int len = 1; len <= LOG2LENLUT; len++)
+    {
+      unsigned int count = cnt[len];
+      index += count;
+      first += count;
+      first <<= 1;
+    }
+    s->first_slow_len = first;
+    s->index_slow_len = index;
+  }
+}
+
+/**
+ * @brief Build lookup tables for faster decode of distance symbol
+ * LUT format is symbols*16+length
+ **/
+__device__ void init_distance_lut(inflate_state_s *s, int t)
+{
+  int32_t *lut = s->u.lut.distlut;
+
+  for (uint32_t bits = t; bits < (1 << LOG2DISTLUT); bits += NUMTHREADS)
+  {
+    const int16_t *cnt = s->distcnt;
+    const int16_t *symbols = s->distsym;
+    int sym = 0;
+    unsigned int first = 0;
+    unsigned int rbits = __brev(bits) >> (32 - LOG2DISTLUT);
+    for (unsigned int len = 1; len <= LOG2DISTLUT; len++)
+    {
+      unsigned int code = (rbits >> (LOG2DISTLUT - len)) - first;
+      unsigned int count = cnt[len];
+      if (code < count)
+      {
+        int dist = symbols[code];
+        int dext = g_dext[dist];
+        sym = g_dists[dist] | (dext << 15);
+        sym = (sym << 5) | len;
+        break;
+      }
+      symbols += count; // else update for next length
+      first += count;
+      first <<= 1;
+    }
+    lut[bits] = sym;
+  }
+  if (t == 0)
+  {
+    unsigned int first = 0;
+    unsigned int index = 0;
+    const int16_t *cnt = s->distcnt;
+    for (unsigned int len = 1; len <= LOG2DISTLUT; len++)
+    {
+      unsigned int count = cnt[len];
+      index += count;
+      first += count;
+      first <<= 1;
+    }
+    s->first_slow_dist = first;
+    s->index_slow_dist = index;
+  }
+}
+
+/// @brief WARP1: process symbols and output uncompressed stream
+template <bool should_output, bool CORRECTNESS_CHECK>
+__device__ void general_process_symbols(inflate_state_s *s, int t, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+{
+  uint8_t *out = s->outmid;
+  int batch = 0;
+  bool end = false;
+
+  __shared__ int ix_output[WARP_SIZE]; //Could be reduced to uint16_t, if chunk_size <= 64KB
+  ix_output[t] = 0;
+  int seq_num = 0;
+
+  do
+  {
+    while ((seq_num = s->x.seq_len(batch).load(cuda::std::memory_order_acquire)) == 0)
+    {
+      if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+      {
+        return;
+      }
+      __nanosleep(1);
+    }
+
+    unsigned offset = 0;
+    unsigned distance = 1;
+    unsigned match_length = 0;
+    uint64_t sequence;
+
+    bool active = t < seq_num;
+    if (active)
+    {
+      // Racecheck flags this as a data race since it does not understand that we are constraining
+      // access to this through the acquire load of "seq_len" above, and stores on the "sequences"
+      // array happen before the release store on "seq_len".
+      sequence = s->x.sequences(batch * WARP_SIZE + t).load(cuda::std::memory_order_relaxed);
+      distance = sequence & (MAX_CHUNK_SIZE - 1);
+      match_length = (sequence >> 16) & (MAX_CHUNK_SIZE - 1);
+      offset = (sequence >> 32) & 0xffffffff;
+    }
+
+    __syncwarp();
+
+    if (t == 0)
+    {
+      s->x.seq_len(batch).store(0, cuda::std::memory_order_release);
+    }
+
+    if (__any_sync(WARP_ALL, distance == 0))
+    {
+      end = true;
+    }
+
+    ix_output[t] = offset;
+
+    if (should_output)
+    {
+      // We need to sync the lz resolver warp here as all offsets needs to be published.
+      __syncwarp();
+      do_match_copies<false>(match_length, distance, active, ix_output, out, seq_num, end);
+    }
+    batch = (batch + 1) & (SEQ_BATCH_NUM - 1);
+  } while (!end);
+}
+
+/**
+ * @brief Initializes a stored block.
+ *
+ * Format notes:
+ *
+ * - After the two-bit stored block type (00), the stored block length and
+ *   stored bytes are byte-aligned for fast copying.  Therefore any leftover
+ *   bits in the byte that has the last bit of the type, as many as seven, are
+ *   discarded.  The value of the discarded bits are not defined and should not
+ *   be checked against any expectation.
+ *
+ * - The second inverted copy of the stored block length does not have to be
+ *   checked, but it's probably a good idea to do so anyway.
+ *
+ * - A stored block can have zero length.  This is sometimes used to byte-align
+ *   subsets of the compressed data for random access or partial recovery.
+ **/
+template <bool CORRECTNESS_CHECK>
+__device__ deflateStatus_t init_stored(inflate_state_s *s, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+{
+  uint32_t len, nlen; // length of stored block
+
+  // Byte align
+  if (s->bitpos & 7)
+  {
+    skipbits(s, 8 - (s->bitpos & 7));
+  }
+  if (s->cur + (s->bitpos >> 3) >= s->end)
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorNotSupported; // Not enough input
+  }
+  // get length and check against its one's complement
+  len = getbits<CORRECTNESS_CHECK>(s, 16, checker);
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+  {
+    return deflateErrorCannotDecompress;
+  }
+  nlen = getbits<CORRECTNESS_CHECK>(s, 16, checker);
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(checker))
+  {
+    return deflateErrorCannotDecompress;
+  }
+  if (len != (nlen ^ 0xffff))
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::INVALID_STORED_BLOCK_LENGTH,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorNotSupported; // didn't match complement!
+  }
+  if (s->cur + (s->bitpos >> 3) + len > s->end)
+  {
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+      DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+      __LINE__,
+      __func__,
+      checker
+    );
+    return deflateErrorNotSupported; // Not enough input
+  }
+  // Check that there is enough space in the output buffer
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+        s->out + len > s->outend,
+        DeflateCorrectnessErrorTypes::OUTPUT_BUFFER_TOO_SMALL,
+        __LINE__,
+        __func__,
+        checker
+      ))
+  {
+    return deflateErrorOutputBufferTooSmall;
+  }
+  s->stored_blk_len = len;
+  // done with a valid stored block
+  return deflateSuccess;
+}
+
+/// Copy bytes from stored block to destination
+template <bool should_output, bool CORRECTNESS_CHECK>
+__device__ void copy_stored(inflate_state_s *s, int t, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+{
+  int len = s->stored_blk_len;
+  if (!should_output)
+  {
+    // Racecheck reports a WAR hazard on s->cur/s->bitpos here.
+    // However only single thread does those loads so it is fully benign.
+    // Probably compiler is loading the values for the entire warp but discarding
+    // for every tid != 0 which is enough to trigger WAR hazard in compute-sanitizer.
+    if (t == 0)
+    {
+      // Reset bitstream to end of block
+      // Notes to future self:
+      // - bitpos stores the number of bits we can skip ahead within bitbuf.x/y and cur
+      //   as they've been already read and processed
+      // - cur stores a 4-byte aligned address whose first 4-8 bytes are
+      //   potentially buffered in bitbuf.x/y . This is the address where the next
+      //   bytes can be read from the compressed stream.
+      // - out stores the next output byte position in the decompressed stream
+      uint8_t *p = s->cur + (s->bitpos >> 3) + len;
+      uint32_t prefix_bytes = (uint32_t)(((size_t)p) & 3);
+      p -= prefix_bytes;
+      s->cur = p;
+      s->bitbuf.x = loadUpTo4Bytes(p, s->end - p);
+      p += 4;
+      s->bitbuf.y = loadUpTo4Bytes(p, s->end - p);
+      s->bitpos = prefix_bytes * 8;
+      s->out += len;
+    }
+    return;
+  }
+
+  uint8_t *cur = s->cur + (s->bitpos >> 3);
+  uint8_t *out = s->out;
+  uint8_t *outend = s->outend;
+  uint8_t *cur4;
+
+  int slow_bytes = min(len, (int)((16 - (size_t)out) & 0xf));
+  int fast_bytes, bitpos;
+
+  // Slow copy until output is 16B aligned
+  if (slow_bytes)
+  {
+    for (int i = t; i < slow_bytes; i += NUMTHREADS)
+    {
+      if (out + i < outend)
+      {
+        out[i] = cur[i]; // Input range has already been validated in init_stored()
+      }
+    }
+    cur += slow_bytes;
+    out += slow_bytes;
+    len -= slow_bytes;
+  }
+  fast_bytes = len;
+  if (out < outend)
+  {
+    fast_bytes = (int)min((size_t)fast_bytes, (outend - out));
+  }
+  fast_bytes &= ~0xf;
+  bitpos = ((int)(3 & (size_t)cur)) << 3;
+  cur4 = cur - (bitpos >> 3);
+  if (out < outend)
+  {
+    // Fast copy 16 bytes at a time
+    for (int i = t * 16; i < fast_bytes; i += NUMTHREADS * 16)
+    {
+      uint4 u;
+      u.x = *(const uint32_t *)(cur4 + i + 0 * 4);
+      u.y = *(const uint32_t *)(cur4 + i + 1 * 4);
+      u.z = *(const uint32_t *)(cur4 + i + 2 * 4);
+      u.w = *(const uint32_t *)(cur4 + i + 3 * 4);
+      if (bitpos != 0)
+      {
+        uint8_t *p = cur4 + i + 4 * 4;
+        uint32_t v = (bitpos != 0) ? loadUpTo4Bytes(p, s->end - p) : 0;
+        u.x = __funnelshift_rc(u.x, u.y, bitpos);
+        u.y = __funnelshift_rc(u.y, u.z, bitpos);
+        u.z = __funnelshift_rc(u.z, u.w, bitpos);
+        u.w = __funnelshift_rc(u.w, v, bitpos);
+      }
+      *(uint4 *)(out + i) = u;
+    }
+  }
+  cur += fast_bytes;
+  out += fast_bytes;
+  len -= fast_bytes;
+  // Slow copy for remaining bytes
+  for (int i = t; i < len; i += NUMTHREADS)
+  {
+    if (out + i < outend)
+    {
+      out[i] = cur[i]; // Input range has already been validated in init_stored()
+    }
+  }
+  out += len;
+  __syncthreads();
+  if (t == 0)
+  {
+    // Reset bitstream to end of block
+    uint8_t *p = cur + len;
+    uint32_t prefix_bytes = (uint32_t)(((size_t)p) & 3);
+    p -= prefix_bytes;
+    s->cur = p;
+    s->bitbuf.x = loadUpTo4Bytes(p, s->end - p);
+    p += 4;
+    s->bitbuf.y = loadUpTo4Bytes(p, s->end - p);
+    s->bitpos = prefix_bytes * 8;
+    s->out = out;
+  }
+}
+
+#if ENABLE_PREFETCH
+__device__ void init_prefetcher(inflate_state_s *s, int t)
+{
+  if (t == 0)
+  {
+    s->pref.cur_p = s->cur;
+    s->pref.run = 1;
+  }
+}
+
+__device__ void prefetch_warp(volatile inflate_state_s *s, int t)
+{
+  const uint8_t *cur_p = s->pref.cur_p;
+  const uint8_t *end = s->end;
+  while (SHFL0((t == 0) ? s->pref.run : 0))
+  {
+    int32_t cur_lo = (int32_t)(size_t)cur_p;
+    int do_pref = SHFL0((t == 0) ? (cur_lo - *(volatile int32_t *)&s->cur < PREFETCH_SIZE - 32 * 4 - 4) : 0);
+    if (do_pref)
+    {
+      const uint8_t *p = cur_p + 4 * t;
+      *PREFETCH_ADDR32(s->pref, p) = (p < end) ? *(const uint32_t *)p : 0;
+      cur_p += 4 * 32;
+      __threadfence_block();
+      SYNCWARP();
+      if (t == 0)
+      {
+        s->pref.cur_p = cur_p;
+        __threadfence_block();
+      }
+    }
+    else if (t == 0)
+    {
+      __nanosleep(150);
+    }
+  }
+}
+#endif // ENABLE_PREFETCH
+
+/**
+ * @brief INFLATE decompression kernel
+ *
+ * blockDim {NUMTHREADS,1,1}
+ *
+ * @param inputs Source and destination buffer information per block
+ * @param outputs Decompression status buffer per block
+ * @param hdr_parser If nonzero, indicates that the compressed bitstream includes a GZIP header
+ **/
+template <bool should_output = true, bool get_decomp_bytes = true, bool CORRECTNESS_CHECK = false>
+__global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
+  const void *const *__restrict__ device_compressed_ptr,
+  const size_t *__restrict__ device_compressed_bytes,
+  void *const *__restrict__ device_uncompressed_ptr,
+  const size_t *__restrict__ device_uncompressed_bytes,
+  size_t *device_actual_uncompressed_bytes,
+  deflateStatus_t *device_statuses,
+  DeflateCorrectnessChecker<CORRECTNESS_CHECK> *device_correctness_ptrs,
+  bool hdr_parser
+)
+{
+  __shared__ __align__(16) inflate_state_s state_g;
+
+  int t = threadIdx.x;
+  int z = blockIdx.x;
+  inflate_state_s *state = &state_g;
+  DeflateCorrectnessChecker<CORRECTNESS_CHECK> *correctness_checker = CORRECTNESS_CHECK ? &device_correctness_ptrs[z]
+                                                                                        : nullptr;
+
+  if (t == 0)
+  {
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(device_compressed_ptr[z]);
+    DeflateCorrectnessChecker<CORRECTNESS_CHECK>::Initialize(state, p, correctness_checker);
+    size_t src_size = device_compressed_bytes[z];
+    uint32_t prefix_bytes;
+    // Parse header if needed
+    state->err = deflateSuccess;
+    if (hdr_parser)
+    {
+      int hdr_len = deflate::parse_gzip_header(p, src_size);
+      src_size = (src_size >= 8) ? src_size - 8 : 0; // ignore footer
+      if (hdr_len >= 0)
+      {
+        p += hdr_len;
+        // Guarded against in "parse_gzip_header", so currently can never happen
+        DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+          (hdr_len > src_size),
+          DeflateCorrectnessErrorTypes::WRONG_GZIP_HEADER,
+          __LINE__,
+          __func__,
+          correctness_checker
+        );
+        src_size -= hdr_len;
+      }
+      else
+      {
+        DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+          DeflateCorrectnessErrorTypes::WRONG_GZIP_HEADER,
+          __LINE__,
+          __func__,
+          correctness_checker
+        );
+        state->err = deflateErrorWrongHeaderLength;
+      }
+    }
+    // Initialize shared state
+    state->out = should_output ? reinterpret_cast<uint8_t *>(device_uncompressed_ptr[z]) : nullptr;
+    state->outbase = state->out;
+    state->end = (uint8_t *)(p + src_size);
+    state->outend = should_output ? state->out + device_uncompressed_bytes[z] : nullptr;
+    prefix_bytes = (uint32_t)(((size_t)p) & 3);
+    p -= prefix_bytes; // p becomes 4-byte aligned
+    state->cur = (uint8_t *)p;
+    if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::preliminaryChecks(__LINE__, __func__, correctness_checker))
+    {
+      state->err = deflateErrorCannotDecompress;
+#ifdef IMPLICIT_BUFFER_ALIGNMENT
+      // We can assume from the input buffer that it was 128/256-byte aligned originally by cudaMalloc and/or variant
+      // CUDA functionality.
+    }
+    else
+    {
+      state->bitbuf.x = loadUpTo4Bytes(p, state->end - p);
+      p += 4;
+      state->bitbuf.y = loadUpTo4Bytes(p, state->end - p);
+      state->bitpos = prefix_bytes * 8;
+    }
+#else
+      // We cannot assume anything about the input buffer's alignment
+    }
+    else
+    {
+      // Load the first 4 bytes
+      if (hdr_parser || !prefix_bytes)
+      {
+        // Either there's a gzip header(and we can go back up to 3 bytes guaranteed),
+        // OR there was no alignment issue, and we can read immediately aligned
+        state->bitbuf.x = loadUpTo4Bytes(p, state->end - p);
+      }
+      else
+      {
+        // There's no gzip header AND there are prefix bytes that are unused to correct the alignment.
+        const uint8_t *p_unaligned = reinterpret_cast<const uint8_t *>(device_compressed_ptr[z]);
+        const uint32_t bytes_available = static_cast<uint32_t>(min((size_t)4, src_size));
+        state->bitbuf.x = 0;
+        for (uint32_t i = prefix_bytes; i < bytes_available; ++i)
+        {
+          state->bitbuf.x |= p_unaligned[i] << (i * 8);
+        }
+      }
+      p += 4;
+      state->bitbuf.y = loadUpTo4Bytes(p, state->end - p);
+      state->bitpos = prefix_bytes * 8;
+    }
+#endif // IMPLICIT_BUFFER_ALIGNMENT
+  }
+
+  __syncthreads();
+  if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(correctness_checker))
+  {
+    device_statuses[z] = state->err;
+    return;
+  }
+
+  // Main loop decoding blocks
+  while (!state->err)
+  {
+    // Note: each iteration decodes a single DEFLATE block,
+    //       and there might be multiple DEFLATE blocks per chunk
+    __syncthreads();
+    if (t == 0)
+    {
+      // Thread0: read last flag, block type and custom huffman tables if any
+      if (state->cur + (state->bitpos >> 3) >= state->end)
+      {
+        state->err = deflateErrorCannotDecompress;
+        DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+          DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+          __LINE__,
+          __func__,
+          correctness_checker
+        );
+      }
+      else
+      {
+        state->blast = getbits<CORRECTNESS_CHECK>(state, 1, correctness_checker);
+        if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(correctness_checker))
+        {
+          state->err = deflateErrorCannotDecompress;
+        }
+        state->btype = getbits<CORRECTNESS_CHECK>(state, 2, correctness_checker);
+        if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(correctness_checker))
+        {
+          state->err = deflateErrorCannotDecompress;
+        }
+        if (state->btype == 0)
+        {
+          state->err = init_stored<CORRECTNESS_CHECK>(state, correctness_checker); // simple copy
+        }
+        else if (state->btype == 1)
+        {
+          state->err = init_fixed(state); // fixed Huffman table
+        }
+        else if (state->btype == 2)
+        {
+          state->err = init_dynamic<CORRECTNESS_CHECK>(state, correctness_checker); // dynamic Huffman table
+        }
+        else
+        {
+          state->err = deflateErrorInvalidValue; // Invalid block
+          DeflateCorrectnessChecker<CORRECTNESS_CHECK>::setError(
+            DeflateCorrectnessErrorTypes::INVALID_BLOCK_TYPE,
+            __LINE__,
+            __func__,
+            correctness_checker
+          );
+        }
+      }
+      state->outmid = state->out;
+    }
+    __syncthreads();
+    if (!state->err && (state->btype == 1 || state->btype == 2))
+    {
+      // Initializes lookup tables (block wide)
+      init_length_lut(state, t);
+      init_distance_lut(state, t);
+#if ENABLE_PREFETCH
+      // Initialize prefetcher
+      init_prefetcher(state, t);
+#endif
+      if (t < SEQ_BATCH_NUM)
+      {
+        state->x.seq_len(t).store(0, cuda::std::memory_order_relaxed);
+      }
+      __syncthreads();
+      // decode data until end-of-block code
+      if (t < 1 * WARP_SIZE)
+      {
+        // WARP0: decode variable-length symbols
+        if (t == 0)
+        {
+          // Thread0: decode symbols (single threaded)
+          general_decode_symbols<should_output, CORRECTNESS_CHECK>(state, correctness_checker);
+#if ENABLE_PREFETCH
+          state->pref.run = 0;
+#endif
+        }
+      }
+      else if (t < 2 * WARP_SIZE)
+      {
+        // WARP1: perform LZ77 using length and distance codes from WARP0
+        general_process_symbols<should_output, CORRECTNESS_CHECK>(state, t & (WARP_SIZE - 1), correctness_checker);
+      }
+#if ENABLE_PREFETCH
+      else if (t < 3 * WARP_SIZE)
+      {
+        // WARP2: Prefetcher: prefetch data for WARP0
+        prefetch_warp(state, t & (WARP_SIZE - 1));
+      }
+#endif
+      // else WARP3: idle
+    }
+    else if (!state->err && state->btype == 0)
+    {
+      // Uncompressed block (block-wide memcpy)
+      // Possible problems already checked in init_stored()
+      copy_stored<should_output, CORRECTNESS_CHECK>(state, t, correctness_checker);
+    }
+
+    __syncthreads();
+    if (state->blast)
+    {
+      break;
+    }
+  }
+
+  __syncthreads();
+  // Output decompression status and length
+  if (t == 0)
+  {
+    if (get_decomp_bytes)
+    {
+      device_actual_uncompressed_bytes[z] = state->out - state->outbase;
+    }
+
+    // Can happen even if no OOB accesses occurred, since bitbuf is still 64 bits.
+    if (state->err == deflateSuccess && state->cur + ((state->bitpos + 7) >> 3) > state->end)
+    {
+      // Read past the end of the input buffer
+      state->err = deflateErrorCannotDecompress;
+    }
+    else if (should_output && state->err == deflateSuccess &&
+             (!get_decomp_bytes || device_actual_uncompressed_bytes[z] > device_uncompressed_bytes[z]))
+    {
+      // Output buffer too small
+      // Error should have been caught already by correctness checker
+      assert(not CORRECTNESS_CHECK or DeflateCorrectnessChecker<CORRECTNESS_CHECK>::hasError(correctness_checker));
+      state->err = deflateErrorOutputBufferTooSmall;
+    }
+    if (DeflateCorrectnessChecker<CORRECTNESS_CHECK>::errorIfTrue(
+          state->cur + ((state->bitpos + 7) >> 3) != state->end,
+          DeflateCorrectnessErrorTypes::UNEXPECTED_END_OF_CHUNK,
+          __LINE__,
+          __func__,
+          correctness_checker
+        ))
+    {
+      state->err = deflateErrorCannotDecompress;
+    }
+    if (device_statuses != nullptr)
+    {
+      device_statuses[z] = state->err;
+    }
+  }
+}
+} // namespace nvcomp_deflate

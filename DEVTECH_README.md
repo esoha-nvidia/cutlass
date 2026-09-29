@@ -34,27 +34,13 @@ python ./cutlass_test.py
 #   python ./cutlass_test.py
 ```
 
-## Build and install nvCOMP from source
+## nvCOMP (in-tree) and nvCOMPDx (MathDx)
 
-The container is missing several tools. Install them first. `python3.10-dev` provides `python3.10-config`, which nvCOMP needs to build the Python extension. `patchelf` is required by `auditwheel` when repairing wheels. The `wheel` package is required for `bdist_wheel`. Configure and build with the aarch64 CMake 4.3.3 binary. `BUILD_PYTHON` and `BUILD_WHEEL` are required for the Python module; a default C++ `make install` does not install it. Install the wheels from `build/python/` (CUDA 13 names; use `cu12` if `nvcc --version` reports CUDA 12). The import is `from nvidia import nvcomp`, not `import nvcomp`.
+Host batched ANS (LLIF compress/decompress) is the copy of nvCOMP under `nvcomp/` (`include/` + `src/`). `00_basic_gemm` compiles that as a **static** library; it does not link a prebuilt `libnvcomp.so`. Do **not** pass `-DBUILD_NVCOMPDX=ON` — nvCOMPDx FetchContent-clones internal GitLab over SSH, which this cluster cannot reach.
 
-Do **not** pass `-DBUILD_NVCOMPDX=ON` on this cluster. nvCOMPDx's CMake FetchContent-clones two **internal** GitLab repos over SSH (`gitlab-master.nvidia.com:12051`). That host is not reachable from the GB200 container, and those trees are not on github.com. Host nvCOMP (batched ANS, Python) does not need them.
-
-In-kernel nvCOMPDx is already in the MathDx tarball at
+In-kernel nvCOMPDx is the MathDx tarball at
 `/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06`
 (nvCOMPDx 0.1.4, `include/nvcompdx.hpp`, `lib/libnvcompdx.fatbin`). On aarch64 (GB200) link **`mathdx::nvcompdx_fatbin`**, not `libnvcompdx.a` (that static lib is x86_64). Device code still needs separable compilation and `-dlto`.
-
-```bash
-python3 -m pip install --upgrade pip setuptools wheel
-mkdir -p /home/esoha/nvcomp-dev/nvcomp/build && cd /home/esoha/nvcomp-dev/nvcomp/build
-../../../cmake-4.3.3-linux-aarch64/bin/cmake .. -DBUILD_PYTHON=ON -DBUILD_WHEEL=ON
-make -j 20
-make install
-python3 -m pip install --force --no-index --find-links=/home/esoha/nvcomp-dev/nvcomp/build/python nvidia-libnvcomp-cu13 nvidia-nvcomp-cu13
-python3 -c "from nvidia import nvcomp; print(nvcomp.__version__, nvcomp.__cuda_version__)"
-```
-
-From another CMake project (CUTLASS example, etc.):
 
 ```cmake
 set(MATHDX_ROOT "/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06")
@@ -65,7 +51,7 @@ set_target_properties(00_basic_gemm PROPERTIES
   INTERPROCEDURAL_OPTIMIZATION ON)
 ```
 
-Host batched ANS (`nvcompBatchedANSCompressAsync`) uses the nvCOMP you built above, not MathDx.
+Host batched ANS (`nvcompBatchedANSCompressAsync`) is the in-tree `nvcomp` static library, not MathDx.
 
 For c++:
 ```bash

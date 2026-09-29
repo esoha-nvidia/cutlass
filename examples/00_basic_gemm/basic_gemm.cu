@@ -372,15 +372,14 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
   int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
   size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
 
-  auto compressor = AnsCompressor();
   size_t const chunk_bytes = kAnsChunkBytes;
-  size_t const shmem_bytes = static_cast<size_t>(compressor.shmem_size_group());
-  size_t const tmp_bytes = static_cast<size_t>(compressor.tmp_size_total(num_chunks));
+  size_t const shmem_bytes = static_cast<size_t>(AnsCompressor::shmem_size_group());
+  size_t const tmp_bytes = static_cast<size_t>(AnsCompressor::tmp_size_total(num_chunks));
   size_t const packed_stride = align_up_bytes(
-      chunk_bytes, std::max(static_cast<size_t>(compressor.input_alignment()), size_t(256)));
+      chunk_bytes, std::max(static_cast<size_t>(AnsCompressor::input_alignment()), size_t(256)));
   size_t const compressed_stride = align_up_bytes(
-      static_cast<size_t>(compressor.max_comp_chunk_size()),
-      std::max(static_cast<size_t>(compressor.output_alignment()), size_t(256)));
+      static_cast<size_t>(AnsCompressor::max_comp_chunk_size()),
+      std::max(static_cast<size_t>(AnsCompressor::output_alignment()), size_t(256)));
 
   float *d_packed = nullptr;
   char *d_compressed = nullptr;
@@ -545,18 +544,17 @@ cudaError_t CutlassSgemmNN(
   size_t const num_chunks =
       static_cast<size_t>(grid_tiled_shape.m()) * static_cast<size_t>(grid_tiled_shape.n());
 
-  auto compressor = AnsCompressor();
   size_t const chunk_bytes = kAnsChunkBytes;
-  size_t const nvcomp_shmem = static_cast<size_t>(compressor.shmem_size_group());
+  size_t const nvcomp_shmem = static_cast<size_t>(AnsCompressor::shmem_size_group());
   size_t const gemm_shmem = sizeof(typename CutlassGemmKernel::SharedStorage);
-  size_t const shmem_align = static_cast<size_t>(compressor.shmem_alignment());
+  size_t const shmem_align = static_cast<size_t>(AnsCompressor::shmem_alignment());
   size_t const dyn_smem = std::max(gemm_shmem, nvcomp_shmem + shmem_align);
-  size_t const tmp_bytes = static_cast<size_t>(compressor.tmp_size_total(num_chunks));
+  size_t const tmp_bytes = static_cast<size_t>(AnsCompressor::tmp_size_total(num_chunks));
   size_t const packed_stride = align_up_bytes(
-      chunk_bytes, std::max(static_cast<size_t>(compressor.input_alignment()), size_t(256)));
+      chunk_bytes, std::max(static_cast<size_t>(AnsCompressor::input_alignment()), size_t(256)));
   size_t const compressed_stride = align_up_bytes(
-      static_cast<size_t>(compressor.max_comp_chunk_size()),
-      std::max(static_cast<size_t>(compressor.output_alignment()), size_t(256)));
+      static_cast<size_t>(AnsCompressor::max_comp_chunk_size()),
+      std::max(static_cast<size_t>(AnsCompressor::output_alignment()), size_t(256)));
 
   float *d_packed = nullptr;
   char *d_compressed = nullptr;

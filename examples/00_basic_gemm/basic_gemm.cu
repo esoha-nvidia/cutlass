@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -254,7 +255,8 @@ struct GemmFusedAns {
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Define a CUTLASS GEMM template and launch a GEMM kernel fused with per-tile ANS.
+/// Define a CUTLASS GEMM template and launch a GEMM kernel.
+/// With fuse_nvcomp, the same CTA also ANS-compresses its 128x128 output tile.
 cudaError_t CutlassSgemmNN(
   int M,
   int N,
@@ -266,7 +268,29 @@ cudaError_t CutlassSgemmNN(
   int ldb,
   float beta,
   float *C,
-  int ldc) {
+  int ldc,
+  bool fuse_nvcomp) {
+
+  if (!fuse_nvcomp) {
+    using ColumnMajor = cutlass::layout::ColumnMajor;
+    using GemmUnfused = cutlass::gemm::device::Gemm<float, ColumnMajor, float, ColumnMajor,
+                                                   float, ColumnMajor>;
+    GemmUnfused gemm_operator;
+    typename GemmUnfused::Arguments args({M, N, K},
+                                         {A, lda},
+                                         {B, ldb},
+                                         {C, ldc},
+                                         {C, ldc},
+                                         {alpha, beta});
+    nvtxRangePushA("cutlass_gemm");
+    cutlass::Status status = gemm_operator(args);
+    cudaError_t sync_status = cudaDeviceSynchronize();
+    nvtxRangePop();
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorUnknown;
+    }
+    return sync_status;
+  }
 
   // Same 128x128x8 SIMT SGEMM as the 6-arg ColumnMajor device::Gemm, plus AnsEpilogueOp so
   // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
@@ -637,7 +661,7 @@ cudaError_t ReferenceGemm(
 
 /// Allocate several matrices in GPU device memory and call a single-precision
 /// CUTLASS GEMM kernel.
-cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
+cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, bool fuse_nvcomp) {
   cudaError_t result;
 
   //
@@ -744,7 +768,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   // Launch CUTLASS GEMM.
   //
 
-  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc);
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, fuse_nvcomp);
 
   if (result != cudaSuccess) {
     std::cerr << "CUTLASS GEMM kernel failed: "
@@ -837,30 +861,44 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
 //
 // usage:
 //
-//   00_basic_gemm <M> <N> <K> <alpha> <beta>
+//   00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]
 //
 int main(int argc, const char *arg[]) {
 
   //
-  // Parse the command line to obtain GEMM dimensions and scalar values.
+  // Parse the command line to obtain GEMM dimensions, scalars, and optional flags.
   //
 
   // GEMM problem dimensions.
   // CUTLASS threadblock tile is 128x128x8, so a 128^3 problem launches 1 CTA.
   // 4096x4096 uses a 32x32 grid (1024 CTAs). K does not change CTA count.
   int problem[3] = { 4096, 4096, 1024 };
-
-  for (int i = 1; i < argc && i < 4; ++i) {
-    std::stringstream ss(arg[i]);
-    ss >> problem[i - 1];
-  }
-
-  // Scalars used for linear scaling the result of the matrix product.
   float scalars[2] = { 1, 0 };
+  bool fuse_nvcomp = false;
+  int positional = 0;
 
-  for (int i = 4; i < argc && i < 6; ++i) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(arg[i], "--fuse-nvcomp") == 0) {
+      fuse_nvcomp = true;
+      continue;
+    }
+    if (std::strcmp(arg[i], "--help") == 0 || std::strcmp(arg[i], "-h") == 0) {
+      std::cout << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]\n"
+                << "  --fuse-nvcomp  ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA\n";
+      return 0;
+    }
+    if (arg[i][0] == '-') {
+      std::cerr << "Unknown option: " << arg[i] << "\n"
+                << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp]\n";
+      return -1;
+    }
     std::stringstream ss(arg[i]);
-    ss >> scalars[i - 4];
+    if (positional < 3) {
+      ss >> problem[positional];
+    } else if (positional < 5) {
+      ss >> scalars[positional - 3];
+    }
+    ++positional;
   }
 
   //
@@ -872,14 +910,16 @@ int main(int argc, const char *arg[]) {
             << " K=" << problem[2]
             << " (CUTLASS tile 128x128 => "
             << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
-            << " CTAs)" << std::endl;
+            << " CTAs, nvCOMP fusion "
+            << (fuse_nvcomp ? "on" : "off") << ")" << std::endl;
 
   cudaError_t result = TestCutlassGemm(
     problem[0],     // GEMM M dimension
     problem[1],     // GEMM N dimension
     problem[2],     // GEMM K dimension
     scalars[0],     // alpha
-    scalars[1]      // beta
+    scalars[1],     // beta
+    fuse_nvcomp
   );
 
   if (result == cudaSuccess) {

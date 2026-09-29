@@ -2,3 +2,7 @@
 __pycache__/
 cutlass_library.egg-info/
 /build*
+
+# Nsight Systems reports and SQLite databases
+*.nsys-rep
+*.sqlite

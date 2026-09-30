@@ -714,7 +714,7 @@ inline __device__ void decompress(
   uint *uncompressed_words_atomic,
   OutputStream<BufferType> &&output_stream,
   grid_t &grid,
-  nvcompStatus_t *device_status
+  nvcompStatus_t *device_status // May be null in the streaming case
 )
 {
   // Note:
@@ -1399,8 +1399,8 @@ __launch_bounds__(std::max(THREADS_PER_BLOCK, BLOCK_HEADER_THREADS_PER_BLOCK), 1
       device_compressed_bytes[current_chunk],
       device_uncompressed_ptrs[current_chunk],
       device_uncompressed_buffer_bytes[current_chunk],
-      device_uncompressed_chunk_bytes ? device_uncompressed_chunk_bytes + current_chunk : nullptr,
-      device_statuses ? device_statuses + current_chunk : nullptr
+      device_uncompressed_chunk_bytes + current_chunk,
+      device_statuses + current_chunk
     );
   }
   else

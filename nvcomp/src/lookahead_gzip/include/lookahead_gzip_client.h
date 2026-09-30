@@ -55,7 +55,7 @@ protected:
     const size_t *device_uncompressed_buffer_bytes,
     size_t *device_uncompressed_chunk_bytes,
     uint8_t *device_temp_ptr,
-    nvcompStatus_t *decomp_statuses = nullptr,
+    nvcompStatus_t *decomp_statuses,
     cudaStream_t stream = nullptr
   );
 
@@ -96,7 +96,7 @@ public:
     const size_t *device_uncompressed_buffer_bytes,
     size_t *device_uncompressed_chunk_bytes,
     uint8_t *device_temp_ptr,
-    nvcompStatus_t *decomp_statuses = nullptr,
+    nvcompStatus_t *decomp_statuses,
     cudaStream_t stream = nullptr
   );
 

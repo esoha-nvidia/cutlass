@@ -18,7 +18,7 @@
 
 #include "cascaded_hash.cuh"
 
-namespace cascaded
+namespace nvcomp::cascaded
 {
 
 // Threads cannot insert a value and assign an index in the same atomic operation
@@ -194,6 +194,7 @@ __device__ bool warp_static_set_try_insert(
       while (true)
       {
         // non-atomic check if value is already present
+        // TODO: double-check race-y behavior with atomicCAS below
         data_t found = set.bucket_to_data_map[my_ix_bucket];
 
         if (found == set.sentinel_value)
@@ -286,4 +287,4 @@ __device__ bool warp_static_set_try_insert(
   return is_unique;
 }
 
-} // namespace cascaded
+} // namespace nvcomp::cascaded

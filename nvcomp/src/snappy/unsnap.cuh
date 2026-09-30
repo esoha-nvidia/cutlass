@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions
@@ -97,27 +97,8 @@ inline __device__ void do_unsnap(
   {
     // Initialize to erred state in case decompression crashses
     // If decompression is successful, this error will be retracted
-    if (nvcomp_statuses)
-    {
-      *nvcomp_statuses = nvcompErrorCannotDecompress;
-    }
-
-    if (valid)
-    {
-      // Trying to avoid using a register by storing output size to gmem
-      if (device_out_bytes)
-      {
-        *device_out_bytes = output_size;
-      }
-    }
-    else
-    {
-      // Metadata was invalid. Cannot decompress
-      if (device_out_bytes)
-      {
-        *device_out_bytes = 0;
-      }
-    }
+    *nvcomp_statuses = nvcompErrorCannotDecompress;
+    *device_out_bytes = valid ? output_size : 0;
   }
 
   if (!valid)
@@ -187,7 +168,7 @@ inline __device__ void do_unsnap(
       decode_ix_output,
       __LINE__,
       __func__,
-      nvcomp_statuses,
+      *nvcomp_statuses,
       correctness_checker
     );
   }

@@ -1,32 +1,16 @@
-#pragma once
-
 /*
- * Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
+
+#pragma once
 
 #include "CRC32.hpp"
 #include "highlevel/ManagerBase.hpp"
@@ -44,10 +28,10 @@ struct LZ4ManagerImpl
     : ManagerBase<
         LZ4FormatSpecHeader,
         decltype(nvcompBatchedLZ4DecompressAsyncEx) *,
-        decltype(nvcompBatchedLZ4DecompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedLZ4DecompressGetTempSize) *,
         decltype(nvcompBatchedLZ4GetDecompressSizeAsync) *,
         decltype(nvcompBatchedLZ4CompressAsync) *,
-        decltype(nvcompBatchedLZ4CompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedLZ4CompressGetTempSize) *,
         decltype(nvcompBatchedLZ4CompressGetMaxOutputChunkSize) *,
         nvcompBatchedLZ4CompressOpts_t,
         nvcompBatchedLZ4DecompressOpts_t,
@@ -59,6 +43,7 @@ struct LZ4ManagerImpl
     nvcompBatchedLZ4DecompressOpts_t decompress_opts,
     cudaStream_t user_stream,
     ChecksumPolicy checksum_policy,
+    ExecutionPolicy execution_policy,
     BitstreamKind bitstream_kind
   )
       : ManagerBase(
@@ -67,30 +52,36 @@ struct LZ4ManagerImpl
           decompress_opts,
           user_stream,
           checksum_policy,
+          execution_policy,
           bitstream_kind,
           nvcompBatchedLZ4DecompressAsyncEx,
-          nvcompBatchedLZ4DecompressGetTempSizeAsync,
+          nvcompBatchedLZ4DecompressGetTempSize,
           nvcompBatchedLZ4GetDecompressSizeAsync,
           nvcompBatchedLZ4CompressAsync,
-          nvcompBatchedLZ4CompressGetTempSizeAsync,
+          nvcompBatchedLZ4CompressGetTempSize,
           nvcompBatchedLZ4CompressGetMaxOutputChunkSize,
           query_alignment_requirements(nvcompBatchedLZ4CompressGetRequiredAlignments, format_opts),
           query_alignment_requirements(nvcompBatchedLZ4DecompressGetRequiredAlignments, decompress_opts)
         )
   {
     static_assert(offsetof(LZ4FormatSpecHeader, data_type) == offsetof(nvcompBatchedLZ4CompressOpts_t, data_type));
+    static_assert(
+      offsetof(LZ4FormatSpecHeader, bitshuffle_mode) == offsetof(nvcompBatchedLZ4CompressOpts_t, bitshuffle_mode)
+    );
   }
 
   ~LZ4ManagerImpl() {}
 };
 
+// C++ does not allow extern-template declarations through a type alias, so the
+// specialization's argument list must be repeated here.
 extern template struct ManagerBase<
   LZ4FormatSpecHeader,
   decltype(nvcompBatchedLZ4DecompressAsyncEx) *,
-  decltype(nvcompBatchedLZ4DecompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedLZ4DecompressGetTempSize) *,
   decltype(nvcompBatchedLZ4GetDecompressSizeAsync) *,
   decltype(nvcompBatchedLZ4CompressAsync) *,
-  decltype(nvcompBatchedLZ4CompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedLZ4CompressGetTempSize) *,
   decltype(nvcompBatchedLZ4CompressGetMaxOutputChunkSize) *,
   nvcompBatchedLZ4CompressOpts_t,
   nvcompBatchedLZ4DecompressOpts_t,
@@ -102,6 +93,7 @@ LZ4Manager::LZ4Manager(
   const nvcompBatchedLZ4DecompressOpts_t &decompress_opts,
   cudaStream_t user_stream,
   ChecksumPolicy checksum_policy,
+  ExecutionPolicy execution_policy,
   BitstreamKind bitstream_kind
 )
 {
@@ -127,6 +119,7 @@ LZ4Manager::LZ4Manager(
     decompress_opts,
     user_stream,
     checksum_policy,
+    execution_policy,
     bitstream_kind
   );
 }

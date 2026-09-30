@@ -32,11 +32,7 @@
 #include "modules_types.cuh"
 #include "Reduction.cuh"
 
-using nvcomp::roundUpDiv;
-using nvcomp::roundUpTo;
-using nvcomp::roundUpToAlignment;
-
-namespace modules
+namespace nvcomp::cascaded::modules
 {
 
 /**
@@ -194,7 +190,7 @@ __device__ void block_bitpack(
     // The bitpacking metadata consists of FOR (data_type size) and bitwidth and
     // the number of elements (4B). The start of the bitpacking data needs to be
     // both 4B and data_type aligned.
-    *out_bytes = roundUpTo(sizeof(data_type) + 4, max(static_cast<size_t>(4), sizeof(data_type))) +
+    *out_bytes = roundUpTo(sizeof(data_type) + 4, max(size_t{4}, sizeof(data_type))) +
                  num_output_elements * sizeof(uint32_t);
   }
 
@@ -300,4 +296,4 @@ __device__ void block_bitunpack(const uint32_t *input, data_type *output, size_t
   }
 }
 
-} // namespace modules
+} // namespace nvcomp::cascaded::modules

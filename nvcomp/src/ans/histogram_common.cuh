@@ -31,114 +31,136 @@
 #include <cuda_pipeline.h>
 
 #include "ans/ans_utils.cuh"
-#include "ans/types.cuh" // Fp16EncodePolicy::split_float (fp16 DX histogram path)
-#include "common_utils.hpp" // nvcomp::bytesUntilAlignmentBoundary
+#include "ans/EncodePolicy.hpp"
 
 namespace ans_gpu_lib::detail
 {
 
 template <typename EncodePolicy>
 inline __device__ uint8_t *
-histogram_sideband_ptr([[maybe_unused]] uint8_t *sideband, [[maybe_unused]] IndexT symbol_offset)
+histogram_mantissas_ptr([[maybe_unused]] uint8_t *mantissas, [[maybe_unused]] IndexT symbol_offset)
 {
-  if constexpr (EncodePolicy::SIDEBAND_BYTES_PER_SYMBOL == 0)
+  if constexpr (EncodePolicy::MANTISSA_BYTES_PER_SYMBOL == 0 || EncodePolicy::ENCODE_WRITES_MANTISSAS)
   {
     return nullptr;
   }
   else
   {
-    return sideband + symbol_offset * EncodePolicy::SIDEBAND_BYTES_PER_SYMBOL;
+    return mantissas + symbol_offset * EncodePolicy::MANTISSA_BYTES_PER_SYMBOL;
   }
 }
 
-// Generic per-warp histogram engine shared by char / fp16 / fp8. The load width,
-// symbols-per-word, software-pipeline depth, optional alignment peel, per-register
-// split + side-band store, and scalar tail are all supplied by EncodePolicy (see
-// ans/types.cuh).
-template <typename EncodePolicy, bool FIX_ALIGNMENT>
-inline __device__ void
-histogram_warp_impl(int idx_in_warp, uint32_t *counts, const uint8_t *ip, int size, uint8_t *sideband)
+// Generic per-warp histogram engine shared by char / fp16 / fp8 / fp32. The load width,
+// prefetch depth, optional alignment peel, per-register split + mantissa store, and
+// scalar tail are all supplied by EncodePolicy (see ans/EncodePolicy.hpp).
+//
+// Loads run through a DEPTH-deep cp.async pipeline into per-warp shared memory
+// (`warp_stage`) when one is provided: the same latency hiding as a register window, but
+// without the LoadT registers, which spill under the fused kernel's launch bounds. Callers
+// with no stage buffer (the unit tests) pass nullptr and get a plain LDG loop.
+template <typename EncodePolicy>
+inline __device__ void histogram_warp_impl(
+  int idx_in_warp,
+  uint32_t *counts,
+  const uint8_t *ip,
+  int size,
+  uint8_t *mantissas,
+  uint8_t *warp_stage = nullptr // [HIST_PREFETCH_DEPTH * WARP_SIZE * sizeof(LoadT)]
+)
 {
   using LoadT = typename EncodePolicy::LoadT;
   // Symbols (or FP8 pairs) per load word, derived from the load width and the input
-  // bytes per symbol: char 8/1=8, fp16/fp8 8/2=4.
+  // bytes per symbol: char 16/1=16, fp8/fp16 16/2=8, fp32 16/4=4.
   constexpr int SYMBOLS_PER_WORD = sizeof(LoadT) / EncodePolicy::INPUT_BYTES_PER_SYMBOL;
-  // LOADS_PER_ITER is per lane; WARP_WORDS_PER_ITER is the warp-wide total.
-  constexpr int LOADS_PER_ITER = EncodePolicy::LOADS_PER_ITER;
-  constexpr int WARP_WORDS_PER_ITER = LOADS_PER_ITER * WARP_SIZE;
-
-  // Optional alignment peel (char: byte-granular to the uint2 boundary; fp16/fp8:
-  // none, their input is already >= 8-byte aligned). Discarded at compile time otherwise.
-  if constexpr (FIX_ALIGNMENT && EncodePolicy::HAS_PEEL)
-  {
-    const int peeled = EncodePolicy::histogram_peel_head_warp(idx_in_warp, counts, ip, size, sideband);
-    if (size <= peeled)
-    {
-      return;
-    }
-    ip += peeled * EncodePolicy::INPUT_BYTES_PER_SYMBOL;
-    size -= peeled;
-    if constexpr (EncodePolicy::SIDEBAND_BYTES_PER_SYMBOL != 0)
-    {
-      sideband += static_cast<IndexT>(peeled) * EncodePolicy::SIDEBAND_BYTES_PER_SYMBOL;
-    }
-  }
+  constexpr int PREFETCH_DEPTH = EncodePolicy::HIST_PREFETCH_DEPTH;
 
   const LoadT *ip_word = reinterpret_cast<const LoadT *>(ip);
 
   // Complete words this warp owns; the final < SYMBOLS_PER_WORD leftover go to the tail.
   const int num_words = size / SYMBOLS_PER_WORD;
 
-  // Main loop: LOADS_PER_ITER words per lane per iteration, software-pipelined --
-  // issue all the coalesced loads before consuming any.
-  const int nloop_iter = num_words / WARP_WORDS_PER_ITER;
-  for (int i = 0; i < nloop_iter; i++)
-  {
-    const int word_iter_base = i * WARP_WORDS_PER_ITER;
+  auto process_word = [&](LoadT reg, int w) {
+    EncodePolicy::histogram_process_word(
+      reg,
+      counts,
+      histogram_mantissas_ptr<EncodePolicy>(mantissas, static_cast<IndexT>(w) * SYMBOLS_PER_WORD)
+    );
+  };
 
-    LoadT reg[LOADS_PER_ITER];
+  // Main loop: one coalesced word per lane per warp-row, PREFETCH_DEPTH rows in flight.
+  constexpr int stride = WARP_SIZE;
+  const int num_rows = num_words / stride;
+  int row = 0;
+  if (warp_stage != nullptr && num_rows > 0)
+  {
+    LoadT *stage = reinterpret_cast<LoadT *>(warp_stage); // [DEPTH][WARP], row-major
+
+    // Prime up to DEPTH rows, one commit each so a wait can drain them individually. A slice
+    // shorter than DEPTH rows -- what a sampled histogram usually hands us -- primes only
+    // what it owns and drains below, rather than dropping to the serial LDG path and putting
+    // the contended atomics on the critical path with nothing to overlap them.
+    const int primed = min(num_rows, PREFETCH_DEPTH);
 #pragma unroll
-    for (int s = 0; s < LOADS_PER_ITER; ++s)
+    for (int g = 0; g < PREFETCH_DEPTH; ++g)
     {
-      reg[s] = ip_word[word_iter_base + s * WARP_SIZE + idx_in_warp];
+      if (g < primed)
+      {
+        __pipeline_memcpy_async(&stage[g * stride + idx_in_warp], &ip_word[g * stride + idx_in_warp], sizeof(LoadT));
+        __pipeline_commit();
+      }
     }
+
+    // Steady state: wait for the oldest commit only, consume that slot, refill it. Waiting
+    // for one commit (rather than all) is what keeps DEPTH-1 rows in flight across the
+    // atomics -- draining the whole pipeline here would serialize fetch behind process.
+    for (; row + 2 * PREFETCH_DEPTH <= num_rows; row += PREFETCH_DEPTH)
+    {
 #pragma unroll
-    for (int s = 0; s < LOADS_PER_ITER; ++s)
-    {
-      const int w = word_iter_base + s * WARP_SIZE + idx_in_warp;
-      EncodePolicy::template histogram_process_word<FIX_ALIGNMENT>(
-        reg[s],
-        counts,
-        histogram_sideband_ptr<EncodePolicy>(sideband, static_cast<IndexT>(w) * SYMBOLS_PER_WORD)
-      );
+      for (int g = 0; g < PREFETCH_DEPTH; ++g)
+      {
+        __pipeline_wait_prior(PREFETCH_DEPTH - 1);
+        __syncwarp();
+        const int cur_row = row + g;
+        process_word(stage[g * stride + idx_in_warp], cur_row * stride + idx_in_warp);
+        __syncwarp(); // WAR: every lane must read slot g before it is refilled
+        __pipeline_memcpy_async(
+          &stage[g * stride + idx_in_warp],
+          &ip_word[(cur_row + PREFETCH_DEPTH) * stride + idx_in_warp],
+          sizeof(LoadT)
+        );
+        __pipeline_commit();
+      }
     }
+
+    // Drain the rows still staged (up to DEPTH), then fall through to LDG for any leftover.
+    __pipeline_wait_prior(0);
+    __syncwarp();
+#pragma unroll
+    for (int g = 0; g < PREFETCH_DEPTH; ++g)
+    {
+      const int cur_row = row + g;
+      if (cur_row < num_rows)
+      {
+        process_word(stage[g * stride + idx_in_warp], cur_row * stride + idx_in_warp);
+      }
+    }
+    row += PREFETCH_DEPTH;
   }
 
-  // Remainder words: full warp-rows (one word/lane, coalesced), then the final
-  // < WARP_SIZE words one per lane.
-  const int rem_word_base = nloop_iter * WARP_WORDS_PER_ITER;
+  // No stage buffer (callers that pass none), or the rows the drain above left over.
+  for (; row < num_rows; ++row)
+  {
+    const int w = row * stride + idx_in_warp;
+    process_word(ip_word[w], w);
+  }
+
+  // Final partial warp-row (< WARP_SIZE words, one per lane).
+  const int rem_word_base = num_rows * stride;
   const int rem_words = num_words - rem_word_base;
-  const int rem_full_rows = rem_words / WARP_SIZE;
-  for (int r = 0; r < rem_full_rows; ++r)
+  if (idx_in_warp < rem_words)
   {
-    const int w = rem_word_base + r * WARP_SIZE + idx_in_warp;
-    LoadT reg = ip_word[w];
-    EncodePolicy::template histogram_process_word<FIX_ALIGNMENT>(
-      reg,
-      counts,
-      histogram_sideband_ptr<EncodePolicy>(sideband, static_cast<IndexT>(w) * SYMBOLS_PER_WORD)
-    );
-  }
-  const int rem_row_words = rem_words - rem_full_rows * WARP_SIZE;
-  if (idx_in_warp < rem_row_words)
-  {
-    const int w = rem_word_base + rem_full_rows * WARP_SIZE + idx_in_warp;
-    LoadT reg = ip_word[w];
-    EncodePolicy::template histogram_process_word<FIX_ALIGNMENT>(
-      reg,
-      counts,
-      histogram_sideband_ptr<EncodePolicy>(sideband, static_cast<IndexT>(w) * SYMBOLS_PER_WORD)
-    );
+    const int w = rem_word_base + idx_in_warp;
+    process_word(ip_word[w], w);
   }
 
   // Scalar tail: the final < SYMBOLS_PER_WORD symbols (pairs for fp8) that do not
@@ -146,8 +168,8 @@ histogram_warp_impl(int idx_in_warp, uint32_t *counts, const uint8_t *ip, int si
   const int tail_base = num_words * SYMBOLS_PER_WORD;
   const int tail_size = size - tail_base;
   const uint8_t *tail_in = ip + static_cast<IndexT>(tail_base) * EncodePolicy::INPUT_BYTES_PER_SYMBOL;
-  uint8_t *tail_sideband = histogram_sideband_ptr<EncodePolicy>(sideband, static_cast<IndexT>(tail_base));
-  EncodePolicy::histogram_process_scalar_tail_warp(idx_in_warp, counts, tail_in, tail_sideband, tail_size);
+  uint8_t *tail_mantissas = histogram_mantissas_ptr<EncodePolicy>(mantissas, static_cast<IndexT>(tail_base));
+  EncodePolicy::histogram_process_scalar_tail_warp(idx_in_warp, counts, tail_in, tail_mantissas, tail_size);
 }
 
 // ===========================================================================
@@ -181,7 +203,6 @@ inline __device__ void reduce_max_symbol_in_block_dx(
   }
 }
 
-template <bool FIX_ALIGNMENT>
 inline __device__ void histogram_uint8_data_dx(
   uint32_t idx_in_warp,
   uint32_t *shared_cta_counts,
@@ -192,26 +213,6 @@ inline __device__ void histogram_uint8_data_dx(
 {
 
   constexpr uint32_t NUM_HIST_SYMBOLS_PER_THREAD = 16;
-
-  if constexpr (FIX_ALIGNMENT)
-  {
-    // Handle the first few bytes so that we can read 16-byte (uint4) aligned words
-    const int alignment_rem = static_cast<int>(nvcomp::bytesUntilAlignmentBoundary(ip, sizeof(uint4)));
-    if (idx_in_warp < min(alignment_rem, histogram_size_per_warp))
-    {
-      uint8_t symbol = ip[idx_in_warp];
-      atomicAdd(&shared_cta_counts[symbol], 1);
-      thread_max_symbol_value = max(thread_max_symbol_value, symbol);
-    }
-
-    if (histogram_size_per_warp <= alignment_rem)
-    {
-      return;
-    }
-
-    ip += alignment_rem;
-    histogram_size_per_warp -= alignment_rem;
-  }
 
   int nloop = histogram_size_per_warp / (NUM_HIST_SYMBOLS_PER_THREAD * WARP_SIZE_U);
 
@@ -289,7 +290,7 @@ inline __device__ void histogram_uint8_data_dx(
   }
 }
 
-template <bool FIX_ALIGNMENT>
+// nvcompDx fp16 histogram. Still uses FP16EncodePolicy::split_float (high byte = symbol).
 inline __device__ void histogram_uint16_data_dx(
   uint32_t idx_in_warp,
   uint32_t *shared_cta_counts,
@@ -302,33 +303,6 @@ inline __device__ void histogram_uint16_data_dx(
 )
 {
   constexpr uint32_t NUM_HIST_SYMBOLS_PER_THREAD = 4;
-
-  if constexpr (FIX_ALIGNMENT)
-  {
-    // Handle the first few bytes so that we can read 8-byte (uint2) aligned words
-    const int alignment_rem = static_cast<int>(nvcomp::bytesUntilAlignmentBoundary(ip, sizeof(uint2)));
-    const int alignment_rem_symbols = alignment_rem / static_cast<int>(sizeof(uint16_t));
-    if (idx_in_warp < min(alignment_rem_symbols, histogram_size_per_warp))
-    {
-      const uint16_t fp16 = reinterpret_cast<const uint16_t *>(ip)[idx_in_warp];
-      uint8_t exponent, mantissa;
-      Fp16EncodePolicy::split_float(fp16, exponent, mantissa);
-      exponents[idx_in_warp] = exponent;
-      comp_chunk[idx_in_warp] = mantissa;
-      atomicAdd(&shared_cta_counts[exponent], 1);
-      thread_max_symbol_value = max(thread_max_symbol_value, exponent);
-    }
-
-    if (histogram_size_per_warp <= alignment_rem_symbols)
-    {
-      return;
-    }
-
-    ip += alignment_rem;
-    histogram_size_per_warp -= alignment_rem_symbols;
-    exponents += alignment_rem_symbols;
-    comp_chunk += alignment_rem_symbols;
-  }
 
   uint2 *shared_staging_buf_uint2 = reinterpret_cast<uint2 *>(shared_staging_buf);
   const uint2 *ip_uint2 = reinterpret_cast<const uint2 *>(ip);
@@ -347,7 +321,7 @@ inline __device__ void histogram_uint16_data_dx(
       uint16_t float_symbol = reinterpret_cast<uint16_t *>(shared_staging_buf)[WARP_SIZE * j + idx_in_warp];
 
       uint8_t exponent, mantissa;
-      Fp16EncodePolicy::split_float(float_symbol, exponent, mantissa);
+      FP16EncodePolicy<FP16X2EncodeImpl>::split_float(float_symbol, exponent, mantissa);
 
       // exponent is used for histogramming purposes and also written to a
       // tmp buffer that is used by the compressor
@@ -378,9 +352,8 @@ inline __device__ void histogram_uint16_data_dx(
       break;
     }
     uint16_t float_symbol = remaining_bytes[idx_in_warp + i];
-
-    const uint8_t exponent = static_cast<uint8_t>(float_symbol >> 8);
-    const uint8_t mantissa = static_cast<uint8_t>(float_symbol);
+    uint8_t exponent, mantissa;
+    FP16EncodePolicy<FP16X2EncodeImpl>::split_float(float_symbol, exponent, mantissa);
 
     // exponent is used for histogramming purposes and also written to a
     // tmp buffer that is used by the compressor

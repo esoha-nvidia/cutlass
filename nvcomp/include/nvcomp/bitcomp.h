@@ -128,10 +128,9 @@ nvcompStatus_t nvcompBatchedBitcompCompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for compression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for compression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks The number of chunks of memory in the batch.
  * @param[in] max_uncompressed_chunk_bytes The maximum size of a chunk in the
@@ -142,15 +141,18 @@ nvcompStatus_t nvcompBatchedBitcompCompressGetRequiredAlignments(
  * @param[in] max_total_uncompressed_bytes Upper bound on the total uncompressed
  * size of all chunks
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedBitcompCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedBitcompCompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedBitcompCompressOpts_t compress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -305,10 +307,9 @@ nvcompStatus_t nvcompBatchedBitcompDecompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for decompression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for decompression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks Number of chunks of data to be decompressed.
  * @param[in] max_uncompressed_chunk_bytes The size of the largest chunk in bytes
@@ -318,15 +319,18 @@ nvcompStatus_t nvcompBatchedBitcompDecompressGetRequiredAlignments(
  * during decompression. The value is returned on the host side.
  * @param[in] max_total_uncompressed_bytes  The total decompressed size of all the chunks.
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedBitcompDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedBitcompDecompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedBitcompDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -444,7 +448,7 @@ nvcompStatus_t nvcompBatchedBitcompGetDecompressSizeAsync(
  * overflow chunk to `nvcompErrorOutputBufferTooSmall`.
  * @param[out] device_uncompressed_chunk_bytes Array with size \p num_chunks to
  * be filled with the actual number of bytes decompressed for every chunk.
- * This argument needs to be preallocated.
+ * This argument needs to be preallocated in device-accessible memory.
  * @param[in] num_chunks Number of chunks of data to decompress.
  * @param[in] device_temp_ptr Temporary scratch memory.
  * @param[in] temp_bytes Size of temporary scratch memory.
@@ -462,7 +466,6 @@ nvcompStatus_t nvcompBatchedBitcompGetDecompressSizeAsync(
  * `nvcompSuccess`. Passing corrupt, invalid, or insufficient data leads to
  * undefined behavior or out-of-bound errors. Error reporting cannot be guaranteed
  * in this scenario as only a limited validation is performed to maintain performance.
- * Can be NULL if desired, in which case error status is not reported.
  * @param[in] stream The CUDA stream to operate on.
  *
  * @return nvcompSuccess if successfully launched, and an error code otherwise.

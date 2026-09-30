@@ -89,7 +89,7 @@ nvcompStatus_t nvcompLookaheadGzipDecompressGetTempSize(size_t num_chunks, size_
  *  @param[out] device_uncompressed_chunk_bytes Array (in device memory) to be filled with uncompressed sizes.
  *  @param[in] num_chunks Number of chunks.
  *  @param[out] device_statuses Array of length \p num_chunks in device memory for per-chunk status.
- *  Set to nvcompSuccess on success, or nvcompErrorNotSupported if the chunk lacks a valid gzip header.
+ *  Set to nvcompSuccess on success, or nvcompErrorCannotDecompress if the chunk lacks a valid gzip header.
  *  Can be nullptr if not needed.
  *  @param[in] stream The CUDA stream to operate on.
  *
@@ -112,7 +112,7 @@ nvcompStatus_t nvcompLookaheadGzipGetDecompressSizeAsync(
  *  @param[out] device_uncompressed_ptrs Pointer to device memory allocated to store decompressed data for each chunk.
  *  @param[in] device_uncompressed_buffer_bytes Number of bytes allocated for holding each uncompressed chunk.
  *  @param[out] device_uncompressed_chunk_bytes Array of length \p num_chunks in device memory where the actual
- *  uncompressed size for each chunk will be written. Can be nullptr if not needed.
+ *  uncompressed size for each chunk will be written.
  *  @param[in] device_temp_ptr Pointer to device memory allocated to store scratch data.
  *  @param[in] temp_bytes Size of internal buffer for scratch space.
  *  @param[in] num_chunks Number of chunks to decompress.

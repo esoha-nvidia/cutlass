@@ -14,154 +14,150 @@
 
 #include <cuda_runtime.h>
 
+#include <cassert>
 #include <cstdint>
 
 #include <ans/ans_utils.cuh>
+#include <ans/simple_types.cuh>
 
 namespace ans_gpu_lib
 {
 namespace detail
 {
 
-// Per-architecture tuning for the ANS decompress kernel, following the same
-// CONFIG_*[ARCH_ID] table pattern used by zstd (src/zstd/constants.cuh). These
-// knobs trade off register/shared-memory pressure, occupancy, and per-iteration
-// work; the best values differ by GPU. The active values are selected purely at
-// compile time on the device via ANS_ARCH_ID (derived from __CUDA_ARCH__); the
-// host launch reads no per-arch knob (block width is the fixed
-// NUM_DECOMP_WARPS_PER_CTA), so there is nothing to keep in sync at runtime.
-//
-// Only two tiers exist for now -- B200 (the current tuned values) and a
-// conservative default for every other GPU (minimum rolls + minimum prefetch).
-// Adding a tuned tier later is a localized edit: insert a value into each
-// CONFIG_ANS_* array and add the matching __CUDA_ARCH__ branch below.
+// fp16 tiling vocabulary, shared by EncodePolicy/DecodePolicy:
+//   row  = the symbols one contiguous inner loop en/decodes (32 lanes x 8 = 256),
+//   tile = one encode_tile (x2: 2 rows, x1: 1 row); format-visible.
+//   meta = CHAR decoder-only main-loop grouping (CHAR_DECODE_ROWS_PER_META rows unrolled
+//          together). Not used for FP16.
+constexpr int NUM_ANS_ARCH_IDS = 3;
 
-// Arch thresholds (major*100 + minor*10), descending. The CONFIG_ANS_ARCH
-// thresholds and the device #if tiers below must stay in sync.
-constexpr int NUM_ANS_ARCH_IDS = 2;
-constexpr int CONFIG_ANS_ARCH[NUM_ANS_ARCH_IDS] = {1000, 0}; // B200 (sm_100), then default
+constexpr size_t CONFIG_ANS_SMEM_PER_SM[NUM_ANS_ARCH_IDS] = {100 * 1024, 228 * 1024, 64 * 1024};
 
-// FP16 decodes per lane per outer iter (multiple of 8 and of inner unrolls).
-constexpr int CONFIG_ANS_FP16_NUM_ROLLS[NUM_ANS_ARCH_IDS] = {16, 8};
-// Inner unroll of the FP16 main loop (FP16_NUM_ROLLS must be a multiple of it).
-constexpr int CONFIG_ANS_INNER_UNROLLS[NUM_ANS_ARCH_IDS] = {4, 4};
-// uint8 decodes per lane per outer iter (>= 1).
-constexpr int CONFIG_ANS_UINT8_NUM_ROLLS[NUM_ANS_ARCH_IDS] = {12, 6};
-// Per-warp renorm buffer depth in uint16 (multiple of WARP_SIZE*8, >= worst-case iter).
-constexpr uint32_t CONFIG_ANS_RENORM_BUF_UINT16[NUM_ANS_ARCH_IDS] = {1024u, 512u};
-// Decompress __launch_bounds__ minimum blocks per SM (B200 = 12; default 8).
-constexpr int CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[NUM_ANS_ARCH_IDS] = {12, 8};
-// Compress (FP16 fused kernel) __launch_bounds__ minimum blocks per SM. Block is
-// NUM_COMP_WARPS_PER_CTA * WARP_SIZE = 128 threads, so minBlocks * 128 must not
-// exceed the arch's max threads/SM (sm_75 = 1024 -> max 8). The default tier
-// covers sm_75, so it must stay <= 8.
-constexpr int CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[NUM_ANS_ARCH_IDS] = {10, 8};
+// Rows the char decoder unrolls per main-loop iteration. Char has no side-band mantissa
+// loads to batch, so this is purely an unroll factor: it widens the window the scheduler
+// has to overlap neighbouring rows' rANS dependency chains.
+constexpr int CONFIG_ANS_CHAR_DECODE_ROWS_PER_META[NUM_ANS_ARCH_IDS] = {8, 8, 4};
+constexpr uint32_t CONFIG_ANS_RENORM_BUF_UINT16[NUM_ANS_ARCH_IDS] = {1280u, 1536u, 512u};
+constexpr int CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[NUM_ANS_ARCH_IDS] = {4, 6, 4};
+constexpr int CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[NUM_ANS_ARCH_IDS] = {4, 6, 4};
 
-// Warps per CTA is NOT arch dependent: the fused table build needs CTA width
-// 128 (= NUM_DECOMP_WARPS_PER_CTA * WARP_SIZE), so it stays fixed in
-// constants.hpp and the host/device launch use it directly.
+// Per-warp cp.async staging budget; the per-policy depth (rows in flight) is derived from
+// it and the policy's load width. Deeper is not automatically better: the pipeline only
+// reaches steady state once a warp slice is >= 2 * depth rows, so 4 KB/warp (8 uint4 rows
+// for fp16) needs twice the slice length of 2 KB before the prefetch pays for itself, and
+// 4 KB/warp on sm_120 would also cap occupancy at 2 blocks.
+constexpr int CONFIG_ANS_HIST_STAGE_BYTES_PER_WARP[NUM_ANS_ARCH_IDS] = {2048, 2048, 1024};
 
-// Translate __CUDA_ARCH__ into an index into the CONFIG_ANS_* arrays. MUST match
-// the CONFIG_ANS_ARCH thresholds. Host TUs (no __CUDA_ARCH__) default to index
-// 0; they don't read any tier-varying knob.
+constexpr int ans_arch_id_from_cuda_arch(int cuda_arch)
+{
+  return cuda_arch >= 1200 ? 0 : cuda_arch >= 1000 ? 1 : NUM_ANS_ARCH_IDS - 1;
+}
+
 #ifdef __CUDA_ARCH__
-#if __CUDA_ARCH__ >= 1000
-constexpr int ANS_ARCH_ID = 0;
-#else
-constexpr int ANS_ARCH_ID = (NUM_ANS_ARCH_IDS - 1);
-#endif
+constexpr int ANS_ARCH_ID = ans_arch_id_from_cuda_arch(__CUDA_ARCH__);
 #else
 constexpr int ANS_ARCH_ID = 0;
 #endif
 
-// Active (device-compiled) tuning knobs, selected by ANS_ARCH_ID. Only
-// meaningful inside the kernel.
-constexpr int NUM_FP16_SYMBOLS_PER_THREAD_META_ITER = CONFIG_ANS_FP16_NUM_ROLLS[ANS_ARCH_ID];
-constexpr int NUM_SYMBOLS_PER_INNER_ITER = CONFIG_ANS_INNER_UNROLLS[ANS_ARCH_ID];
-constexpr int NUM_CHAR_SYMBOLS_PER_THREAD_META_ITER = CONFIG_ANS_UINT8_NUM_ROLLS[ANS_ARCH_ID];
-constexpr uint32_t RENORM_PREFETCH_BUF_SIZE = CONFIG_ANS_RENORM_BUF_UINT16[ANS_ARCH_ID] * sizeof(uint16_t);
-constexpr uint32_t RENORM_PREFETCH_BUF_SIZE_U16 = RENORM_PREFETCH_BUF_SIZE / sizeof(uint16_t);
-constexpr int ANS_DECOMP_MIN_BLOCKS_PER_SM = CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[ANS_ARCH_ID];
-constexpr int ANS_COMP_MIN_BLOCKS_PER_SM = CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[ANS_ARCH_ID];
+constexpr int CHAR_DECODE_ROWS_PER_META = CONFIG_ANS_CHAR_DECODE_ROWS_PER_META[ANS_ARCH_ID];
+static_assert(CHAR_DECODE_ROWS_PER_META > 0, "the CHAR meta-iter must make progress");
 
-// Warp-wide symbols decoded per meta-iter (one per lane per roll across the warp).
-constexpr int NUM_FP16_SYMBOLS_PER_WARP_META_ITER = NUM_FP16_SYMBOLS_PER_THREAD_META_ITER * WARP_SIZE;
-constexpr int NUM_CHAR_SYMBOLS_PER_WARP_META_ITER = NUM_CHAR_SYMBOLS_PER_THREAD_META_ITER * WARP_SIZE;
-
-// Renorm-buffer refill threshold (uint16). Refill when buf_pos_ can no longer
-// satisfy one worst-case meta-iter. Each lane decodes
-// NUM_SYMBOLS_PER_THREAD_META_ITER symbols, each consuming up to
-// DEFAULT_TABLELOG bits of state, and the bit stream is read in 16-bit chunks, so
-// a single lane reads at most roundUpDiv(DEFAULT_TABLELOG * rolls, 16) uint16.
-// Per-iter consumption is the SUM of per-lane reads, so we round the PER-LANE
-// bits->uint16 conversion UP and THEN scale by WARP_SIZE.
-constexpr int MAX_NUM_SYMBOLS_PER_THREAD_META_ITER =
-  std::max(NUM_FP16_SYMBOLS_PER_THREAD_META_ITER, NUM_CHAR_SYMBOLS_PER_THREAD_META_ITER);
-constexpr uint32_t RENORM_REFILL_THRESHOLD_U16 =
-  static_cast<uint32_t>(WARP_SIZE) *
-  nvcomp::roundUpDiv(DEFAULT_TABLELOG * static_cast<uint32_t>(MAX_NUM_SYMBOLS_PER_THREAD_META_ITER), 16u);
-
-// NUM_CHAR_SYMBOLS_PER_THREAD_META_ITER (CHAR decodes/lane/iter),
-// NUM_FP16_SYMBOLS_PER_THREAD_META_ITER (FP16 decodes/lane/iter),
-// RENORM_PREFETCH_BUF_SIZE (per-warp renorm buffer size in bytes), and
-// RENORM_REFILL_THRESHOLD_U16 (refill trigger) are per-arch tunable and defined
-// in ans_arch_profile.cuh. The renorm buffer is decoupled from per-iter
-// consumption: it holds multiple iters' worth of renorm data and is only
-// refilled when buf_pos_ drops below RENORM_REFILL_THRESHOLD_U16, so most outer
-// iters issue *only* the mantissa LDGSTS (no renorm LDGSTS, no commit/wait, no
-// bookkeeping) under typical data.
-
-// Per-iter mantissa staging payload (bytes): one mantissa byte per FP16
-// decode = NUM_FP16_SYMBOLS_PER_THREAD_META_ITER * WARP_SIZE.
-constexpr uint32_t MANTISSA_STAGE_SIZE = static_cast<uint32_t>(NUM_FP16_SYMBOLS_PER_THREAD_META_ITER) * WARP_SIZE;
-
-// Per-warp per-stage stride (bytes) of the mantissa staging buffer. The
-// per-lane mantissa LDGSTS uses uint2 (8 B) form, sourced directly from
-// sub_chunk_mantissas (naturally 8 B-aligned) with no front-pad and no
-// leading-slot carry: each stage holds exactly the MANTISSA_STAGE_SIZE payload
-// for one outer iter, where stage[m] == sub_chunk_mantissas[iter *
-// MANTISSA_STAGE_SIZE + m]. 8 B alignment is sufficient for the uint2 LDGSTS
-// dst; we keep the stride 16 B-aligned so each warp/stage slice base is
-// 16-byte aligned (no functional requirement, just clean addressing).
-constexpr uint32_t MANTISSA_WARP_STRIDE = ((MANTISSA_STAGE_SIZE + 15u) / 16u) * 16u;
-
-// FP8 per-warp renorm buffer depth (uint16). The fp8 decode paths load the
-// packed_signs_mantissas side-band with a plain LDG (no cp.async staging), so the fp8 decode
-// shared-memory layout drops mantissa_staging entirely and folds those bytes
-// into a deeper renorm buffer. fp8 compresses poorly (small renorm region per
-// symbol), so a deeper window pushes refills (and their per-iter bookkeeping)
-// out of the hot loop at no extra shared memory vs the fp16/char layout.
-// Reclaimed u16 = per-warp mantissa bytes / 2 = (2 * MANTISSA_WARP_STRIDE) / 2 =
-// MANTISSA_WARP_STRIDE. Must stay a multiple of WARP_SIZE*8 for the uint4 LDGSTS.
-constexpr uint32_t RENORM_PREFETCH_BUF_SIZE_U16_FP8 = RENORM_PREFETCH_BUF_SIZE_U16 + MANTISSA_WARP_STRIDE;
+constexpr uint32_t ANS_RENORM_BUF_UINT16 = CONFIG_ANS_RENORM_BUF_UINT16[ANS_ARCH_ID];
 static_assert(
-  RENORM_PREFETCH_BUF_SIZE_U16_FP8 % (static_cast<uint32_t>(WARP_SIZE) * 8u) == 0,
-  "fp8 renorm depth must be a multiple of WARP_SIZE*8 (uint4 LDGSTS granularity)"
+  ANS_RENORM_BUF_UINT16 % (WARP_SIZE_U * (sizeof(uint4) / sizeof(uint16_t))) == 0,
+  "renorm depth must be a multiple of WARP_SIZE*8 (uint4 LDGSTS granularity)"
 );
+constexpr int ANS_COMP_MIN_BLOCKS_PER_SM = CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[ANS_ARCH_ID];
+constexpr int ANS_HIST_STAGE_BYTES_PER_WARP = CONFIG_ANS_HIST_STAGE_BYTES_PER_WARP[ANS_ARCH_ID];
 
-// Coupling constraints, validated for every tier so a bad edit fails to compile
-// regardless of which GPU is being built for.
 namespace
 {
-constexpr bool ans_config_is_valid(int i)
+// TODO: improve the smem calculation by having one top level struct that contains all the smem used by comp/decomp
+// Compress excess over the terms below (CUB temporaries, defrag offsets), taken as cuobjdump
+// -res-usage on compress_kernel minus that sum, not measured per component:
+// 4016 B before sm_90, 5040 B from sm_90 on; the max keeps this an upper bound.
+constexpr size_t ANS_COMP_SCRATCH_SMEM_BYTES = 5040;
+
+constexpr size_t ans_compress_smem_bytes(int i)
 {
-  return CONFIG_ANS_FP16_NUM_ROLLS[i] % 8 == 0 && // mantissa uint2 LDGSTS granularity
-         CONFIG_ANS_INNER_UNROLLS[i] > 0 && CONFIG_ANS_FP16_NUM_ROLLS[i] % CONFIG_ANS_INNER_UNROLLS[i] == 0 &&
-         CONFIG_ANS_UINT8_NUM_ROLLS[i] > 0 &&
-         CONFIG_ANS_RENORM_BUF_UINT16[i] % (static_cast<uint32_t>(WARP_SIZE) * 8u) == 0 && // uint4 LDGSTS granularity
-         // renorm buffer must cover one worst-case FP16 (or char, whichever is larger) iter of consumption: the
-         // per-lane worst case rounded UP to whole uint16, summed across the warp.
-         CONFIG_ANS_RENORM_BUF_UINT16[i] >=
-           static_cast<uint32_t>(WARP_SIZE) *
-             nvcomp::roundUpDiv(DEFAULT_TABLELOG * static_cast<uint32_t>(CONFIG_ANS_FP16_NUM_ROLLS[i]), 16u) &&
-         CONFIG_ANS_RENORM_BUF_UINT16[i] >=
-           static_cast<uint32_t>(WARP_SIZE) *
-             nvcomp::roundUpDiv(DEFAULT_TABLELOG * static_cast<uint32_t>(CONFIG_ANS_UINT8_NUM_ROLLS[i]), 16u) &&
-         CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[i] > 0 && CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[i] > 0;
+  return static_cast<size_t>(NUM_COMP_WARPS_PER_CTA) * static_cast<size_t>(CONFIG_ANS_HIST_STAGE_BYTES_PER_WARP[i]) +
+         NV_SYMBOL_COUNT * sizeof(int) + 16u + // min/max/uncovered + padding
+         NV_SYMBOL_COUNT * sizeof(uint2) + sizeof(uint32_t) +
+         sizeof(uint32_t) + // packed_chunk_size_bytes + chunk_idx_handoff
+         sizeof(EncodeChunkSmem) + ANS_COMP_SCRATCH_SMEM_BYTES;
 }
-static_assert(ans_config_is_valid(0), "ANS arch config tier 0 violates a decode coupling constraint");
-static_assert(ans_config_is_valid(1), "ANS arch config tier 1 violates a decode coupling constraint");
-static_assert(NUM_ANS_ARCH_IDS == 2, "update the per-tier static_asserts when adding ANS arch tiers");
+
+// CUB scan temporaries, allocated on top of the terms below. Measured with cuobjdump
+// -res-usage on a kernel whose only __shared__ is cta_inclusive_prefix_sum's scan:
+// 1184 B before sm_90, 2208 B from sm_90 on; the max keeps the estimates upper bounds.
+constexpr size_t ANS_SCAN_SMEM_BYTES = 2208;
+
+// Decode footprint for a given tablelog: decoding table, one renorm buffer per decode warp,
+// sub-chunk offsets, the handoff word (16 B once aligned), and scan scratch.
+constexpr size_t ans_decompress_smem_bytes(int i, uint32_t tablelog)
+{
+  return (static_cast<size_t>(1u) << tablelog) * sizeof(uint32_t) +
+         static_cast<size_t>(NUM_DECOMP_WARPS_PER_CTA) *
+           (static_cast<size_t>(CONFIG_ANS_RENORM_BUF_UINT16[i]) * sizeof(uint16_t) + sizeof(WarpRefillState)) +
+         MAX_SUB_CHUNKS_PER_CHUNK * sizeof(uint32_t) + sizeof(uint4) + ANS_SCAN_SMEM_BYTES;
+}
+
+// Keep the configured occupancy target when shared memory permits it; otherwise
+// lower the launch-bounds target to the number of blocks the table can fit.
+constexpr int ans_decomp_min_blocks_per_sm(int i, uint32_t tablelog)
+{
+  const int smem_limit = static_cast<int>(CONFIG_ANS_SMEM_PER_SM[i] / ans_decompress_smem_bytes(i, tablelog));
+  return CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[i] < smem_limit ? CONFIG_ANS_DECOMP_MIN_BLOCKS_PER_SM[i] : smem_limit;
+}
+
+inline constexpr int ans_decomp_min_blocks_per_sm(uint32_t tablelog)
+{
+  return ans_decomp_min_blocks_per_sm(ANS_ARCH_ID, tablelog);
+}
+
+constexpr bool ans_decompress_smem_fits(int i, uint32_t tablelog)
+{
+  const int blocks = ans_decomp_min_blocks_per_sm(i, tablelog);
+  return blocks > 0 &&
+         ans_decompress_smem_bytes(i, tablelog) * static_cast<size_t>(blocks) <= CONFIG_ANS_SMEM_PER_SM[i];
+}
+
+// Only one block is proven to fit: tier 2 spans sm_75's 64 KiB and sm_90's 228 KiB, so
+// pairing the tier's floor budget with its ceiling footprint describes no real device.
+constexpr bool ans_compress_smem_fits(int i)
+{
+  return CONFIG_ANS_COMP_MIN_BLOCKS_PER_SM[i] > 0 && ans_compress_smem_bytes(i) <= CONFIG_ANS_SMEM_PER_SM[i];
+}
+
+#ifndef NDEBUG
+// The launch-bounds targets are derived from the footprints above, so those have to bound
+// what ptxas allocated. Callers pass the MAX_TABLELOG ceiling, not the mode's own tablelog.
+template <typename KernelT, typename EstimateForArchT>
+inline void ans_assert_smem_within_estimate(KernelT kernel, EstimateForArchT estimate_for_arch)
+{
+  cudaFuncAttributes attr{};
+  if (cudaFuncGetAttributes(&attr, kernel) == cudaSuccess)
+  {
+    // ptxVersion is compute capability major * 10 + minor, whereas __CUDA_ARCH__
+    // uses major * 100 + minor * 10.
+    const int arch_id = ans_arch_id_from_cuda_arch(attr.ptxVersion * 10);
+    const size_t estimate = estimate_for_arch(arch_id);
+    assert(attr.sharedSizeBytes <= estimate && "ANS smem estimate is below the compiled kernel footprint");
+  }
+}
+#endif
+
+static_assert(ans_decompress_smem_fits(0, MAX_TABLELOG), "ANS tier 0 (sm_120): maximum tablelog decode does not fit");
+static_assert(ans_compress_smem_fits(0), "ANS tier 0 (sm_120): compress smem exceeds its occupancy budget");
+
+static_assert(ans_decompress_smem_fits(1, MAX_TABLELOG), "ANS tier 1 (sm_100): maximum tablelog decode does not fit");
+static_assert(ans_compress_smem_fits(1), "ANS tier 1 (sm_100): compress smem exceeds its occupancy budget");
+
+static_assert(ans_decompress_smem_fits(2, MAX_TABLELOG), "ANS tier 2 (default): maximum tablelog decode does not fit");
+static_assert(ans_compress_smem_fits(2), "ANS tier 2 (default): compress smem exceeds its occupancy budget");
+
+static_assert(NUM_ANS_ARCH_IDS == 3, "update the per-tier static_asserts when adding ANS arch tiers");
 } // namespace
 
 } // namespace detail

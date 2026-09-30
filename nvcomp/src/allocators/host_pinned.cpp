@@ -175,9 +175,15 @@ host_device_async_resource_ref make_default_pinned_mr()
 
       // The singleton pool is placed on the NUMA node local to the thread that
       // first initializes the default pinned-memory resource.
-      static cuda::mr::shared_resource<cuda::pinned_memory_pool>
-        mr{cuda::std::in_place_type<cuda::pinned_memory_pool>, numa_node, properties};
-      return host_device_async_resource_ref{mr};
+      // Deliberately leaked to avoid problems with library unload order on both
+      // Linux and Windows.
+      // More details here: https://nvidia.slack.com/archives/CCP05T27R/p1790163204623689
+      auto *mr = new cuda::mr::shared_resource<cuda::pinned_memory_pool>{
+        cuda::std::in_place_type<cuda::pinned_memory_pool>,
+        numa_node,
+        properties
+      };
+      return host_device_async_resource_ref{*mr};
     }
     catch (const std::exception &e)
     {
@@ -190,19 +196,11 @@ host_device_async_resource_ref make_default_pinned_mr()
   return make_basic_pinned_mr();
 }
 
-host_device_async_resource_ref host_mr()
+host_device_async_resource_ref get_pinned_memory_resource()
 {
-  static std::mutex mr_lock;
-  std::lock_guard lock{mr_lock};
-
-  static std::optional<host_device_async_resource_ref> mr_ref;
-  if (not mr_ref.has_value())
-  {
-    mr_ref = make_default_pinned_mr();
-  }
-  return *mr_ref;
+  // Note: initialization of a function-local static object is thread-safe.
+  static host_device_async_resource_ref mr_ref = make_default_pinned_mr();
+  return mr_ref;
 }
-
-host_device_async_resource_ref get_pinned_memory_resource() { return host_mr(); }
 
 } // namespace nvcomp

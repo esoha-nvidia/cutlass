@@ -114,7 +114,7 @@ std::vector<uint8_t> HEAD::do_replicate(const std::vector<uint8_t> &input_data, 
   size_t *iter_comp_sizes = comp_sizes + orig_num_chunks;
   size_t *iter_comp_offsets = comp_chunk_offsets + orig_num_chunks;
   size_t full_rep_comp_data_size =
-    roundUpTo(comp_chunk_offsets[orig_num_chunks - 1] + comp_sizes[orig_num_chunks - 1], sizeof(size_t));
+    roundUpTo(comp_chunk_offsets[orig_num_chunks - 1] + comp_sizes[orig_num_chunks - 1], min_alignment);
   size_t comp_rep_offset = full_rep_comp_data_size;
   for (int ix_rep = 0; ix_rep < extra_rep_count; ++ix_rep)
   {
@@ -173,6 +173,14 @@ std::vector<uint8_t> HEAD::do_replicate(const std::vector<uint8_t> &input_data, 
     comp_data += num_chunks * 2 * sizeof(size_t);
     orig_comp_data += orig_num_chunks * 2 * sizeof(size_t);
   }
+
+  // Align the payload the same way compress does. Tables grew, so the pad is
+  // computed from this buffer; the original offset is already in the header.
+  const uint32_t orig_comp_data_offset = common_header->comp_data_offset;
+  const size_t new_comp_data_offset = roundUpTo(static_cast<size_t>(comp_data - new_data.data()), min_alignment);
+  common_header->comp_data_offset = static_cast<uint32_t>(new_comp_data_offset);
+  orig_comp_data = input_data.data() + orig_comp_data_offset;
+  comp_data = new_data.data() + new_comp_data_offset;
 
   for (int ix_rep = 0; ix_rep < total_rep_count; ++ix_rep)
   {

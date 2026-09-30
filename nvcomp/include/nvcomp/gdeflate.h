@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2017-2025 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -112,10 +112,9 @@ nvcompStatus_t nvcompBatchedGdeflateCompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for compression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for compression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @note For best performance, a chunk size of 65536 bytes is recommended.
  *
@@ -128,15 +127,18 @@ nvcompStatus_t nvcompBatchedGdeflateCompressGetRequiredAlignments(
  * @param[in] max_total_uncompressed_bytes Upper bound on the total uncompressed
  * size of all chunks
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGdeflateCompressOpts_t compress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -300,10 +302,9 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for decompression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for decompression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks Number of chunks of data to be decompressed.
  * @param[in] max_uncompressed_chunk_bytes The size of the largest chunk in bytes
@@ -313,15 +314,18 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressGetRequiredAlignments(
  * during decompression. The value is returned on the host side.
  * @param[in] max_total_uncompressed_bytes The total decompressed size of all the chunks.
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGdeflateDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -436,8 +440,7 @@ nvcompStatus_t nvcompBatchedGdeflateGetDecompressSizeAsync(
  * overflow chunk to `nvcompErrorCannotDecompress`.
  * @param[out] device_uncompressed_chunk_bytes Array with size \p num_chunks to
  * be filled with the actual number of bytes decompressed for every chunk.
- * This argument needs to be preallocated, but can be NULL if desired,
- * in which case the actual sizes are not reported.
+ * This argument needs to be preallocated in device-accessible memory.
  * @param[in] num_chunks Number of chunks of data to decompress.
  * @param[in] device_temp_ptr The temporary GPU space.
  * Must be aligned to the value in the `temp` member of the
@@ -458,7 +461,6 @@ nvcompStatus_t nvcompBatchedGdeflateGetDecompressSizeAsync(
  * `nvcompSuccess`. Passing corrupt, invalid, or insufficient data leads to
  * undefined behavior or out-of-bound errors. Error reporting cannot be guaranteed
  * in this scenario as only a limited validation is performed to maintain performance.
- * Can be NULL if desired, in which case error status is not reported.
  * @param[in] stream The CUDA stream to operate on.
  *
  * @return nvcompSuccess if successfully launched, and an error code otherwise.

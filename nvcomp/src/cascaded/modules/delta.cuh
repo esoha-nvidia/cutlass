@@ -32,9 +32,7 @@
 
 #include "common.h"
 
-using nvcomp::roundUpDiv;
-
-namespace modules
+namespace nvcomp::cascaded::modules
 {
 
 /**
@@ -111,4 +109,4 @@ __device__ void block_delta_decompress(
   }
 }
 
-} // namespace modules
+} // namespace nvcomp::cascaded::modules

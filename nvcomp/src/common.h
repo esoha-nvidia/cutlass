@@ -30,14 +30,10 @@
 
 #include <cuda_runtime.h>
 
-#include <chrono>
 #include <cstdint>
-#include <stdexcept>
-#include <string>
 
 #include "CudaConstants.h"
 #include "exception.hpp"
-#include "nvcomp.hpp"
 #include "nvcomp/shared_types.h"
 #include "nvcomp/utils.hpp"
 

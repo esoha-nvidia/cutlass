@@ -28,29 +28,21 @@
 
 #pragma once
 
+#include <cuda/std/utility>
+
 #include "cascaded/modules/bitpack.cuh"
 #include "cascaded/modules/delta.cuh"
 #include "cascaded/modules/rle.cuh"
 #include "cascaded/universal/universal_header.cuh"
-#include "common.h"
 #include "composite_constants.cuh"
 #include "composite_types.cuh"
 #include "composite_utils.cuh"
 #include "CudaUtils.h"
 #include "exception.hpp"
 #include "lowlevel/Check.h"
-#include "nvcomp.h"
-#include "nvcomp/cascaded.h"
 #include "type_macros.h"
 
-using nvcomp::Check;
-using nvcomp::CudaUtils;
-using nvcomp::isAligned;
-using nvcomp::roundUpDiv;
-using nvcomp::roundUpTo;
-using nvcomp::roundUpToAlignment;
-
-namespace composite
+namespace nvcomp::cascaded::composite
 {
 
 /**
@@ -107,6 +99,9 @@ __device__ BlockIOStatus block_read(
 
   if (use_bp)
   {
+    // TODO: Validate the encoded bit width, element count, and required payload
+    // size before unpacking. A malformed buffer can otherwise read or write
+    // beyond the fixed shared-memory workspaces.
     modules::block_bitunpack<data_type, size_type>(temp_storage, output, out_num_elements);
   }
   else
@@ -118,6 +113,342 @@ __device__ BlockIOStatus block_read(
   }
 
   return BlockIOStatus::success;
+}
+
+// Special case for zero-byte chunks: they compress to zero bytes,
+// so they're valid to be decompressed to zero bytes.
+__device__ void
+set_empty_chunk_outputs(const size_t compressed_bytes, size_t &actual_decompressed_bytes, nvcompStatus_t &status)
+{
+  actual_decompressed_bytes = 0;
+  status = compressed_bytes == 0 ? nvcompSuccess : nvcompErrorCannotDecompress;
+}
+
+struct ChunkLayout
+{
+  const uint32_t *chunk_end_ptr;
+  const uint32_t *rle0_ptr;
+  const uint32_t *final_array_ptr;
+  uint32_t applied_stages;
+  uint32_t rle_stages;
+  uint32_t in_bytes;
+  int compressed_size;
+  int num_rles;
+  int num_deltas;
+};
+
+struct ChunkHeaderLayout
+{
+  bool ok;
+  const uint32_t *rle0_ptr;
+  const uint32_t *final_array_ptr;
+  uint32_t in_bytes;
+  int num_rles;
+  int num_deltas;
+};
+
+template <typename data_type>
+__device__ __forceinline__ ChunkHeaderLayout parse_adaptive_chunk_header(
+  const uint32_t *const chunk_ptr,
+  const uint32_t *const chunk_end_ptr,
+  const uint32_t applied_stages,
+  const uint32_t rle_stages,
+  uint32_t *const chunk_metadata,
+  data_type *const delta_header,
+  uint32_t *const rle_offsets
+)
+{
+  ChunkHeaderLayout header{false, chunk_ptr, nullptr, chunk_ptr[1], 0, 0};
+  if ((rle_stages & ~applied_stages) != 0u)
+  {
+    return header;
+  }
+
+  const uint32_t *stage_ptr = chunk_ptr + ADAPTIVE_CHUNK_PREFIX_SIZE / sizeof(uint32_t);
+  for (uint32_t stage_idx = 0; stage_idx < ADAPTIVE_MAX_NUM_STAGES; ++stage_idx)
+  {
+    if ((applied_stages & (1u << stage_idx)) == 0u)
+    {
+      continue;
+    }
+
+    const bool stage_is_rle = (rle_stages & (1u << stage_idx)) != 0u;
+    if (stage_is_rle)
+    {
+      if (stage_ptr + 1 > chunk_end_ptr)
+      {
+        return header;
+      }
+
+      const uint32_t count_bytes = *stage_ptr;
+      const uint32_t *const count_ptr = stage_ptr + 1;
+      if (count_bytes > static_cast<size_t>(chunk_end_ptr - count_ptr) * sizeof(uint32_t))
+      {
+        return header;
+      }
+      if (threadIdx.x == 0)
+      {
+        chunk_metadata[header.num_rles + 1] = count_bytes;
+        rle_offsets[header.num_rles] =
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(count_ptr) - reinterpret_cast<uintptr_t>(chunk_ptr));
+      }
+      stage_ptr = count_ptr + roundUpDiv(count_bytes, sizeof(uint32_t));
+      ++header.num_rles;
+    }
+    else
+    {
+      constexpr size_t delta_words = roundUpDiv(sizeof(data_type), sizeof(uint32_t));
+      if (stage_ptr + delta_words > chunk_end_ptr)
+      {
+        return header;
+      }
+      if (threadIdx.x == 0)
+      {
+        delta_header[header.num_deltas] = deserialize_value<data_type>(stage_ptr);
+      }
+      stage_ptr += delta_words;
+      ++header.num_deltas;
+    }
+  }
+
+  if (header.num_rles > MAX_NUM_RLE_LAYERS || header.num_deltas > MAX_NUM_DELTA_LAYERS)
+  {
+    return header;
+  }
+  header.final_array_ptr = reinterpret_cast<const uint32_t *>(roundUpToAlignment<data_type>(stage_ptr));
+  header.ok = true;
+  return header;
+}
+
+template <typename data_type, int threadblock_size>
+__device__ __forceinline__ ChunkHeaderLayout parse_legacy_chunk_header(
+  const uint32_t *const chunk_ptr,
+  const int max_num_rles,
+  const int max_num_deltas,
+  uint32_t *const chunk_metadata,
+  uint32_t *const rle_offsets
+)
+{
+  const int metadata_size = get_chunk_metadata_size<data_type>(max_num_rles, max_num_deltas);
+  for (int element_idx = threadIdx.x; element_idx < metadata_size / 4; element_idx += threadblock_size)
+  {
+    chunk_metadata[element_idx] = chunk_ptr[element_idx];
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0)
+  {
+    rle_offsets[0] = 0;
+    if (max_num_rles > 0)
+    {
+      for (int rle_idx = 0; rle_idx < max_num_rles - 1; ++rle_idx)
+      {
+        rle_offsets[rle_idx + 1] = roundUpTo(rle_offsets[rle_idx] + chunk_metadata[rle_idx + 1], 4);
+      }
+      rle_offsets[max_num_rles] = roundUpTo(
+        rle_offsets[max_num_rles - 1] + chunk_metadata[max_num_rles],
+        max(static_cast<size_t>(4), sizeof(data_type))
+      );
+    }
+  }
+  __syncthreads();
+
+  const uint32_t *const rle0_ptr = chunk_ptr + metadata_size / sizeof(uint32_t);
+  return {
+    true,
+    rle0_ptr,
+    rle0_ptr + rle_offsets[max_num_rles] / sizeof(uint32_t),
+    chunk_metadata[1 + max_num_rles],
+    max_num_rles,
+    max_num_deltas
+  };
+}
+
+template <typename data_type, int threadblock_size>
+__device__ __forceinline__ bool parse_chunk_layout(
+  const uint32_t *const chunk_ptr,
+  const uint32_t *const partition_end_ptr,
+  const bool adaptive_layout,
+  const int max_num_rles,
+  const int max_num_deltas,
+  const int num_scheduled_stages,
+  uint32_t *const chunk_metadata,
+  uint32_t *const rle_offsets,
+  data_type *const delta_header,
+  ChunkLayout &layout
+)
+{
+  if (chunk_ptr + 1 > partition_end_ptr)
+  {
+    return false;
+  }
+
+  const uint32_t packed_chunk_size = chunk_ptr[0];
+  layout.compressed_size =
+    static_cast<int>(adaptive_layout ? get_adaptive_chunk_size(packed_chunk_size) : packed_chunk_size);
+  layout.applied_stages = adaptive_layout ? get_adaptive_applied_stages(packed_chunk_size) : 0;
+  layout.rle_stages = adaptive_layout ? get_adaptive_rle_stages(packed_chunk_size) : 0;
+  layout.num_rles = adaptive_layout ? 0 : max_num_rles;
+  layout.num_deltas = adaptive_layout ? 0 : max_num_deltas;
+
+  const int minimum_metadata_size = adaptive_layout ? ADAPTIVE_CHUNK_PREFIX_SIZE
+                                                    : get_chunk_metadata_size<data_type>(max_num_rles, max_num_deltas);
+  if (layout.compressed_size < minimum_metadata_size || layout.compressed_size % sizeof(uint32_t) != 0 ||
+      static_cast<size_t>(layout.compressed_size) >
+        static_cast<size_t>(partition_end_ptr - chunk_ptr) * sizeof(uint32_t))
+  {
+    return false;
+  }
+
+  layout.chunk_end_ptr = chunk_ptr + layout.compressed_size / sizeof(uint32_t);
+  if (adaptive_layout && chunk_ptr + ADAPTIVE_CHUNK_PREFIX_SIZE / sizeof(uint32_t) > layout.chunk_end_ptr)
+  {
+    return false;
+  }
+  const ChunkHeaderLayout header = adaptive_layout ? parse_adaptive_chunk_header<data_type>(
+                                                       chunk_ptr,
+                                                       layout.chunk_end_ptr,
+                                                       layout.applied_stages,
+                                                       layout.rle_stages,
+                                                       chunk_metadata,
+                                                       delta_header,
+                                                       rle_offsets
+                                                     )
+                                                   : parse_legacy_chunk_header<data_type, threadblock_size>(
+                                                       chunk_ptr,
+                                                       max_num_rles,
+                                                       max_num_deltas,
+                                                       chunk_metadata,
+                                                       rle_offsets
+                                                     );
+  if (!header.ok)
+  {
+    return false;
+  }
+  layout.rle0_ptr = header.rle0_ptr;
+  layout.final_array_ptr = header.final_array_ptr;
+  layout.in_bytes = header.in_bytes;
+  layout.num_rles = header.num_rles;
+  layout.num_deltas = header.num_deltas;
+
+  if (layout.final_array_ptr > layout.chunk_end_ptr ||
+      ((adaptive_layout || int32_t(layout.in_bytes) >= 0) &&
+       layout.in_bytes > static_cast<size_t>(layout.chunk_end_ptr - layout.final_array_ptr) * sizeof(uint32_t)))
+  {
+    return false;
+  }
+
+  __syncthreads();
+  return true;
+}
+
+template <typename data_type, typename size_type>
+struct DecodedChunk
+{
+  data_type *data;
+  size_type num_elements;
+};
+
+template <typename data_type, typename size_type, typename run_type, int threadblock_size>
+__device__ __forceinline__ bool decode_chunk(
+  const ChunkLayout &layout,
+  const bool adaptive_layout,
+  const int max_num_rles,
+  const int max_num_deltas,
+  const int num_scheduled_stages,
+  const int bitpacking,
+  const uint32_t *const chunk_metadata,
+  const data_type *const delta_header,
+  const uint32_t *const rle_offsets,
+  data_type *shared_input_buffer,
+  data_type *shared_output_buffer,
+  uint32_t *const count_array,
+  uint32_t *const temp_count_array,
+  DecodedChunk<data_type, size_type> &decoded
+)
+{
+  size_type num_elements;
+  int delta_remaining;
+  if (int32_t(layout.in_bytes) >= 0)
+  {
+    if (block_read<data_type, size_type, threadblock_size>(
+          layout.final_array_ptr,
+          layout.in_bytes,
+          layout.chunk_end_ptr,
+          shared_input_buffer,
+          &num_elements,
+          reinterpret_cast<uint32_t *>(shared_output_buffer),
+          bitpacking
+        ) != BlockIOStatus::success)
+    {
+      return false;
+    }
+    __syncthreads();
+    delta_remaining = layout.num_deltas;
+  }
+  else
+  {
+    delta_remaining = layout.num_deltas + int32_t(layout.in_bytes);
+    num_elements = 0;
+  }
+
+  int rle_remaining = layout.num_rles;
+  const int decode_stages = adaptive_layout ? static_cast<int>(ADAPTIVE_MAX_NUM_STAGES)
+                                            : max(layout.num_rles, layout.num_deltas);
+  for (int layer_idx = 0; layer_idx < decode_stages; ++layer_idx)
+  {
+    const int stage_idx = adaptive_layout ? decode_stages - layer_idx - 1 : layer_idx;
+    const bool stage_applied = !adaptive_layout || (layout.applied_stages & (1u << stage_idx)) != 0u;
+    const bool stage_is_rle = adaptive_layout && (layout.rle_stages & (1u << stage_idx)) != 0u;
+    if (stage_applied && (adaptive_layout ? !stage_is_rle : (delta_remaining > 0 && delta_remaining >= rle_remaining)))
+    {
+      modules::block_delta_decompress<data_type, size_type, threadblock_size>(
+        shared_input_buffer,
+        delta_header[delta_remaining - 1],
+        num_elements,
+        shared_output_buffer
+      );
+      __syncthreads();
+      cuda::std::swap(shared_input_buffer, shared_output_buffer);
+      ++num_elements;
+      --delta_remaining;
+    }
+
+    if (stage_applied && (adaptive_layout ? stage_is_rle : (rle_remaining > 0 && rle_remaining > delta_remaining)))
+    {
+      if (block_read<run_type, size_type, threadblock_size>(
+            layout.rle0_ptr + rle_offsets[rle_remaining - 1] / sizeof(uint32_t),
+            chunk_metadata[rle_remaining],
+            layout.chunk_end_ptr,
+            reinterpret_cast<run_type *>(count_array),
+            nullptr,
+            temp_count_array,
+            bitpacking
+          ) != BlockIOStatus::success)
+      {
+        return false;
+      }
+      __syncthreads();
+
+      // TODO: Validate the widened sum of the decoded run counts against the
+      // shared output capacity before expansion. Malformed counts can otherwise
+      // overflow the scan accumulator or write beyond shared memory.
+      size_type output_num_elements;
+      modules::block_rle_decompress<data_type, size_type, run_type, threadblock_size>(
+        shared_input_buffer,
+        reinterpret_cast<run_type *>(count_array),
+        num_elements,
+        shared_output_buffer,
+        &output_num_elements
+      );
+      num_elements = output_num_elements;
+      cuda::std::swap(shared_input_buffer, shared_output_buffer);
+      --rle_remaining;
+    }
+  }
+
+  decoded = {shared_input_buffer, num_elements};
+  return true;
 }
 
 /**
@@ -159,7 +490,7 @@ __device__ void composite_decompression_fcn(
 )
 {
   using run_type = uint16_t;
-  constexpr int chunk_num_elements = chunk_size / sizeof(data_type);
+  constexpr int CHUNK_NUM_ELEMENTS = chunk_size / sizeof(data_type);
 
   // Shared memory storage for chunk metadata. Chunk metadata consists of
   // 1. size of the chunk (4B)
@@ -197,10 +528,10 @@ __device__ void composite_decompression_fcn(
   // run_type should be no larger than 4B, we use `uint32_t` to guarantee 4B
   // aligned (which implies run_type aligned as well).
   uint32_t *count_array = static_cast<uint32_t *>(shmem);
-  shmem = static_cast<void *>(static_cast<uint8_t *>(shmem) + (chunk_num_elements * sizeof(run_type)));
+  shmem = static_cast<void *>(static_cast<uint8_t *>(shmem) + (CHUNK_NUM_ELEMENTS * sizeof(run_type)));
 
   uint32_t *temp_count_array = static_cast<uint32_t *>(shmem);
-  shmem = static_cast<void *>(static_cast<uint8_t *>(shmem) + (chunk_num_elements * sizeof(run_type)));
+  shmem = static_cast<void *>(static_cast<uint8_t *>(shmem) + (CHUNK_NUM_ELEMENTS * sizeof(run_type)));
 
   // RLE offsets
   uint32_t *rle_offsets = static_cast<uint32_t *>(shmem);
@@ -208,25 +539,62 @@ __device__ void composite_decompression_fcn(
   for (int partition_idx = batch_start; partition_idx < batch_size; partition_idx += batch_stride)
   {
     if (compressed_data[partition_idx] == nullptr ||
-        compressed_bytes[partition_idx] < universal_header::header_size_bytes)
+        compressed_bytes[partition_idx] < universal_header::HEADER_SIZE_BYTES)
     {
       // Compressed buffer should at least have enough space for partition
       // metadata.
       if (threadIdx.x == 0)
       {
-        // Special case for zero-byte chunks: they compress to zero bytes,
-        // so they're valid to be decompressed to zero bytes.
-        const bool is_empty = compressed_bytes[partition_idx] == 0;
-        statuses[partition_idx] = is_empty ? nvcompSuccess : nvcompErrorCannotDecompress;
+        set_empty_chunk_outputs(
+          compressed_bytes[partition_idx],
+          actual_decompressed_bytes[partition_idx],
+          statuses[partition_idx]
+        );
+      }
+      continue;
+    }
+
+    const uint8_t *const partition_metadata_ptr = reinterpret_cast<const uint8_t *>(compressed_data[partition_idx]);
+    if (universal_header::is_legacy_compressed(partition_metadata_ptr) ||
+        !universal_header::has_supported_preamble(partition_metadata_ptr))
+    {
+      if (threadIdx.x == 0)
+      {
+        statuses[partition_idx] = nvcompErrorCannotDecompress;
+        actual_decompressed_bytes[partition_idx] = 0;
+      }
+      continue;
+    }
+    // The data type this function was instantiated for must match the one the
+    // partition was compressed with. Signed and unsigned types of one width
+    // share this decompression path and are not distinguished on the wire, so
+    // both are accepted.
+    const nvcompType_t partition_data_type = universal_header::get_data_type(partition_metadata_ptr);
+    if (partition_data_type != nvcomp::TypeOfConst<std::make_signed_t<data_type>>() &&
+        partition_data_type != nvcomp::TypeOfConst<std::make_unsigned_t<data_type>>())
+    {
+      if (threadIdx.x == 0)
+      {
+        statuses[partition_idx] = nvcompErrorCannotDecompress;
         actual_decompressed_bytes[partition_idx] = 0;
       }
       continue;
     }
 
-    if (!universal_header::is_legacy_compressed(reinterpret_cast<const uint8_t *>(compressed_data[partition_idx])))
+    const auto mode = universal_header::get_mode(partition_metadata_ptr);
+    if (mode == universal_header::CompressionMode::Symmetric)
     {
-      // This buffer was compressed using a compression mode other than LEGACY.
-      // This kernel cannot decompress the buffer.
+      // A later universal-decompression candidate may own this chunk. Marking
+      // failure here also preserves strict mode checking for direct dispatch.
+      if (threadIdx.x == 0)
+      {
+        statuses[partition_idx] = nvcompErrorCannotDecompress;
+        actual_decompressed_bytes[partition_idx] = 0;
+      }
+      continue;
+    }
+    if (mode != universal_header::CompressionMode::Asymmetric)
+    {
       if (threadIdx.x == 0)
       {
         statuses[partition_idx] = nvcompErrorCannotDecompress;
@@ -236,18 +604,15 @@ __device__ void composite_decompression_fcn(
     }
 
     const uint32_t *partition_start_ptr = static_cast<const uint32_t *>(compressed_data[partition_idx]);
-    const uint32_t *partition_end_ptr = partition_start_ptr + compressed_bytes[partition_idx] / 4;
+    const uint32_t *partition_end_ptr = partition_start_ptr + compressed_bytes[partition_idx] / sizeof(uint32_t);
     data_type *decompressed_ptr = reinterpret_cast<data_type *const *>(decompressed_data)[partition_idx];
     size_type decompressed_num_elements = 0;
 
-    const uint8_t *partition_metadata_ptr = reinterpret_cast<const uint8_t *>(partition_start_ptr);
-    int num_RLEs = universal_header::get_num_rles(partition_metadata_ptr);
-    int num_deltas = universal_header::get_num_deltas(partition_metadata_ptr);
-    int bitpacking = universal_header::get_use_bitpack(partition_metadata_ptr);
-
-    // Max number of RLE layers is 7
-    assert(num_RLEs <= max_num_rle_layers);
-    assert(num_deltas <= max_num_delta_layers);
+    constexpr bool adaptive_layout = true;
+    constexpr int max_num_RLEs = MAX_NUM_RLE_LAYERS;
+    constexpr int max_num_deltas = MAX_NUM_DELTA_LAYERS;
+    constexpr int32_t num_scheduled_stages = ADAPTIVE_MAX_NUM_STAGES;
+    constexpr int bitpacking = 1;
 
     const uint32_t num_uncompressed_elements =
       universal_header::get_uncompressed_size(reinterpret_cast<const uint8_t *>(partition_start_ptr)) /
@@ -265,202 +630,83 @@ __device__ void composite_decompression_fcn(
       continue;
     }
 
-    if (num_RLEs == 0 && num_deltas == 0 && bitpacking == 0)
+    const size_t raw_partition_bytes = roundUpTo(universal_header::HEADER_SIZE_BYTES, sizeof(data_type)) +
+                                       roundUpTo(sizeof(data_type) * num_uncompressed_elements, sizeof(uint32_t));
+    if (compressed_bytes[partition_idx] == raw_partition_bytes)
     {
       // No compression is used. This could be the result of user specification
       // or compression ratio less than 1. In this case, we copy the compressed
       // data directly to output buffer.
 
-      if (compressed_bytes[partition_idx] < roundUpTo(universal_header::header_size_bytes, sizeof(data_type)) +
-                                              sizeof(data_type) * num_uncompressed_elements)
+      const data_type *direct_compressed_buffer =
+        roundUpToAlignment<data_type>(partition_start_ptr + universal_header::HEADER_SIZE_WORDS);
+      for (int element_idx = threadIdx.x; element_idx < num_uncompressed_elements; element_idx += blockDim.x)
       {
-        // Compressed buffer does not have enough space to hold all uncompressed
-        // data, so we report failure.
-        if (threadIdx.x == 0)
-        {
-          actual_decompressed_bytes[partition_idx] = 0;
-          statuses[partition_idx] = nvcompErrorCannotDecompress;
-        }
+        decompressed_ptr[element_idx] = direct_compressed_buffer[element_idx];
       }
-      else
+      if (threadIdx.x == 0)
       {
-        const data_type *direct_compressed_buffer =
-          roundUpToAlignment<data_type>(partition_start_ptr + universal_header::header_size_words);
-        for (int element_idx = threadIdx.x; element_idx < num_uncompressed_elements; element_idx += blockDim.x)
-        {
-          decompressed_ptr[element_idx] = direct_compressed_buffer[element_idx];
-        }
-        if (threadIdx.x == 0)
-        {
-          actual_decompressed_bytes[partition_idx] = sizeof(data_type) * num_uncompressed_elements;
-          statuses[partition_idx] = nvcompSuccess;
-        }
+        actual_decompressed_bytes[partition_idx] = sizeof(data_type) * num_uncompressed_elements;
+        statuses[partition_idx] = nvcompSuccess;
       }
       continue;
     }
 
     // Start location of the first elements of delta layers in shared memory
     // storage of chunk metadata.
-    const data_type *const delta_header = roundUpToAlignment<data_type>(chunk_metadata + 1 + num_RLEs + 1);
+    data_type *const delta_header = roundUpToAlignment<data_type>(chunk_metadata + 1 + max_num_RLEs + 1);
 
     // `chunk_ptr` points to the start location of the current chunk in global
     // memory. Here we initialize it to the start location of the first chunk.
     const uint32_t *chunk_ptr = reinterpret_cast<const uint32_t *>(
-      roundUpToAlignment<data_type>(partition_start_ptr + universal_header::header_size_words)
+      roundUpToAlignment<data_type>(partition_start_ptr + universal_header::HEADER_SIZE_WORDS)
     );
 
     bool is_decompression_successful = true;
 
     while (chunk_ptr < partition_end_ptr)
     {
-      // Load chunk metadata to the shared memory storage
-      const int chunk_metadata_size = get_chunk_metadata_size<data_type>(num_RLEs, num_deltas);
-      if (chunk_ptr + chunk_metadata_size / 4 > partition_end_ptr)
+      ChunkLayout layout;
+      if (!parse_chunk_layout<data_type, threadblock_size>(
+            chunk_ptr,
+            partition_end_ptr,
+            adaptive_layout,
+            max_num_RLEs,
+            max_num_deltas,
+            num_scheduled_stages,
+            chunk_metadata,
+            rle_offsets,
+            delta_header,
+            layout
+          ))
       {
-        // Compressed buffer does not have enough space for the current chunk
-        // metadata. This means the compressed data is corrupt, so we report
-        // failure.
         is_decompression_successful = false;
         break;
       }
-      for (int element_idx = threadIdx.x; element_idx < chunk_metadata_size / 4; element_idx += threadblock_size)
+
+      DecodedChunk<data_type, size_type> decoded;
+      if (!decode_chunk<data_type, size_type, run_type, threadblock_size>(
+            layout,
+            adaptive_layout,
+            max_num_RLEs,
+            max_num_deltas,
+            num_scheduled_stages,
+            bitpacking,
+            chunk_metadata,
+            delta_header,
+            rle_offsets,
+            shared_element_buffer_0,
+            shared_element_buffer_1,
+            count_array,
+            temp_count_array,
+            decoded
+          ))
       {
-        chunk_metadata[element_idx] = chunk_ptr[element_idx];
+        is_decompression_successful = false;
+        break;
       }
 
-      __syncthreads();
-
-      // Chunk size is the first element of metadata
-      const int compressed_chunk_size = chunk_metadata[0];
-
-      // Calculate RLE count array / final array location offsets from array
-      // sizes. The calculation is a prefix sum on array sizes with alignment
-      // paddings.
-      if (threadIdx.x == 0)
-      {
-        rle_offsets[0] = 0;
-        if (num_RLEs > 0)
-        {
-          for (int rle_idx = 0; rle_idx < num_RLEs - 1; rle_idx++)
-          {
-            // The count arrays start at alignment of 4.
-            rle_offsets[rle_idx + 1] = roundUpTo(rle_offsets[rle_idx] + chunk_metadata[rle_idx + 1], 4);
-          }
-          // The final array start at location both aligned with data_type and
-          // aligned with 4B.
-          rle_offsets[num_RLEs] = roundUpTo(
-            rle_offsets[num_RLEs - 1] + chunk_metadata[num_RLEs],
-            max(static_cast<size_t>(4), sizeof(data_type))
-          );
-        }
-      }
-      __syncthreads();
-
-      data_type *shared_input_buffer = shared_element_buffer_0;
-      data_type *shared_output_buffer = shared_element_buffer_1;
-      const uint32_t *rle0_ptr = chunk_ptr + chunk_metadata_size / 4;
-
-      // Load array after final layer to shared memory
-      const uint32_t *final_array_ptr = rle0_ptr + rle_offsets[num_RLEs] / 4;
-      const uint32_t in_bytes = chunk_metadata[1 + num_RLEs];
-      size_type num_elements;
-      int delta_remaining;
-      if (int32_t(in_bytes) >= 0)
-      {
-        if (block_read<data_type, size_type, threadblock_size>(
-              final_array_ptr,
-              in_bytes,
-              partition_end_ptr,
-              shared_input_buffer,
-              &num_elements,
-              reinterpret_cast<uint32_t *>(shared_output_buffer),
-              bitpacking
-            ) != BlockIOStatus::success)
-        {
-          is_decompression_successful = false;
-          break;
-        }
-        __syncthreads();
-
-        delta_remaining = num_deltas;
-      }
-      else
-      {
-        // Negative byte count for this sub-chunk indicates that there are
-        // no elements and that at least one delta pass was skipped due
-        // to running out of elements during compression, so they must be
-        // skipped during decompression, too.
-        delta_remaining = num_deltas + int32_t(in_bytes);
-        num_elements = 0;
-      }
-
-      int rle_remaining = num_RLEs;
-
-      for (int layer_idx = 0; layer_idx < max(num_RLEs, num_deltas); layer_idx++)
-      {
-        if (delta_remaining > 0 && delta_remaining >= rle_remaining)
-        {
-          // Decompress the delta layer
-          modules::block_delta_decompress<data_type, size_type, threadblock_size>(
-            shared_input_buffer,
-            delta_header[delta_remaining - 1],
-            num_elements,
-            shared_output_buffer
-          );
-          __syncthreads();
-
-          // Revert the role of input and ouput buffer
-          auto temp_ptr = shared_output_buffer;
-          shared_output_buffer = shared_input_buffer;
-          shared_input_buffer = temp_ptr;
-
-          // Decompressing delta layer adds one extra element (the first
-          // element).
-          num_elements++;
-          delta_remaining--;
-        }
-
-        if (rle_remaining > 0 && rle_remaining > delta_remaining)
-        {
-          // Load the count array from global memory to shared memory
-          if (block_read<run_type, size_type, threadblock_size>(
-                rle0_ptr + rle_offsets[rle_remaining - 1] / 4,
-                chunk_metadata[rle_remaining],
-                partition_end_ptr,
-                reinterpret_cast<run_type *>(count_array),
-                nullptr,
-                temp_count_array,
-                bitpacking
-              ) != BlockIOStatus::success)
-          {
-            is_decompression_successful = false;
-            goto afterlastchunk;
-          }
-          __syncthreads();
-
-          // Decompress the RLE layer
-          size_type output_num_elements;
-          modules::block_rle_decompress<data_type, size_type, run_type, threadblock_size>(
-            shared_input_buffer,
-            reinterpret_cast<run_type *>(count_array),
-            num_elements,
-            shared_output_buffer,
-            &output_num_elements
-          );
-          num_elements = output_num_elements;
-
-          // Revert the role of input and ouput buffer
-          auto temp_ptr = shared_output_buffer;
-          shared_output_buffer = shared_input_buffer;
-          shared_input_buffer = temp_ptr;
-
-          rle_remaining--;
-        }
-      }
-
-      // Save the current chunk to the output buffer
-
-      if (decompressed_num_elements + num_elements > num_uncompressed_elements)
+      if (decompressed_num_elements + decoded.num_elements > num_uncompressed_elements)
       {
         // If the number of decompressed elements after the current chunk is
         // more than the total number of uncompressed elements, the compressed
@@ -469,19 +715,19 @@ __device__ void composite_decompression_fcn(
         break;
       }
 
-      for (int element_idx = threadIdx.x; element_idx < num_elements; element_idx += threadblock_size)
+      for (int element_idx = threadIdx.x; element_idx < decoded.num_elements; element_idx += threadblock_size)
       {
-        decompressed_ptr[element_idx] = shared_input_buffer[element_idx];
+        decompressed_ptr[element_idx] = decoded.data[element_idx];
       }
-      decompressed_ptr += num_elements;
-      decompressed_num_elements += num_elements;
+      decompressed_ptr += decoded.num_elements;
+      decompressed_num_elements += decoded.num_elements;
 
       // Update `chunk_ptr` to the start location of the next chunk
-      chunk_ptr =
-        reinterpret_cast<const uint32_t *>(roundUpToAlignment<data_type>(chunk_ptr + compressed_chunk_size / 4));
+      chunk_ptr = reinterpret_cast<const uint32_t *>(
+        roundUpToAlignment<data_type>(chunk_ptr + layout.compressed_size / sizeof(uint32_t))
+      );
     }
 
-  afterlastchunk:
     if (num_uncompressed_elements != decompressed_num_elements)
     {
       // The number of decompressed elements does not match the uncompressed
@@ -507,16 +753,25 @@ __device__ void composite_decompression_fcn(
 }
 
 /**
- * @brief Kernel to perform batched cascaded decompression. Extracts the
- * datatype from the metadata of the compressed buffer, then checks of the
- * templated call type matches.  If it matches, it allocates the correct amount
- * of shared memory and runs decompression.  Otherwise, it just exits.
+ * @brief Kernel to perform batched cascaded decompression for one element
+ * width. It allocates the shared memory that width requires and decompresses
+ * every partition whose header declares a matching data type. Partitions
+ * declaring a different data type are reported as
+ * `nvcompErrorCannotDecompress`, unless \p SKIP_TYPE_MISMATCHED_BATCH opts out
+ * of reporting them.
  *
- * @tparam bitwidth_test Data type to use for underlying decompression.  If
- * datatype found in metadata matches, perform compression, else exit.
+ * @tparam bitwidth_test Element width in bytes to decompress with.
  * @tparam size_type Data type used for size measures, typically size_t is used.
  * @tparam threadblock_size Number of threads in a threadblock. This argument
  * must match the configuration specified when launching this kernel.
+ * @tparam SKIP_TYPE_MISMATCHED_BATCH Whether to leave the whole batch untouched
+ * when its headers declare a data type of a different width. Callers that know
+ * the data type launch this kernel once and want the mismatch reported, because
+ * it means the compressed data is not what they claimed. Callers that do not
+ * know it launch one kernel per candidate width over the same output arrays
+ * instead, and all but the matching width must write nothing at all - the
+ * last launch would otherwise overwrite the results of the one that did the
+ * work.
  * @tparam chunk_size Number of bytes for each uncompressed chunk to fit inside
  * shared memory. This argument must match the chunk size specified during
  * compression.
@@ -531,8 +786,14 @@ __device__ void composite_decompression_fcn(
  * bytes.
  * @param[out] actual_decompressed_bytes Actual number of bytes decompressed for
  * all partitions.
+ * @param[out] statuses Whether the decompressions are successful.
  */
-template <int bitwidth_test, typename size_type, int threadblock_size, int chunk_size = default_chunk_size>
+template <
+  int bitwidth_test,
+  typename size_type,
+  int threadblock_size,
+  bool SKIP_TYPE_MISMATCHED_BATCH,
+  int chunk_size = default_chunk_size>
 __global__ void type_checked_composite_decompression_kernel(
   int batch_size,
   const void *const *compressed_data,
@@ -543,55 +804,58 @@ __global__ void type_checked_composite_decompression_kernel(
   nvcompStatus_t *statuses
 )
 {
-  // This kernel assumes all chunks have the same data type.
-  // TODO: is there a reason to require all chunks be the same data type?
-
-  // Find the first non-null compressed buffer with a readable header. Assume that buffer's type is also my buffers type
-  int i = 0;
-  nvcompType_t type;
-  while (i < batch_size)
-  {
-    if (compressed_data[i] != nullptr && compressed_bytes[i] >= universal_header::header_size_bytes)
-    {
-      const auto partition_metadata_ptr = reinterpret_cast<const uint8_t *>(compressed_data[i]);
-      type = universal_header::get_data_type(partition_metadata_ptr);
-      assert(nvcomp::isValidNvcompType(type));
-      break;
-    }
-    if (i == batch_size - 1)
-    {
-      return; // No readable headers; nothing to do
-    }
-    ++i;
-  }
-
   using data_type = std::conditional_t<
     bitwidth_test == 1,
     uint8_t,
     std::conditional_t<bitwidth_test == 2, uint16_t, std::conditional_t<bitwidth_test == 4, uint32_t, uint64_t>>>;
+
+  if constexpr (SKIP_TYPE_MISMATCHED_BATCH)
+  {
+    // All partitions are assumed to have the same data type, so the first
+    // readable header decides whether this launch owns the batch.
+    // TODO: is there a reason to require all chunks be the same data type?
+    int sampled_partition_idx = 0;
+    while (sampled_partition_idx < batch_size &&
+           compressed_bytes[sampled_partition_idx] < universal_header::HEADER_SIZE_BYTES)
+    {
+      ++sampled_partition_idx;
+    }
+
+    if (sampled_partition_idx == batch_size)
+    {
+      // No header is readable, so no partition is this launch's to decompress.
+      // The caller has already reported all of them as not decompressed.
+      return;
+    }
+
+    assert(compressed_data[sampled_partition_idx] != nullptr);
+    const nvcompType_t sampled_data_type =
+      universal_header::get_data_type(reinterpret_cast<const uint8_t *>(compressed_data[sampled_partition_idx]));
+    assert(nvcomp::isValidNvcompType(sampled_data_type));
+    if (sampled_data_type != nvcomp::TypeOfConst<std::make_signed_t<data_type>>() &&
+        sampled_data_type != nvcomp::TypeOfConst<std::make_unsigned_t<data_type>>())
+    {
+      return; // The launch for the sampled width owns this batch.
+    }
+  }
 
   constexpr int shmem_size = compute_decompress_smem_size<chunk_size, bitwidth_test, ((bitwidth_test == 8) ? 8 : 4)>();
   // This must be aligned to at least sizeof(data_type) and sizeof(uint32_t)
   // to avoid misaligned access crashes depending on its alignment.
   __shared__ alignas(8) uint8_t shmem[shmem_size];
 
-  const nvcompType_t signed_type = nvcomp::TypeOfConst<std::make_signed_t<data_type>>();
-  const nvcompType_t unsigned_type = nvcomp::TypeOfConst<std::make_unsigned_t<data_type>>();
-  if (type == signed_type || type == unsigned_type)
-  {
-    composite_decompression_fcn<data_type, size_type, threadblock_size>(
-      batch_size,
-      blockIdx.x,
-      gridDim.x,
-      compressed_data,
-      compressed_bytes,
-      decompressed_data,
-      decompressed_buffer_bytes,
-      actual_decompressed_bytes,
-      reinterpret_cast<void *>(shmem),
-      statuses
-    );
-  }
+  composite_decompression_fcn<data_type, size_type, threadblock_size>(
+    batch_size,
+    blockIdx.x,
+    gridDim.x,
+    compressed_data,
+    compressed_bytes,
+    decompressed_data,
+    decompressed_buffer_bytes,
+    actual_decompressed_bytes,
+    reinterpret_cast<void *>(shmem),
+    statuses
+  );
 }
 
 nvcompStatus_t DecompressAsync(
@@ -606,6 +870,13 @@ nvcompStatus_t DecompressAsync(
   cudaStream_t stream
 )
 {
+  if (num_chunks == 0)
+  {
+    // The batch size doubles as the grid size, and an empty grid is an invalid
+    // launch configuration. There is nothing to decompress either way.
+    return nvcompSuccess;
+  }
+
   constexpr int threadblock_size = composite_decompress_threadblock_size;
   try
   {
@@ -613,7 +884,7 @@ nvcompStatus_t DecompressAsync(
     {
       case NVCOMP_TYPE_CHAR:
       case NVCOMP_TYPE_UCHAR:
-        type_checked_composite_decompression_kernel<1, size_t, threadblock_size>
+        type_checked_composite_decompression_kernel<1, size_t, threadblock_size, /*SKIP_TYPE_MISMATCHED_BATCH=*/false>
           <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
             nvcomp::narrow_cast<int>(num_chunks),
             device_compressed_chunk_ptrs,
@@ -626,7 +897,7 @@ nvcompStatus_t DecompressAsync(
         break;
       case NVCOMP_TYPE_SHORT:
       case NVCOMP_TYPE_USHORT:
-        type_checked_composite_decompression_kernel<2, size_t, threadblock_size>
+        type_checked_composite_decompression_kernel<2, size_t, threadblock_size, /*SKIP_TYPE_MISMATCHED_BATCH=*/false>
           <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
             nvcomp::narrow_cast<int>(num_chunks),
             device_compressed_chunk_ptrs,
@@ -639,7 +910,7 @@ nvcompStatus_t DecompressAsync(
         break;
       case NVCOMP_TYPE_INT:
       case NVCOMP_TYPE_UINT:
-        type_checked_composite_decompression_kernel<4, size_t, threadblock_size>
+        type_checked_composite_decompression_kernel<4, size_t, threadblock_size, /*SKIP_TYPE_MISMATCHED_BATCH=*/false>
           <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
             nvcomp::narrow_cast<int>(num_chunks),
             device_compressed_chunk_ptrs,
@@ -652,7 +923,7 @@ nvcompStatus_t DecompressAsync(
         break;
       case NVCOMP_TYPE_LONGLONG:
       case NVCOMP_TYPE_ULONGLONG:
-        type_checked_composite_decompression_kernel<8, size_t, threadblock_size>
+        type_checked_composite_decompression_kernel<8, size_t, threadblock_size, /*SKIP_TYPE_MISMATCHED_BATCH=*/false>
           <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
             nvcomp::narrow_cast<int>(num_chunks),
             device_compressed_chunk_ptrs,
@@ -677,4 +948,4 @@ nvcompStatus_t DecompressAsync(
   return nvcompSuccess;
 }
 
-} // namespace composite
+} // namespace nvcomp::cascaded::composite

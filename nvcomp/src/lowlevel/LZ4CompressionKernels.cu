@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cub/cub.cuh>
 
@@ -128,7 +112,7 @@ __global__ void lz4CompressBatchKernel(
   }
 }
 
-template <bool CORRECTNESS_CHECK>
+template <bool CORRECTNESS_CHECK, bool WRITE_DECOMPRESSED_OUTPUT>
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1200)
 __launch_bounds__(LZ4_DECOMP_THREADS_PER_CHUNK *LZ4_DECOMP_CHUNKS_PER_BLOCK)
 #endif
@@ -140,8 +124,7 @@ __launch_bounds__(LZ4_DECOMP_THREADS_PER_CHUNK *LZ4_DECOMP_CHUNKS_PER_BLOCK)
     uint8_t *const *const device_out_ptrs,
     size_t *device_uncompressed_bytes,
     nvcompStatus_t *device_status_ptrs,
-    LZ4CorrectnessChecker<CORRECTNESS_CHECK> *device_correctness_ptrs,
-    bool output_decompressed
+    LZ4CorrectnessChecker<CORRECTNESS_CHECK> *device_correctness_ptrs
   )
 {
   assert(blockDim.x == WARP_SIZE_U); // code below assumes there is only a single warp on dim x
@@ -157,10 +140,9 @@ __launch_bounds__(LZ4_DECOMP_THREADS_PER_CHUNK *LZ4_DECOMP_CHUNKS_PER_BLOCK)
   __shared__ int ix_output[WARP_SIZE * LZ4_DECOMP_CHUNKS_PER_BLOCK];
   */
 
-  assert(!output_decompressed || device_out_ptrs != nullptr);
-  // device_uncompressed_bytes needs to be valid if we are precomputing
-  // output size
-  assert(output_decompressed || device_uncompressed_bytes != nullptr);
+  assert(!WRITE_DECOMPRESSED_OUTPUT || device_out_ptrs != nullptr);
+  // device_uncompressed_bytes must always be present.
+  assert(device_uncompressed_bytes != nullptr);
 
   if constexpr (CORRECTNESS_CHECK)
   {
@@ -175,8 +157,9 @@ __launch_bounds__(LZ4_DECOMP_THREADS_PER_CHUNK *LZ4_DECOMP_CHUNKS_PER_BLOCK)
     uint8_t *const decomp_ptr = device_out_ptrs == nullptr ? nullptr : device_out_ptrs[bid];
     const uint8_t *const comp_ptr = device_in_ptrs[bid];
     const position_type chunk_length = static_cast<position_type>(device_in_bytes[bid]);
-    const position_type output_buf_length = output_decompressed ? static_cast<position_type>(device_out_bytes[bid])
-                                                                : UINT_MAX;
+    const position_type output_buf_length = WRITE_DECOMPRESSED_OUTPUT
+                                              ? static_cast<position_type>(device_out_bytes[bid])
+                                              : UINT_MAX;
 
     decompressStream<CORRECTNESS_CHECK>(
       shared_mem[threadIdx.y],
@@ -184,9 +167,9 @@ __launch_bounds__(LZ4_DECOMP_THREADS_PER_CHUNK *LZ4_DECOMP_CHUNKS_PER_BLOCK)
       comp_ptr,
       chunk_length,
       output_buf_length,
-      device_uncompressed_bytes ? device_uncompressed_bytes + bid : nullptr,
-      device_status_ptrs ? device_status_ptrs + bid : nullptr,
-      output_decompressed,
+      device_uncompressed_bytes + bid,
+      WRITE_DECOMPRESSED_OUTPUT ? device_status_ptrs + bid : nullptr,
+      WRITE_DECOMPRESSED_OUTPUT,
       warp,
       device_correctness_ptrs ? device_correctness_ptrs + bid : nullptr
     );
@@ -318,10 +301,7 @@ __global__ void fill_cudecomp_params(
   de_params[ix_chunk].dstNumBytes = 0;
   de_params[ix_chunk].algo = CU_MEM_DECOMPRESS_ALGORITHM_LZ4;
 
-  if (device_statuses != nullptr)
-  {
-    device_statuses[sorted_ix_chunk] = nvcompSuccess;
-  }
+  device_statuses[sorted_ix_chunk] = nvcompSuccess;
 }
 
 void LZ4FillCuDecompParams(
@@ -418,7 +398,7 @@ void lz4BatchDecompress(
     );
   }
 
-  lz4DecompressBatchKernel<CORRECTNESS_CHECK><<<grid, block, 0, stream>>>(
+  lz4DecompressBatchKernel<CORRECTNESS_CHECK, true><<<grid, block, 0, stream>>>(
     device_in_ptrs,
     device_in_bytes,
     device_out_bytes,
@@ -426,8 +406,7 @@ void lz4BatchDecompress(
     device_out_ptrs,
     device_actual_uncompressed_bytes,
     device_status_ptrs,
-    reinterpret_cast<LZ4CorrectnessChecker<CORRECTNESS_CHECK> *>(device_correctness_ptrs),
-    true
+    reinterpret_cast<LZ4CorrectnessChecker<CORRECTNESS_CHECK> *>(device_correctness_ptrs)
   );
   CUDA_CHECK(cudaGetLastError());
 
@@ -473,7 +452,7 @@ void lz4BatchGetDecompressSizes(
   const dim3 grid(nvcomp::cuda_dim_cast(roundUpDiv(batch_size, LZ4_DECOMP_CHUNKS_PER_BLOCK)));
   const dim3 block(LZ4_DECOMP_THREADS_PER_CHUNK, LZ4_DECOMP_CHUNKS_PER_BLOCK);
 
-  lz4DecompressBatchKernel<false><<<grid, block, 0, stream>>>(
+  lz4DecompressBatchKernel<false, false><<<grid, block, 0, stream>>>(
     device_compressed_ptrs,
     device_compressed_bytes,
     nullptr,
@@ -481,8 +460,7 @@ void lz4BatchGetDecompressSizes(
     nullptr,
     device_uncompressed_bytes,
     nullptr,
-    nullptr,
-    false
+    nullptr
   );
   CUDA_CHECK(cudaGetLastError());
 }

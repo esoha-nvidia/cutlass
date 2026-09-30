@@ -94,21 +94,12 @@ public:
 
   inline __device__ char &operator[](size_t index) { return device_uncompressed_ptr[index]; }
 
-  inline __device__ void set_done(size_t end_position)
-  {
-    if (device_uncompressed_chunk_bytes)
-    {
-      *device_uncompressed_chunk_bytes = end_position;
-    }
-  }
+  inline __device__ void set_done(size_t end_position) { *device_uncompressed_chunk_bytes = end_position; }
 
   inline __device__ void set_error()
   {
-    if (device_uncompressed_chunk_bytes)
-    {
-      // Following suit with BufferD2H<>, although there is no restriction
-      *device_uncompressed_chunk_bytes = 0xffffffffffffffffULL;
-    }
+    // Following suit with BufferD2H<>, although there is no restriction
+    *device_uncompressed_chunk_bytes = 0xffffffffffffffffULL;
   }
 
   // Note:

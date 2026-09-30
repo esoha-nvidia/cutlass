@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -18,10 +18,10 @@ namespace nvcomp
 template struct ManagerBase<
   GzipFormatSpecHeader,
   decltype(nvcompBatchedGzipDecompressAsyncEx) *,
-  decltype(nvcompBatchedGzipDecompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedGzipDecompressGetTempSize) *,
   decltype(nvcompBatchedGzipGetDecompressSizeAsync) *,
   decltype(nvcompBatchedGzipCompressAsync) *,
-  decltype(nvcompBatchedGzipCompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedGzipCompressGetTempSize) *,
   decltype(nvcompBatchedGzipCompressGetMaxOutputChunkSize) *,
   nvcompBatchedGzipCompressOpts_t,
   nvcompBatchedGzipDecompressOpts_t,

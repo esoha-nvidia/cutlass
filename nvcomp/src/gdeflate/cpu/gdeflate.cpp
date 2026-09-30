@@ -1,17 +1,21 @@
 /*
- * Copyright (c) 2021-2025, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "common.h"
@@ -23,7 +27,7 @@
 #define WITH_GDEFLATE
 #include "deflate_constants.h"
 
-namespace gdeflate
+namespace nvcomp::gdeflate
 {
 
 // Verify public & internal constants
@@ -35,17 +39,36 @@ static_assert(
   (nvcompGdeflateCPURequiredDecompressionAlignment & (nvcompGdeflateCPURequiredDecompressionAlignment - 1)) == 0
 );
 
+namespace
+{
+
+using GdeflateCompressorHandle =
+  std::unique_ptr<libdeflate_gdeflate_compressor, decltype(&libdeflate_free_gdeflate_compressor)>;
+using GdeflateDecompressorHandle =
+  std::unique_ptr<libdeflate_gdeflate_decompressor, decltype(&libdeflate_free_gdeflate_decompressor)>;
+
+void validate_max_uncompressed_chunk_bytes(size_t max_uncompressed_chunk_bytes)
+{
+  if (max_uncompressed_chunk_bytes > nvcompGdeflateCPUCompressionMaxAllowedChunkSize)
+  {
+    throw NVCompException(
+      nvcompErrorInvalidValue,
+      "Maximum allowed chunk size for Gdeflate CPU is " +
+        std::to_string(nvcompGdeflateCPUCompressionMaxAllowedChunkSize) + " bytes"
+    );
+  }
+}
+
+} // namespace
+
 void compressCPUGetMaxOutputChunkSize(size_t max_uncompressed_chunk_bytes, size_t *max_compressed_chunk_bytes)
 {
 
   if (max_compressed_chunk_bytes == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "max_compressed_chunk_bytes must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "max_compressed_chunk_bytes must not be null");
   }
-  if (max_uncompressed_chunk_bytes > GDEFLATE_PAGE_SIZE /* gdeflateMaxChunkSize */)
-  {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "Maximum allowed chunk size for Gdeflate CPU is 64kB");
-  }
+  validate_max_uncompressed_chunk_bytes(max_uncompressed_chunk_bytes);
 
   // TODO: Check how/why this differs from our gdeflate::compressGetMaxOutputChunkSize implementation .
   size_t npages;
@@ -65,23 +88,33 @@ void decompressCPU(
 
   if (in_ptr == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "in_ptr must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "in_ptr must not be null");
+  }
+  if (in_bytes == nullptr)
+  {
+    throw NVCompException(nvcompErrorInvalidValue, "in_bytes must not be null");
   }
   if (out_ptr == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "out_ptr must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "out_ptr must not be null");
   }
   if (out_buffer_bytes == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "out_buffer_bytes must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "out_buffer_bytes must not be null");
   }
   if (out_bytes == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "out_bytes must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "out_bytes must not be null");
   }
 
-  libdeflate_gdeflate_decompressor *decompressor;
-  decompressor = libdeflate_alloc_gdeflate_decompressor();
+  GdeflateDecompressorHandle decompressor(
+    libdeflate_alloc_gdeflate_decompressor(),
+    libdeflate_free_gdeflate_decompressor
+  );
+  if (decompressor == nullptr)
+  {
+    throw NVCompException(nvcompErrorInternal, "Failed to allocate Gdeflate CPU decompressor");
+  }
 
   // TODO: why not parallel?
   for (size_t i = 0; i < batch_size; ++i)
@@ -98,10 +131,10 @@ void decompressCPU(
     //       zero it out ourselves.
     out_bytes[i] = 0;
     libdeflate_result result =
-      libdeflate_gdeflate_decompress(decompressor, &page, 1, out_ptr[i], out_buffer_bytes_i, &out_bytes[i]);
+      libdeflate_gdeflate_decompress(decompressor.get(), &page, 1, out_ptr[i], out_buffer_bytes_i, &out_bytes[i]);
     if (result != LIBDEFLATE_SUCCESS)
     {
-      throw nvcomp::NVCompException(nvcompErrorCannotDecompress, "Failed to decompress chunk");
+      throw NVCompException(nvcompErrorCannotDecompress, "Failed to decompress chunk");
     }
   }
 }
@@ -119,43 +152,50 @@ void compressCPU(
 
   if (in_ptr == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "in_ptr must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "in_ptr must not be null");
   }
   if (in_bytes == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "in_bytes must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "in_bytes must not be null");
   }
   if (out_ptr == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "out_ptr must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "out_ptr must not be null");
   }
   if (out_bytes == nullptr)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "out_bytes must not be null");
+    throw NVCompException(nvcompErrorInvalidValue, "out_bytes must not be null");
   }
-  // TODO: Why is the maximum supported chunk size 64KiB?
-  if (max_uncompressed_chunk_bytes > GDEFLATE_PAGE_SIZE /* gdeflateMaxChunkSize */)
+  validate_max_uncompressed_chunk_bytes(max_uncompressed_chunk_bytes);
+  if (compression_level < nvcompGdeflateCPUMinCompressionLevel ||
+      compression_level > nvcompGdeflateCPUMaxCompressionLevel)
   {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "Maximum allowed chunk size for Gdeflate CPU is 64kB");
-  }
-  if (compression_level < 0 || compression_level > 12)
-  {
-    throw nvcomp::NVCompException(nvcompErrorInvalidValue, "Compression level must be between 0 and 12, both inclusive");
+    throw NVCompException(
+      nvcompErrorInvalidValue,
+      "Compression level must be between " + std::to_string(nvcompGdeflateCPUMinCompressionLevel) + " and " +
+        std::to_string(nvcompGdeflateCPUMaxCompressionLevel) + ", both inclusive"
+    );
   }
 
   size_t npages;
   size_t max_comp_len = libdeflate_gdeflate_compress_bound(nullptr, max_uncompressed_chunk_bytes, &npages);
   assert(npages == 1);
 
-  libdeflate_gdeflate_compressor *compressor;
-  compressor = libdeflate_alloc_gdeflate_compressor(compression_level);
+  GdeflateCompressorHandle compressor(
+    libdeflate_alloc_gdeflate_compressor(compression_level),
+    libdeflate_free_gdeflate_compressor
+  );
+  if (compressor == nullptr)
+  {
+    throw NVCompException(nvcompErrorInternal, "Failed to allocate Gdeflate CPU compressor");
+  }
 
   // TODO: why not parallel?
   for (size_t i = 0; i < batch_size; ++i)
   {
     if (in_bytes[i] > max_uncompressed_chunk_bytes)
     {
-      throw nvcomp::NVCompException(
+      throw NVCompException(
         nvcompErrorInvalidValue,
         "max_uncompressed_chunk_bytes cannot be lower than any single chunk size"
       );
@@ -166,22 +206,17 @@ void compressCPU(
     page.data = out_ptr[i];
     page.nbytes = max_comp_len;
 
-    size_t compressedSize = libdeflate_gdeflate_compress(compressor, in_ptr[i], in_bytes[i], &page, 1);
+    size_t compressedSize = libdeflate_gdeflate_compress(compressor.get(), in_ptr[i], in_bytes[i], &page, 1);
 
     if (compressedSize == 0)
     {
-      throw nvcomp::NVCompException(
+      throw NVCompException(
         nvcompErrorCannotCompress,
         "Failed to compress chunk, check if max_uncompressed_chunk_bytes is set correctly"
       );
     }
     out_bytes[i] = page.nbytes;
   }
-
-  if (compressor)
-  {
-    libdeflate_free_gdeflate_compressor(compressor);
-  }
 }
 
-} // namespace gdeflate
+} // namespace nvcomp::gdeflate

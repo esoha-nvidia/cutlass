@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2017-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cassert>
 #include <iostream>
@@ -184,21 +168,23 @@ nvcompStatus_t nvcompBatchedLZ4DecompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedLZ4DecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedLZ4DecompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
   nvcompBatchedLZ4DecompressOpts_t decompress_opts,
   size_t *const temp_bytes,
-  const size_t max_total_uncompressed_bytes
+  const size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
 )
 {
   LZ4_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   // Error check inputs
@@ -230,7 +216,7 @@ nvcompStatus_t nvcompBatchedLZ4DecompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedLZ4DecompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedLZ4DecompressGetTempSize()");
   }
 
   return nvcompSuccess;
@@ -256,12 +242,13 @@ nvcompStatus_t nvcompBatchedLZ4DecompressGetTempSizeSync(
     return result;
   }
 
-  return nvcompBatchedLZ4DecompressGetTempSizeAsync(
+  return nvcompBatchedLZ4DecompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     decompress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
@@ -310,16 +297,16 @@ nvcompStatus_t nvcompBatchedLZ4DecompressAsyncEx(
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
-  if (device_uncompressed_chunk_bytes == nullptr && decompress_opts.bitshuffle_mode != NVCOMP_BITSHUFFLE_NONE)
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
+  if (temp_bytes > 0)
   {
-    LOG_ERROR("device_uncompressed_chunk_bytes is required when bitshuffle is enabled.");
-    return nvcompErrorInvalidValue;
+    NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
   }
 
-  // Device status array must be provided for correctness checks
-  if (check_lz4_correctness and (device_statuses == nullptr or device_temp_ptr == nullptr))
+  if (check_lz4_correctness && device_temp_ptr == nullptr)
   {
-    LOG_ERROR("For correctness checks, device_statuses and device_temp_ptr must be provided");
+    LOG_ERROR("For correctness checks, device_temp_ptr must be provided");
     return nvcompErrorInvalidValue;
   }
   LZ4_CHECK_DECOMPRESS_OPTS(decompress_opts);
@@ -339,11 +326,6 @@ nvcompStatus_t nvcompBatchedLZ4DecompressAsyncEx(
   NVCOMP_CHECK_BATCH_SIZE(num_chunks, std::numeric_limits<int>::max());
 
   auto launch_hw_decomp = [&](const bool force_hw_decomp) -> bool {
-    if (device_uncompressed_chunk_bytes == nullptr)
-    {
-      return false;
-    }
-
     auto fill_params = [&device_uncompressed_buffer_bytes,
                         host_comp_chunk_buffers,
                         host_setup_mode,
@@ -514,7 +496,7 @@ nvcompStatus_t nvcompBatchedLZ4DecompressAsync(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
-  size_t *device_uncompressed_chunk_bytes, // optional
+  size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
   void *const device_temp_ptr,
   size_t temp_bytes,
@@ -624,21 +606,23 @@ nvcompStatus_t nvcompBatchedLZ4CompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedLZ4CompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedLZ4CompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
-  const nvcompBatchedLZ4CompressOpts_t format_opts, // unused, except for logging
+  const nvcompBatchedLZ4CompressOpts_t format_opts,
   size_t *const temp_bytes,
-  const size_t max_total_uncompressed_bytes
-) // unused, except for logging
+  const size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
+)
 {
   LZ4_LOG_WITH_COMPRESS_OPTS(
-    nvcomp::logBatchedCompressGetTempSizeAsync,
+    nvcomp::logBatchedCompressGetTempSize,
     format_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
   LZ4_CHECK_COMPRESS_OPTS(format_opts);
 
@@ -660,7 +644,7 @@ nvcompStatus_t nvcompBatchedLZ4CompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedLZ4CompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedLZ4CompressGetTempSize()");
   }
   return nvcompSuccess;
 }
@@ -673,21 +657,22 @@ nvcompStatus_t nvcompBatchedLZ4CompressGetTempSizeSync(
   nvcompBatchedLZ4CompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
-  [[maybe_unused]] cudaStream_t stream
+  cudaStream_t stream
 )
 {
-  return nvcompBatchedLZ4CompressGetTempSizeAsync(
+  return nvcompBatchedLZ4CompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
-    compress_opts, // unused, except for logging
+    compress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
 nvcompStatus_t nvcompBatchedLZ4CompressGetMaxOutputChunkSize(
   const size_t max_uncompressed_chunk_bytes,
-  const nvcompBatchedLZ4CompressOpts_t format_opts, // unused, except for logging
+  const nvcompBatchedLZ4CompressOpts_t format_opts,
   size_t *const max_compressed_chunk_bytes
 )
 {

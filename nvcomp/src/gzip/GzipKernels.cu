@@ -781,14 +781,20 @@ namespace
 {
 // Per-window sizing for one GZIP_STREAMING_WINDOW_SIZE chunk (batch_size == 1): scratch temp_bytes
 // and worst-case compressed output max_out. Single source for both the temp-size query and the run.
-void compute_streaming_window_sizing(nvcompBatchedGzipCompressOpts_t opts, size_t &temp_bytes, size_t &max_out)
+void compute_streaming_window_sizing(
+  nvcompBatchedGzipCompressOpts_t opts,
+  size_t &temp_bytes,
+  size_t &max_out,
+  cudaStream_t stream
+)
 {
-  if (nvcompBatchedGzipCompressGetTempSizeAsync(
+  if (nvcompBatchedGzipCompressGetTempSize(
         1,
         GZIP_STREAMING_WINDOW_SIZE,
         opts,
         &temp_bytes,
-        GZIP_STREAMING_WINDOW_SIZE
+        GZIP_STREAMING_WINDOW_SIZE,
+        stream
       ) != nvcompSuccess ||
       nvcompBatchedGzipCompressGetMaxOutputChunkSize(GZIP_STREAMING_WINDOW_SIZE, opts, &max_out) != nvcompSuccess)
   {
@@ -815,7 +821,7 @@ size_t gzipStreamingCompressTempSize(nvcompBatchedGzipCompressOpts_t opts)
 {
   size_t temp_bytes = 0;
   size_t max_out = 0;
-  compute_streaming_window_sizing(opts, temp_bytes, max_out);
+  compute_streaming_window_sizing(opts, temp_bytes, max_out, nullptr);
   return streaming_total_device_bytes(temp_bytes, max_out);
 }
 
@@ -833,7 +839,7 @@ void gzipStreamingCompress(
   // Single-chunk-per-window sizing (batch_size == 1). Fixed for every window, so size once.
   size_t temp_bytes = 0;
   size_t max_out = 0;
-  compute_streaming_window_sizing(opts, temp_bytes, max_out);
+  compute_streaming_window_sizing(opts, temp_bytes, max_out, stream);
 
   // The caller must provide at least the device workspace gzipStreamingCompressTempSize() reports;
   // the windows are carved from it, so a short buffer would be an out-of-bounds write.

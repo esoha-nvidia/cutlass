@@ -29,8 +29,6 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
-#include <stdexcept>
-#include <string>
 #include <type_traits>
 
 // Green context (SM partitioning) runtime APIs are available from CTK 13.1.

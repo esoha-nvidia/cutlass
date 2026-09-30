@@ -30,6 +30,8 @@
 
 #include <cub/cub.cuh>
 
+#include "ans/constants.hpp"
+
 namespace ans_gpu_lib::detail
 {
 
@@ -42,11 +44,10 @@ struct normalize_max_op
   __device__ __forceinline__ uint32_t operator()(const uint32_t &a, const uint32_t &b) const { return a > b ? a : b; }
 };
 
-template <int BLOCK_DIM_X, typename T>
 static inline __device__ void normalize_counts_chunk_parallel(
   const unsigned int idx_in_block,
   const uint32_t *chunk_counts,
-  T *chunk_norm_counts,
+  int *chunk_norm_counts,
   uint32_t *max_symbol_value_out,
   const IndexT uncomp_chunk_size,
   uint8_t tablelog
@@ -54,8 +55,11 @@ static inline __device__ void normalize_counts_chunk_parallel(
 {
 
   constexpr int N_SYMBOLS = NV_SYMBOL_COUNT;
-  static_assert(N_SYMBOLS % BLOCK_DIM_X == 0, "BLOCK_DIM_X must evenly divide NV_SYMBOL_COUNT");
-  constexpr int ITEMS_PER_THREAD = N_SYMBOLS / BLOCK_DIM_X;
+  static_assert(
+    N_SYMBOLS % NUM_COMP_THREADS_PER_CTA == 0,
+    "NUM_COMP_THREADS_PER_CTA must evenly divide NV_SYMBOL_COUNT"
+  );
+  constexpr int ITEMS_PER_THREAD = N_SYMBOLS / NUM_COMP_THREADS_PER_CTA;
 
   constexpr int16_t NOT_ASSIGNED = -2;
 
@@ -100,11 +104,11 @@ static inline __device__ void normalize_counts_chunk_parallel(
         my_total_dec += static_cast<uint64_t>(c);
       }
     }
-    chunk_norm_counts[i] = static_cast<T>(nc);
+    chunk_norm_counts[i] = nc;
   }
 
-  using BlockReduceU32 = nvcomp::cub::BlockReduce<uint32_t, BLOCK_DIM_X>;
-  using BlockReduceU64 = nvcomp::cub::BlockReduce<uint64_t, BLOCK_DIM_X>;
+  using BlockReduceU32 = nvcomp::cub::BlockReduce<uint32_t, NUM_COMP_THREADS_PER_CTA>;
+  using BlockReduceU64 = nvcomp::cub::BlockReduce<uint64_t, NUM_COMP_THREADS_PER_CTA>;
   __shared__ typename BlockReduceU32::TempStorage last_nonzero_temp;
   __shared__ typename BlockReduceU32::TempStorage remaining_dec_temp;
   __shared__ typename BlockReduceU64::TempStorage total_dec_temp;
@@ -130,6 +134,7 @@ static inline __device__ void normalize_counts_chunk_parallel(
   uint32_t max_symbol_value = s_max_symbol_value;
   uint32_t remaining = s_remaining;
   IndexT total = static_cast<IndexT>(s_total);
+  __syncthreads();
 
   // Note: With the current tablelog of 10, the following four conditions are never true in testing.
   if (remaining == 0)
@@ -179,7 +184,7 @@ static inline __device__ void normalize_counts_chunk_parallel(
           max_count = chunk_counts[i];
         }
       }
-      chunk_norm_counts[max_symbol] += static_cast<T>(remaining);
+      chunk_norm_counts[max_symbol] += static_cast<int>(remaining);
     }
     return;
   }
@@ -212,7 +217,7 @@ static inline __device__ void normalize_counts_chunk_parallel(
   const uint64_t step = ((1ULL << freq_offset_log) * remaining + mid) / total;
 
   uint64_t my_contrib[ITEMS_PER_THREAD];
-  T my_existing[ITEMS_PER_THREAD];
+  int my_existing[ITEMS_PER_THREAD];
   bool my_active[ITEMS_PER_THREAD];
 
 #pragma unroll
@@ -220,12 +225,12 @@ static inline __device__ void normalize_counts_chunk_parallel(
   {
     const uint32_t i = base + static_cast<uint32_t>(e);
     my_existing[e] = chunk_norm_counts[i];
-    const bool active = (i <= max_symbol_value) && (my_existing[e] == static_cast<T>(NOT_ASSIGNED));
+    const bool active = (i <= max_symbol_value) && (my_existing[e] == NOT_ASSIGNED);
     my_active[e] = active;
     my_contrib[e] = active ? (step * static_cast<uint64_t>(chunk_counts[i])) : 0ULL;
   }
 
-  using BlockScanU64 = nvcomp::cub::BlockScan<uint64_t, BLOCK_DIM_X>;
+  using BlockScanU64 = nvcomp::cub::BlockScan<uint64_t, NUM_COMP_THREADS_PER_CTA>;
   __shared__ typename BlockScanU64::TempStorage bs_temp;
 
   uint64_t my_prefix[ITEMS_PER_THREAD];
@@ -242,26 +247,25 @@ static inline __device__ void normalize_counts_chunk_parallel(
       const uint64_t cumul_after = cumul_before + my_contrib[e];
       const uint64_t start = cumul_before >> freq_offset_log;
       const uint64_t end = cumul_after >> freq_offset_log;
-      chunk_norm_counts[i] = static_cast<T>(end - start);
+      chunk_norm_counts[i] = static_cast<int>(end - start);
     }
   }
 }
 
-// nvcompDX duplicate
-// TODO: parallelize this
-// Note: this takes around 2% of the compression time
+// nvcompDX duplicate. Sequential on the Dx path; the host kernel uses
+// normalize_counts_chunk_parallel.
 template <typename T>
 static inline __device__ void normalize_counts_chunk_dx(
   const unsigned int idx_in_block,
   const uint32_t *chunk_counts,
   T *chunk_norm_counts,
   uint32_t max_symbol_value,
-  const size_t uncomp_chunk_size,
+  uint32_t uncomp_chunk_size,
   uint8_t tablelog
 )
 {
 
-  size_t total = uncomp_chunk_size;
+  uint32_t total = uncomp_chunk_size;
 
   if (total == 0)
   {

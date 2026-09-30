@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstdint>
+
 namespace nvcomp
 {
 
@@ -42,6 +45,15 @@ inline __device__ uint32_t loadUpTo4Bytes(const uint8_t *p, const ptrdiff_t &byt
   // Opportunistic load, when we don't care about over-reading the input buffer
   return bytes_available > 0 ? *reinterpret_cast<const uint32_t *>(p) : 0u;
 #endif
+}
+
+// fast way of returning the rank of the current thread while respecting multi-
+// dimensional thread grids
+inline __device__ uint32_t lane_id()
+{
+  uint32_t ret;
+  asm("mov.u32 %0, %laneid;" : "=r"(ret));
+  return ret;
 }
 
 } // namespace nvcomp

@@ -40,7 +40,7 @@
 #include "cascaded_hash.cuh"
 #include "cascaded_utils.cuh"
 
-namespace cascaded
+namespace nvcomp::cascaded
 {
 
 // HLL sized to fill a shared-memory budget. Registers are uint32_t so we can
@@ -224,4 +224,4 @@ inline __device__ uint32_t block_hll_estimate_cardinality(const uint32_t *hll_re
   return max(s_estimate, 1); // cardinality cannot be less than 1
 }
 
-} // namespace cascaded
+} // namespace nvcomp::cascaded

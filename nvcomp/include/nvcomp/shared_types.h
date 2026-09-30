@@ -61,8 +61,8 @@ typedef enum nvcompType_t
   NVCOMP_TYPE_ULONGLONG = 7, // 8B
   NVCOMP_TYPE_FLOAT8_E4M3 = 9, // 1B FP8 with E4M3 layout (sign:1 | exp:4 | mantissa:3)
   NVCOMP_TYPE_FLOAT16 = 10, // 2B
-  NVCOMP_TYPE_FLOAT32 = 11, // 4B
-  NVCOMP_TYPE_FLOAT64 = 12, // 8B
+  NVCOMP_TYPE_FLOAT32 = 11, // 4B IEEE-754 single precision
+  NVCOMP_TYPE_FLOAT64 = 12, // 8B IEEE-754 double precision
   NVCOMP_TYPE_BITS = 0xff // 1b
 } nvcompType_t;
 

@@ -51,9 +51,22 @@ enum class BitstreamKind
 };
 
 /**
+ * @brief Enumeration that defines how an nvCOMP manager trades off kernel latency
+ * against concurrency with other work on the device.
+ */
+enum class ExecutionPolicy
+{
+  /// Use implementation optimized for concurrency.
+  Concurrency = 0,
+
+  /// Use implementation optimized for latency.
+  Latency = 1,
+};
+
+/**
  * @brief Enumeration that defines the checksum policy used by an nvCOMP manager.
  */
-enum ChecksumPolicy
+enum class ChecksumPolicy
 {
   /// During compression, do not compute checksums.
   /// During decompression, do not verify checksums.
@@ -526,6 +539,30 @@ struct nvcompManagerBase
    * @return A vector with the decompressed sizes of each buffer in the batch.
    */
   virtual std::vector<size_t> get_decompressed_output_size(const uint8_t *const *comp_buffers, size_t batch_size) = 0;
+
+  /**
+   * @brief Get the minimum alignments required for buffers passed to compression.
+   *
+   * The input and output alignments account for both the compression format and
+   * the configured bitstream kind. The temporary-storage alignment is always 1
+   * because the manager owns its temporary storage.
+   *
+   * @return Required compression input, output, and temporary-storage buffer
+   * alignments in bytes.
+   */
+  virtual nvcompAlignmentRequirements_t get_required_compression_alignments() const = 0;
+
+  /**
+   * @brief Get the minimum alignments required for buffers passed to decompression.
+   *
+   * The input and output alignments account for both the compression format and
+   * the configured bitstream kind. The temporary-storage alignment is always 1
+   * because the manager owns its temporary storage.
+   *
+   * @return Required decompression input, output, and temporary-storage buffer
+   * alignments in bytes.
+   */
+  virtual nvcompAlignmentRequirements_t get_required_decompression_alignments() const = 0;
 };
 
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
@@ -645,6 +682,12 @@ struct
 
   NVCOMP_EXPORT
   std::vector<size_t> get_decompressed_output_size(const uint8_t *const *comp_buffers, size_t batch_size) override;
+
+  NVCOMP_EXPORT
+  nvcompAlignmentRequirements_t get_required_compression_alignments() const override;
+
+  NVCOMP_EXPORT
+  nvcompAlignmentRequirements_t get_required_decompression_alignments() const override;
 };
 
 } // namespace detail

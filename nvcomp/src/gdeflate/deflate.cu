@@ -1,12 +1,14 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cub/device/device_radix_sort.cuh>
 
@@ -35,7 +37,6 @@ __global__ void init_cudecomp_sort(
   const void *const *device_in_ptr,
   const size_t *device_in_bytes,
   const size_t *device_buffer_bytes,
-  nvcompStatus_t *device_statuses,
   size_t num_chunks,
   int *sort_keys,
   int *sort_vals
@@ -93,10 +94,7 @@ __global__ void fill_params_kernel(
   params[ix_chunk].dstActBytes = reinterpret_cast<cuuint32_t *>(&device_uncompressed_chunk_bytes[sorted_ix_chunk]);
   device_uncompressed_chunk_bytes[sorted_ix_chunk] = 0;
   params[ix_chunk].algo = CU_MEM_DECOMPRESS_ALGORITHM_DEFLATE;
-  if (device_statuses != nullptr)
-  {
-    device_statuses[sorted_ix_chunk] = nvcompSuccess;
-  }
+  device_statuses[sorted_ix_chunk] = nvcompSuccess;
 }
 
 void DeflateFillCuDecompParams(
@@ -132,7 +130,6 @@ void DeflateFillCuDecompParams(
       device_compressed_chunk_ptrs,
       device_compressed_chunk_bytes,
       device_uncompressed_buffer_bytes,
-      device_statuses,
       num_chunks,
       sort_keys_in,
       sort_ix_in
@@ -183,7 +180,7 @@ cudaError_t __host__ DeflateDecompressAsync(
 {
   if constexpr (CORRECTNESS_CHECK)
   {
-    assert(device_correctness_ptrs != nullptr and device_statuses != nullptr);
+    assert(device_correctness_ptrs != nullptr);
   }
 
   if (batch_size > 0)
@@ -204,10 +201,7 @@ cudaError_t __host__ DeflateDecompressAsync(
       ));
     }
     auto grid_dim = cuda_dim_cast(batch_size);
-    auto kernel = device_actual_uncompressed_bytes
-                    ? inflate_kernel<true /* should_output */, true /* get_decomp_bytes */, CORRECTNESS_CHECK>
-                    : inflate_kernel<true /* should_output */, false /* get_decomp_bytes */, CORRECTNESS_CHECK>;
-    kernel<<<grid_dim, NUMTHREADS, 0, stream>>>(
+    inflate_kernel<true /* should_output */, CORRECTNESS_CHECK><<<grid_dim, NUMTHREADS, 0, stream>>>(
       device_compressed_ptrs,
       device_compressed_bytes,
       device_uncompressed_ptrs,
@@ -270,17 +264,16 @@ cudaError_t __host__ DeflateDecompressSizeAsync(
   if (batch_size > 0)
   {
     auto grid_dim = cuda_dim_cast(batch_size);
-    inflate_kernel<false /* should_output */, true /* get_decomp_bytes */, false /* check_correctness */>
-      <<<grid_dim, NUMTHREADS, 0, stream>>>(
-        device_compressed_ptrs,
-        device_compressed_bytes,
-        device_uncompressed_ptrs,
-        device_uncompressed_bytes,
-        device_actual_uncompressed_bytes,
-        device_statuses,
-        nullptr,
-        gzip_header_parser
-      );
+    inflate_kernel<false /* should_output */, false /* check_correctness */><<<grid_dim, NUMTHREADS, 0, stream>>>(
+      device_compressed_ptrs,
+      device_compressed_bytes,
+      device_uncompressed_ptrs,
+      device_uncompressed_bytes,
+      device_actual_uncompressed_bytes,
+      device_statuses,
+      nullptr,
+      gzip_header_parser
+    );
     CUDA_CHECK(cudaGetLastError());
   }
   return cudaSuccess;

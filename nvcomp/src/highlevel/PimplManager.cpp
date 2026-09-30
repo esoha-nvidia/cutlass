@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,6 +35,16 @@ namespace nvcomp::detail
 PimplManager::PimplManager(std::unique_ptr<nvcompManagerInternalBase> p) noexcept
     : impl(std::move(p))
 {}
+
+nvcompAlignmentRequirements_t PimplManager::get_required_compression_alignments() const
+{
+  return impl->get_required_compression_alignments();
+}
+
+nvcompAlignmentRequirements_t PimplManager::get_required_decompression_alignments() const
+{
+  return impl->get_required_decompression_alignments();
+}
 
 CompressionConfig PimplManager::configure_compression(const size_t uncomp_buffer_size)
 {

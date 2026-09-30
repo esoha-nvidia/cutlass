@@ -80,8 +80,8 @@ void HEAD::decompress_chunked_single(
   comp_buffer += sizeof(CommonHeader) + sizeof(FormatSpecHeader);
 
   auto &checksums_present = decomp_config.checksums_present;
-  bool verify_checksums = checksums_present && (checksum_policy != NoComputeNoVerify) &&
-                          (checksum_policy != ComputeAndNoVerify);
+  bool verify_checksums = checksums_present && (checksum_policy != ChecksumPolicy::NoComputeNoVerify) &&
+                          (checksum_policy != ChecksumPolicy::ComputeAndNoVerify);
 
   const size_t num_chunks = decomp_config.num_chunks;
 
@@ -422,10 +422,11 @@ void HEAD::run_decompress_chunked_batched_device_path(
   // the worst-case decompression scratch alignment.
 
   assert(reinterpret_cast<uintptr_t>(free_scratch_buffer) % min_alignment == 0);
+  assert(free_scratch_buffer <= scratch_buffer + scratch_buffer_size);
   const size_t free_scratch_size = scratch_buffer_size - (uintptr_t(free_scratch_buffer) - uintptr_t(scratch_buffer));
   assert(free_scratch_size >= compute_lowlevel_decompress_scratch_size(total_num_chunks, uncomp_chunk_size));
 
-  // Pinned memory is already allocated and populated in decompress_chunked_batched
+  // The pinned memory is already allocated and populated in decompress_chunked_batched.
 
   DeviceGuard device_guard(user_stream);
 
@@ -629,6 +630,19 @@ void HEAD::decompress_raw_batched(
     decompress_scratch_req += sizeof(size_t) * batch_size; // mutable_comp_sizes
   }
 
+  // With ExecutionPolicy::Latency the pointer / size / status arrays that the codec kernel
+  // dereferences per chunk are staged in device memory.
+  const bool stage_metadata_on_device = execution_policy == ExecutionPolicy::Latency;
+  if (stage_metadata_on_device)
+  {
+    decompress_scratch_req +=
+      batch_size * sizeof(size_t) + // Decompressed sizes array
+      batch_size * sizeof(uint8_t *) + // Decompressed buffer pointers
+      batch_size * sizeof(const uint8_t *) + // Compressed buffer pointers
+      roundUpTo(batch_size * sizeof(nvcompStatus_t), sizeof(size_t)) + // Decompression statuses (rounded)
+      min_alignment - 1; // Alignment padding
+  }
+
   // Alignment bytes: cover the min_alignment round-up of the decompression
   // scratch region (see decompress_raw_batched).
   decompress_scratch_req += min_alignment - 1;
@@ -640,6 +654,12 @@ void HEAD::decompress_raw_batched(
   //
   // - for BitstreamKind::WITH_UNCOMPRESSED_SIZE:
   //   [ Mutable compressed sizes (batch_size, size_t) ]
+  //
+  // - for ExecutionPolicy::Latency:
+  //   [ Decompressed sizes (batch_size, size_t) ]
+  //   [ Decompressed buffer pointers (batch_size, uint8_t*) ]
+  //   [ Compressed buffer pointers (batch_size, const uint8_t*) ]
+  //   [ Decompression statuses (batch_size, nvcompStatus_t) ]
   //
   // [ Decompression scratch space (bytes)]
   uint8_t *free_scratch_buffer = scratch_buffer;
@@ -661,10 +681,34 @@ void HEAD::decompress_raw_batched(
   free_scratch_buffer =
     reinterpret_cast<uint8_t *>(roundUpTo(reinterpret_cast<uintptr_t>(free_scratch_buffer), min_alignment));
 
+  size_t *device_decomp_sizes = nullptr;
+  uint8_t **device_decomp_buffers = nullptr;
+  const uint8_t **device_comp_buffers = nullptr;
+  nvcompStatus_t *device_decomp_statuses = nullptr;
+  if (stage_metadata_on_device)
+  {
+    device_decomp_sizes = reinterpret_cast<size_t *>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(size_t);
+
+    device_decomp_buffers = reinterpret_cast<uint8_t **>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(uint8_t *);
+
+    device_comp_buffers = reinterpret_cast<const uint8_t **>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(const uint8_t *);
+
+    device_decomp_statuses = reinterpret_cast<nvcompStatus_t *>(free_scratch_buffer);
+    free_scratch_buffer += roundUpTo(batch_size * sizeof(nvcompStatus_t), sizeof(size_t));
+
+    // The staged arrays are only size_t-aligned, so realign before the codec scratch.
+    free_scratch_buffer =
+      reinterpret_cast<uint8_t *>(roundUpTo(reinterpret_cast<uintptr_t>(free_scratch_buffer), min_alignment));
+  }
+
   // Note:
   // free_scratch_buffer must be aligned to min_alignment to
   // accomodate the worst-case decompression scratch requirement.
   assert(reinterpret_cast<uintptr_t>(free_scratch_buffer) % min_alignment == 0);
+  assert(free_scratch_buffer <= scratch_buffer + scratch_buffer_size);
 
   const size_t free_scratch_size = scratch_buffer_size - (uintptr_t(free_scratch_buffer) - uintptr_t(scratch_buffer));
   assert(free_scratch_size >= compute_lowlevel_decompress_scratch_size(batch_size, max_decomp_size));
@@ -708,21 +752,64 @@ void HEAD::decompress_raw_batched(
     false /* force_sync*/
   ));
 
+  if (stage_metadata_on_device)
+  {
+    // Stream-ordered, so these run after the host lambda above has populated the pinned arrays.
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_decomp_sizes,
+      pinned_decomp_sizes,
+      batch_size * sizeof(size_t),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_decomp_buffers,
+      pinned_decomp_buffers,
+      batch_size * sizeof(uint8_t *),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_comp_buffers,
+      pinned_comp_buffers,
+      batch_size * sizeof(const uint8_t *),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+  }
+
+  const uint8_t **kernel_comp_buffers = stage_metadata_on_device ? device_comp_buffers : pinned_comp_buffers;
+  size_t *kernel_decomp_sizes = stage_metadata_on_device ? device_decomp_sizes : pinned_decomp_sizes;
+  uint8_t **kernel_decomp_buffers = stage_metadata_on_device ? device_decomp_buffers : pinned_decomp_buffers;
+  nvcompStatus_t *kernel_decomp_statuses = stage_metadata_on_device ? device_decomp_statuses : pinned_decomp_statuses;
+
   ManagerBase::check<FnType::Decompress>(decompress_fn(
-    reinterpret_cast<const void *const *>(pinned_comp_buffers),
+    reinterpret_cast<const void *const *>(kernel_comp_buffers),
     comp_sizes,
-    pinned_decomp_sizes,
+    kernel_decomp_sizes,
     actual_decomp_sizes,
     batch_size,
     free_scratch_buffer,
     free_scratch_size,
-    reinterpret_cast<void *const *>(pinned_decomp_buffers),
-    pinned_decomp_statuses,
+    reinterpret_cast<void *const *>(kernel_decomp_buffers),
+    kernel_decomp_statuses,
     format_opts,
     decompress_opts,
     user_stream,
     nullptr /*host_comp_chunk_buffers*/
   ));
+
+  if (stage_metadata_on_device)
+  {
+    // Bring the statuses back so that the propagation lambda below is unchanged.
+    CUDA_CHECK(cudaMemcpyAsync(
+      pinned_decomp_statuses,
+      device_decomp_statuses,
+      batch_size * sizeof(nvcompStatus_t),
+      cudaMemcpyDeviceToHost,
+      user_stream
+    ));
+  }
 
   // Propagate the statuses to the configs
   CUDA_CHECK(cudaLaunchHostLambda(

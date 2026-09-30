@@ -14,6 +14,7 @@
 
 #include <cuda/std/bit>
 #include <cuda/type_traits>
+#include <cuda_fp16.h>
 
 #include <cassert>
 #include <limits>
@@ -48,6 +49,18 @@ __host__ __device__ T zeroMantissaBits(const T delta)
     delta_as_int &= 0xFC00; // keep sign and exponent bits only
     return cuda::std::bit_cast<T>(delta_as_int);
   }
+}
+
+template <typename T>
+inline __host__ __device__ T convert_effective_delta(const double supplied_delta)
+{
+  return static_cast<T>(zeroMantissaBits(supplied_delta));
+}
+
+template <>
+inline __host__ __device__ half convert_effective_delta<half>(const double supplied_delta)
+{
+  return __double2half(zeroMantissaBits(supplied_delta));
 }
 
 bool validBufferAlignment(const void *adr, const size_t alignment);

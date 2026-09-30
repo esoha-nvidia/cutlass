@@ -30,13 +30,69 @@
 // in the same file, nvcc sometimes uses too much memory for the
 // build machines.
 
+#include <cassert>
+
 #include "composite/composite_comp_kernels.cuh"
 #include "composite/composite_decomp_kernels.cuh"
+#include "next/terminal_codecs/terminal_cascaded/terminal_cascaded_dispatcher.cuh"
 #include "universal/universal_decomp.cuh"
 
 namespace nvcomp
 {
-nvcompStatus_t cascadedCompressAsyncPart2(
+namespace
+{
+
+cascaded::next::kibi_cascader::kibi_cascader_optimization_search_space
+get_terminal_cascaded_search_space(const nvcompBatchedCascadedCompressOpts_t &format_opts)
+{
+  auto search_space = cascaded::next::kibi_cascader::SEARCH_NONE;
+  if ((format_opts.fine_grained_encoding_flags & NVCOMP_CASCADED_FINE_GRAINED_ENCODING_DELTA) != 0u)
+  {
+    search_space |= cascaded::next::kibi_cascader::SEARCH_DELTA;
+  }
+  if ((format_opts.fine_grained_encoding_flags & NVCOMP_CASCADED_FINE_GRAINED_ENCODING_FOR) != 0u)
+  {
+    search_space |= cascaded::next::kibi_cascader::SEARCH_FOR;
+  }
+  if ((format_opts.fine_grained_encoding_flags & NVCOMP_CASCADED_FINE_GRAINED_ENCODING_RLE) != 0u)
+  {
+    search_space |= cascaded::next::kibi_cascader::SEARCH_RLE;
+  }
+  return search_space;
+}
+
+} // namespace
+
+nvcompStatus_t cascadedCompressGetMaxOutputChunkSizeDispatch(
+  const size_t max_uncompressed_chunk_bytes,
+  const nvcompBatchedCascadedCompressOpts_t format_opts,
+  size_t *max_compressed_chunk_bytes
+)
+{
+  if (format_opts.common_opts.mode == NVCOMP_CASCADED_MODE_SYMMETRIC)
+  {
+    return cascaded::next::terminal_cascaded::get_max_output_chunk_size(
+      max_uncompressed_chunk_bytes,
+      format_opts.common_opts.data_type,
+      max_compressed_chunk_bytes
+    );
+  }
+  else if (format_opts.common_opts.mode == NVCOMP_CASCADED_MODE_ASYMMETRIC)
+  {
+    // Asymmetric compression may store the input verbatim. Reserve the universal
+    // header plus enough space for the uncompressed payload rounded up to a 32-bit word.
+    *max_compressed_chunk_bytes = roundUpTo(max_uncompressed_chunk_bytes, sizeof(uint32_t)) +
+                                  cascaded::universal_header::HEADER_SIZE_BYTES;
+    return nvcompSuccess;
+  }
+  else
+  {
+    assert(false && "Unsupported Cascaded compression mode.");
+    return nvcompErrorInvalidValue;
+  }
+}
+
+nvcompStatus_t cascadedCompressAsyncDispatch(
   const void *const *device_uncompressed_chunk_ptrs,
   const size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
@@ -47,19 +103,48 @@ nvcompStatus_t cascadedCompressAsyncPart2(
   cudaStream_t stream
 )
 {
-  return composite::compressAsync(
-    device_uncompressed_chunk_ptrs,
-    device_uncompressed_chunk_bytes,
-    num_chunks,
-    device_compressed_chunk_ptrs,
-    device_compressed_chunk_bytes,
-    format_opts,
-    device_statuses,
-    stream
-  );
+  if (num_chunks == 0)
+  {
+    return nvcompSuccess;
+  }
+  if (format_opts.common_opts.mode == NVCOMP_CASCADED_MODE_SYMMETRIC)
+  {
+    return cascaded::next::terminal_cascaded::compress_async(
+      device_uncompressed_chunk_ptrs,
+      device_uncompressed_chunk_bytes,
+      nvcompCascadedCompressionMaxAllowedChunkSize,
+      num_chunks,
+      nullptr,
+      0u,
+      device_compressed_chunk_ptrs,
+      device_compressed_chunk_bytes,
+      format_opts.common_opts.data_type,
+      get_terminal_cascaded_search_space(format_opts),
+      device_statuses,
+      stream
+    );
+  }
+  else if (format_opts.common_opts.mode == NVCOMP_CASCADED_MODE_ASYMMETRIC)
+  {
+    return cascaded::composite::compressAsync(
+      device_uncompressed_chunk_ptrs,
+      device_uncompressed_chunk_bytes,
+      num_chunks,
+      device_compressed_chunk_ptrs,
+      device_compressed_chunk_bytes,
+      format_opts,
+      device_statuses,
+      stream
+    );
+  }
+  else
+  {
+    assert(false && "Unsupported Cascaded compression mode.");
+    return nvcompErrorInvalidValue;
+  }
 }
 
-nvcompStatus_t cascadedDecompressAsyncPart2(
+nvcompStatus_t cascadedDecompressAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
@@ -70,8 +155,11 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
   cudaStream_t stream
 )
 {
-  // Compression settings are not provided, so we must use the universal decomp pipeline
-  return universal_header::DecompressAsync(
+  if (num_chunks == 0)
+  {
+    return nvcompSuccess;
+  }
+  const nvcompStatus_t universal_status = cascaded::universal_header::DecompressAsync(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
@@ -81,9 +169,24 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
     device_statuses,
     stream
   );
+  if (universal_status != nvcompSuccess)
+  {
+    return universal_status;
+  }
+  return cascaded::next::terminal_cascaded::decompress_self_dispatch_async<false>(
+    device_compressed_chunk_ptrs,
+    device_compressed_chunk_bytes,
+    device_uncompressed_buffer_bytes,
+    device_uncompressed_chunk_bytes,
+    num_chunks,
+    device_uncompressed_chunk_ptrs,
+    NVCOMP_TYPE_BITS,
+    device_statuses,
+    stream
+  );
 }
 
-nvcompStatus_t cascadedDecompressAsyncPart2(
+nvcompStatus_t cascadedDecompressAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
@@ -91,11 +194,29 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
   size_t num_chunks,
   void *const *device_uncompressed_chunk_ptrs,
   nvcompStatus_t *device_statuses,
-  nvcompType_t type,
+  nvcompCascadedCommonOpts_t common_opts,
   cudaStream_t stream
 )
 {
-  return composite::DecompressAsync(
+  if (num_chunks == 0)
+  {
+    return nvcompSuccess;
+  }
+  if (common_opts.mode == NVCOMP_CASCADED_MODE_SYMMETRIC)
+  {
+    return cascaded::next::terminal_cascaded::decompress_self_dispatch_async(
+      device_compressed_chunk_ptrs,
+      device_compressed_chunk_bytes,
+      device_uncompressed_buffer_bytes,
+      device_uncompressed_chunk_bytes,
+      num_chunks,
+      device_uncompressed_chunk_ptrs,
+      common_opts.data_type,
+      device_statuses,
+      stream
+    );
+  }
+  return cascaded::composite::DecompressAsync(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
@@ -103,12 +224,12 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
     num_chunks,
     device_uncompressed_chunk_ptrs,
     device_statuses,
-    type,
+    common_opts.data_type,
     stream
   );
 }
 
-nvcompStatus_t cascadedGetDecompressSizeAsyncPart2(
+nvcompStatus_t cascadedGetDecompressSizeAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   size_t *device_uncompressed_chunk_bytes,
@@ -118,7 +239,7 @@ nvcompStatus_t cascadedGetDecompressSizeAsyncPart2(
 {
   // comp opts / decomp opts not provided
   // All configurations must support the legacy GetDecompressSizeAsync function
-  return universal_header::GetDecompressSizeAsync(
+  return cascaded::universal_header::GetDecompressSizeAsync(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_chunk_bytes,

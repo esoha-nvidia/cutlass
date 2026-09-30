@@ -1,40 +1,22 @@
 /*
- * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include "cascaded/composite/composite_constants.cuh"
 #include "common.h"
 #include "Logging.h"
 #include "lowlevel/Check.h"
 #include "lowlevel/nvcomp_private.h"
-#include "nvcomp.h"
 #include "nvcomp/cascaded.h"
 #include "nvcomp/utils.hpp"
-#include "type_macros.h"
 
 using nvcomp::Check;
 using nvcomp::isAligned;
@@ -43,16 +25,36 @@ using nvcomp::roundUpTo;
 namespace
 {
 
-constexpr const char *cascaded_compress_opts_format_str = "{{num_RLEs={:d}, num_deltas={:d}}}";
-constexpr const char *cascaded_decompress_opts_format_str = "{{backend={:d}}}";
+constexpr const char *CASCADED_COMPRESS_OPTS_FORMAT_STR =
+  "{{common_opts={{data_type={:d}, mode={:d}, terminal_codec_flags={:#x}, "
+  "coarse_grained_encoding_flags={:#x}}}, compression_level={:d}, fine_grained_encoding_flags={:#x}}}";
+constexpr const char *CASCADED_DECOMPRESS_OPTS_FORMAT_STR =
+  "{{backend={:d}, common_opts={{data_type={:d}, mode={:d}, terminal_codec_flags={:#x}, "
+  "coarse_grained_encoding_flags={:#x}}}}}";
 
 #define CASCADED_WITH_TRAILING_COMPRESS_OPTS_ARGS(callable, opts, ...)                                                 \
-  callable(__VA_ARGS__, opts.internal_chunk_bytes, int(opts.data_type), opts.num_RLEs, opts.num_deltas, opts.use_bp)
+  callable(                                                                                                            \
+    __VA_ARGS__,                                                                                                       \
+    int(opts.common_opts.data_type),                                                                                   \
+    int(opts.common_opts.mode),                                                                                        \
+    opts.common_opts.terminal_codec_flags,                                                                             \
+    opts.common_opts.coarse_grained_encoding_flags,                                                                    \
+    unsigned(opts.compression_level),                                                                                  \
+    opts.fine_grained_encoding_flags                                                                                   \
+  )
 
-#define CASCADED_WITH_TRAILING_DECOMPRESS_OPTS_ARGS(callable, opts, ...) callable(__VA_ARGS__, int(opts.backend))
+#define CASCADED_WITH_TRAILING_DECOMPRESS_OPTS_ARGS(callable, opts, ...)                                               \
+  callable(                                                                                                            \
+    __VA_ARGS__,                                                                                                       \
+    int(opts.backend),                                                                                                 \
+    int(opts.common_opts.data_type),                                                                                   \
+    int(opts.common_opts.mode),                                                                                        \
+    opts.common_opts.terminal_codec_flags,                                                                             \
+    opts.common_opts.coarse_grained_encoding_flags                                                                     \
+  )
 
 #define CASCADED_LOG_WITH_COMPRESS_OPTS(log_func, opts, ...)                                                           \
-  CASCADED_WITH_TRAILING_COMPRESS_OPTS_ARGS(log_func, opts, __func__, __VA_ARGS__, cascaded_compress_opts_format_str)
+  CASCADED_WITH_TRAILING_COMPRESS_OPTS_ARGS(log_func, opts, __func__, __VA_ARGS__, CASCADED_COMPRESS_OPTS_FORMAT_STR)
 
 #define CASCADED_LOG_WITH_DECOMPRESS_OPTS(log_func, opts, ...)                                                         \
   CASCADED_WITH_TRAILING_DECOMPRESS_OPTS_ARGS(                                                                         \
@@ -60,23 +62,52 @@ constexpr const char *cascaded_decompress_opts_format_str = "{{backend={:d}}}";
     opts,                                                                                                              \
     __func__,                                                                                                          \
     __VA_ARGS__,                                                                                                       \
-    cascaded_decompress_opts_format_str                                                                                \
+    CASCADED_DECOMPRESS_OPTS_FORMAT_STR                                                                                \
   )
 
 #define CASCADED_CHECK_COMPRESS_OPTS(opts) NVCOMP_WRAP_CHECK_FUNC(check_compress_opts, opts)
 
 #define CASCADED_CHECK_DECOMPRESS_OPTS(opts) NVCOMP_WRAP_CHECK_FUNC(check_decompress_opts, opts)
 
+bool is_supported_data_type(const nvcompType_t data_type)
+{
+  return data_type == NVCOMP_TYPE_CHAR || data_type == NVCOMP_TYPE_UCHAR || data_type == NVCOMP_TYPE_SHORT ||
+         data_type == NVCOMP_TYPE_USHORT || data_type == NVCOMP_TYPE_INT || data_type == NVCOMP_TYPE_UINT ||
+         data_type == NVCOMP_TYPE_LONGLONG || data_type == NVCOMP_TYPE_ULONGLONG;
+}
+
+bool is_supported_symmetric_data_type(const nvcompType_t data_type)
+{
+  return data_type == NVCOMP_TYPE_INT || data_type == NVCOMP_TYPE_UINT || data_type == NVCOMP_TYPE_LONGLONG ||
+         data_type == NVCOMP_TYPE_ULONGLONG;
+}
+
+bool is_supported_common_opts(const nvcompCascadedCommonOpts_t &common_opts, const bool allow_unspecified)
+{
+  if (common_opts.mode == NVCOMP_CASCADED_MODE_UNSPECIFIED)
+  {
+    return allow_unspecified;
+  }
+
+  constexpr uint64_t SUPPORTED_TERMINAL_CODECS = NVCOMP_CASCADED_TERMINAL_CODEC_CASCADED_BITPACK;
+  constexpr uint64_t SUPPORTED_COARSE_GRAINED_ENCODINGS = NVCOMP_CASCADED_COARSE_GRAINED_ENCODING_NONE;
+  const bool supported_mode_and_type =
+    (common_opts.mode == NVCOMP_CASCADED_MODE_ASYMMETRIC && is_supported_data_type(common_opts.data_type)) ||
+    (common_opts.mode == NVCOMP_CASCADED_MODE_SYMMETRIC && is_supported_symmetric_data_type(common_opts.data_type));
+  return supported_mode_and_type && common_opts.terminal_codec_flags != NVCOMP_CASCADED_TERMINAL_CODEC_UNSPECIFIED &&
+         (common_opts.terminal_codec_flags & ~SUPPORTED_TERMINAL_CODECS) == 0u &&
+         (common_opts.coarse_grained_encoding_flags & ~SUPPORTED_COARSE_GRAINED_ENCODINGS) == 0u;
+}
+
 nvcompStatus_t check_compress_opts(const nvcompBatchedCascadedCompressOpts_t &opts)
 {
-  // TODO: we should also check the validity of internal_chunk_bytes.
-  const bool is_valid_type = opts.data_type == NVCOMP_TYPE_CHAR || opts.data_type == NVCOMP_TYPE_UCHAR ||
-                             opts.data_type == NVCOMP_TYPE_SHORT || opts.data_type == NVCOMP_TYPE_USHORT ||
-                             opts.data_type == NVCOMP_TYPE_INT || opts.data_type == NVCOMP_TYPE_UINT ||
-                             opts.data_type == NVCOMP_TYPE_LONGLONG || opts.data_type == NVCOMP_TYPE_ULONGLONG;
-  const bool supported = opts.num_RLEs >= 0 && opts.num_RLEs <= composite::max_num_rle_layers && opts.num_deltas >= 0 &&
-                         opts.num_deltas <= composite::max_num_delta_layers && (opts.use_bp == 0 || opts.use_bp == 1) &&
-                         is_valid_type;
+  constexpr uint64_t ASYMMETRIC_REQUIRED_ENCODINGS = NVCOMP_CASCADED_FINE_GRAINED_ENCODING_FOR;
+  const bool has_required_encodings = opts.common_opts.mode != NVCOMP_CASCADED_MODE_ASYMMETRIC ||
+                                      (opts.fine_grained_encoding_flags & ASYMMETRIC_REQUIRED_ENCODINGS) ==
+                                        ASYMMETRIC_REQUIRED_ENCODINGS;
+  const bool supported = is_supported_common_opts(opts.common_opts, false) &&
+                         (opts.fine_grained_encoding_flags & ~NVCOMP_CASCADED_FINE_GRAINED_ENCODING_ALL) == 0u &&
+                         has_required_encodings;
   if (supported)
   {
     return nvcompSuccess;
@@ -85,21 +116,21 @@ nvcompStatus_t check_compress_opts(const nvcompBatchedCascadedCompressOpts_t &op
   CASCADED_WITH_TRAILING_COMPRESS_OPTS_ARGS(
     LOG_ERROR,
     opts,
-    std::string("Unsupported options: ") + cascaded_compress_opts_format_str
+    std::string("Unsupported options: ") + CASCADED_COMPRESS_OPTS_FORMAT_STR
   );
   return nvcompErrorNotSupported;
 }
 
 nvcompStatus_t check_decompress_opts(const nvcompBatchedCascadedDecompressOpts_t &opts)
 {
-  const bool supported = opts.backend == NVCOMP_DECOMPRESS_BACKEND_DEFAULT ||
-                         opts.backend == NVCOMP_DECOMPRESS_BACKEND_CUDA;
+  const bool supported_backend = opts.backend == NVCOMP_DECOMPRESS_BACKEND_DEFAULT ||
+                                 opts.backend == NVCOMP_DECOMPRESS_BACKEND_CUDA;
+  const bool supported = supported_backend && is_supported_common_opts(opts.common_opts, true);
   if (supported)
   {
     return nvcompSuccess;
   }
 
-  // Backend error
   switch (opts.backend)
   {
     case NVCOMP_DECOMPRESS_BACKEND_DEFAULT:
@@ -115,11 +146,10 @@ nvcompStatus_t check_decompress_opts(const nvcompBatchedCascadedDecompressOpts_t
       return nvcompErrorInvalidValue;
   }
 
-  // Other errors
   CASCADED_WITH_TRAILING_DECOMPRESS_OPTS_ARGS(
     LOG_ERROR,
     opts,
-    std::string("Unsupported options: ") + cascaded_decompress_opts_format_str
+    std::string("Unsupported options: ") + CASCADED_DECOMPRESS_OPTS_FORMAT_STR
   );
   return nvcompErrorNotSupported;
 }
@@ -133,7 +163,7 @@ namespace nvcomp
 // in the same file, nvcc sometimes uses too much memory for the
 // build machines.
 // TODO(mpayrits): Check if still true with culiblogger.
-nvcompStatus_t cascadedCompressAsyncPart2(
+nvcompStatus_t cascadedCompressAsyncDispatch(
   const void *const *device_uncompressed_chunk_ptrs,
   const size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
@@ -143,7 +173,12 @@ nvcompStatus_t cascadedCompressAsyncPart2(
   nvcompStatus_t *device_statuses,
   cudaStream_t stream
 );
-nvcompStatus_t cascadedDecompressAsyncPart2(
+nvcompStatus_t cascadedCompressGetMaxOutputChunkSizeDispatch(
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedCascadedCompressOpts_t format_opts,
+  size_t *max_compressed_chunk_bytes
+);
+nvcompStatus_t cascadedDecompressAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
@@ -153,7 +188,7 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
   nvcompStatus_t *device_statuses,
   cudaStream_t stream
 );
-nvcompStatus_t cascadedDecompressAsyncPart2(
+nvcompStatus_t cascadedDecompressAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
@@ -161,10 +196,10 @@ nvcompStatus_t cascadedDecompressAsyncPart2(
   size_t num_chunks,
   void *const *device_uncompressed_chunk_ptrs,
   nvcompStatus_t *device_statuses,
-  nvcompType_t type,
+  nvcompCascadedCommonOpts_t common_opts,
   cudaStream_t stream
 );
-nvcompStatus_t cascadedGetDecompressSizeAsyncPart2(
+nvcompStatus_t cascadedGetDecompressSizeAsyncDispatch(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   size_t *device_uncompressed_chunk_bytes,
@@ -186,7 +221,7 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetRequiredAlignments(
   NVCOMP_CHECK_NOT_NULL(alignment_requirements);
 
   // Cast to corresponding type in cascaded_batched_compression_typed.
-  alignment_requirements->input = nvcomp::sizeOfnvcompType(format_opts.data_type);
+  alignment_requirements->input = nvcomp::sizeOfnvcompType(format_opts.common_opts.data_type);
   // Cast to uint32_t* in do_cascaded_compression_kernel.
   alignment_requirements->output = 4;
   alignment_requirements->temp = 1; // Not used.
@@ -203,21 +238,23 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedCascadedCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedCascadedCompressGetTempSize(
   size_t num_chunks, // unused, except for logging
   size_t max_uncompressed_chunk_bytes, // unused, except for logging
   nvcompBatchedCascadedCompressOpts_t compress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
-) // unused, except for logging
+  size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
+)
 {
   CASCADED_LOG_WITH_COMPRESS_OPTS(
-    nvcomp::logBatchedCompressGetTempSizeAsync,
+    nvcomp::logBatchedCompressGetTempSize,
     compress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   CASCADED_CHECK_COMPRESS_OPTS(compress_opts);
@@ -237,15 +274,16 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetTempSizeSync(
   nvcompBatchedCascadedCompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
-  [[maybe_unused]] cudaStream_t stream
+  cudaStream_t stream
 )
 {
-  return nvcompBatchedCascadedCompressGetTempSizeAsync(
+  return nvcompBatchedCascadedCompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     compress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
@@ -268,18 +306,20 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetMaxOutputChunkSize(
 
   NVCOMP_CHECK_CHUNK_SIZE(max_uncompressed_chunk_bytes, nvcompCascadedCompressionMaxAllowedChunkSize);
 
-  *max_compressed_chunk_bytes = roundUpTo(max_uncompressed_chunk_bytes, 4) + 8;
-
-  return nvcompSuccess;
+  return nvcomp::cascadedCompressGetMaxOutputChunkSizeDispatch(
+    max_uncompressed_chunk_bytes,
+    format_opts,
+    max_compressed_chunk_bytes
+  );
 }
 
 nvcompStatus_t nvcompBatchedCascadedCompressAsync(
   const void *const *device_uncompressed_chunk_ptrs,
   const size_t *device_uncompressed_chunk_bytes,
-  size_t max_uncompressed_chunk_bytes, // not used
+  size_t max_uncompressed_chunk_bytes, // unused, except for logging
   size_t num_chunks,
-  void *device_temp_ptr, // not used
-  size_t temp_bytes, // not used
+  void *device_temp_ptr, // unused, except for logging
+  size_t temp_bytes, // unused, except for logging
   void *const *device_compressed_chunk_ptrs,
   size_t *device_compressed_chunk_bytes,
   const nvcompBatchedCascadedCompressOpts_t format_opts,
@@ -307,6 +347,10 @@ nvcompStatus_t nvcompBatchedCascadedCompressAsync(
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_ptrs);
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
+  if (temp_bytes > 0)
+  {
+    NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
+  }
 
   // Check device pointer alignment
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_ptrs);
@@ -318,7 +362,7 @@ nvcompStatus_t nvcompBatchedCascadedCompressAsync(
   // Batch size is used as grid size, which CUDA limits to 2^31 - 1
   NVCOMP_CHECK_BATCH_SIZE(num_chunks, std::numeric_limits<int>::max());
 
-  return nvcomp::cascadedCompressAsyncPart2(
+  return nvcomp::cascadedCompressAsyncDispatch(
     device_uncompressed_chunk_ptrs,
     device_uncompressed_chunk_bytes,
     num_chunks,
@@ -344,7 +388,7 @@ nvcompStatus_t nvcompBatchedCascadedDecompressGetRequiredAlignments(
   NVCOMP_CHECK_NOT_NULL(alignment_requirements);
 
   // Input is cast to uint32_t* in cascaded_decompression_fcn, so 4 bytes.
-  // Output depends on the opts.data_type used during compression and its
+  // Output depends on the opts.common_opts.data_type used during compression and its
   // alignment is the same as the alignment of the compression input. Since we
   // do not have access to compression options, the worst-case scenario is used,
   // which is 8 bytes.
@@ -365,21 +409,23 @@ nvcompStatus_t nvcompBatchedCascadedDecompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedCascadedDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedCascadedDecompressGetTempSize(
   size_t num_chunks, // unused, except for logging
-  size_t max_uncompressed_chunk_bytes, // unused, except for logging
+  size_t max_uncompressed_chunk_bytes,
   nvcompBatchedCascadedDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
-) // unused, except for loggign
+  size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
+)
 {
   CASCADED_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   CASCADED_CHECK_DECOMPRESS_OPTS(decompress_opts);
@@ -412,12 +458,13 @@ nvcompStatus_t nvcompBatchedCascadedDecompressGetTempSizeSync(
     return result;
   }
 
-  return nvcompBatchedCascadedDecompressGetTempSizeAsync(
+  return nvcompBatchedCascadedDecompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     decompress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
@@ -427,8 +474,8 @@ nvcompStatus_t nvcompBatchedCascadedDecompressAsync(
   const size_t *device_uncompressed_buffer_bytes,
   size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
-  void *const device_temp_ptr, // not used
-  size_t temp_bytes, // not used
+  void *const device_temp_ptr, // unused, except for logging
+  size_t temp_bytes, // unused, except for logging
   void *const *device_uncompressed_chunk_ptrs,
   nvcompBatchedCascadedDecompressOpts_t decompress_opts,
   nvcompStatus_t *device_statuses,
@@ -454,11 +501,12 @@ nvcompStatus_t nvcompBatchedCascadedDecompressAsync(
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
-  // Note:
-  // In contrast to other decompressors, Cascaded does not have checks for the absence of
-  // `device_statuses` and `device_uncompressed_chunk_bytes`.
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_statuses);
+  if (temp_bytes > 0)
+  {
+    NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
+  }
 
   CASCADED_CHECK_DECOMPRESS_OPTS(decompress_opts);
 
@@ -474,7 +522,22 @@ nvcompStatus_t nvcompBatchedCascadedDecompressAsync(
   NVCOMP_CHECK_BATCH_SIZE(num_chunks, std::numeric_limits<int>::max());
 
   LOG_INFO("Launching SM decompression");
-  return nvcomp::cascadedDecompressAsyncPart2(
+  if (decompress_opts.common_opts.mode != NVCOMP_CASCADED_MODE_UNSPECIFIED)
+  {
+    return nvcomp::cascadedDecompressAsyncDispatch(
+      device_compressed_chunk_ptrs,
+      device_compressed_chunk_bytes,
+      device_uncompressed_buffer_bytes,
+      device_uncompressed_chunk_bytes,
+      num_chunks,
+      device_uncompressed_chunk_ptrs,
+      device_statuses,
+      decompress_opts.common_opts,
+      stream
+    );
+  }
+
+  return nvcomp::cascadedDecompressAsyncDispatch(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
@@ -492,25 +555,28 @@ nvcompStatus_t nvcompBatchedCascadedDecompressAsyncEx(
   const size_t *device_uncompressed_buffer_bytes,
   size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
-  void *const /*device_temp_ptr*/,
-  size_t /*temp_bytes*/,
+  void *const device_temp_ptr,
+  size_t temp_bytes,
   void *const *device_uncompressed_chunk_ptrs,
   nvcompStatus_t *device_statuses,
   nvcompBatchedCascadedCompressOpts_t compress_opts,
-  nvcompBatchedCascadedDecompressOpts_t /*decompress_opts*/,
+  nvcompBatchedCascadedDecompressOpts_t decompress_opts,
   cudaStream_t stream,
-  const void *const * /*host_comp_chunk_buffers*/
+  [[maybe_unused]] const void *const * /*host_comp_chunk_buffers*/
 )
 {
-  return nvcomp::cascadedDecompressAsyncPart2(
+  decompress_opts.common_opts = compress_opts.common_opts;
+  return nvcompBatchedCascadedDecompressAsync(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
     device_uncompressed_chunk_bytes,
     num_chunks,
+    device_temp_ptr,
+    temp_bytes,
     device_uncompressed_chunk_ptrs,
+    decompress_opts,
     device_statuses,
-    compress_opts.data_type,
     stream
   );
 }
@@ -541,7 +607,7 @@ nvcompStatus_t nvcompBatchedCascadedGetDecompressSizeAsync(
   NVCOMP_CHECK_ALIGNMENT(device_compressed_chunk_bytes);
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_bytes);
 
-  return nvcomp::cascadedGetDecompressSizeAsyncPart2(
+  return nvcomp::cascadedGetDecompressSizeAsyncDispatch(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_chunk_bytes,

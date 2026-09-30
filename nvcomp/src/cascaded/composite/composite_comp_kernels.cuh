@@ -28,7 +28,12 @@
 
 #pragma once
 
+#include <cuda/std/utility>
+
+#include <type_traits>
+
 #include "cascaded/common/cascaded_utils.cuh"
+#include "cascaded/composite/composite_batch_optimizer.cuh"
 #include "cascaded/modules/bitpack.cuh"
 #include "cascaded/modules/delta.cuh"
 #include "cascaded/modules/rle.cuh"
@@ -45,14 +50,7 @@
 #include "nvcomp/cascaded.h"
 #include "type_macros.h"
 
-using nvcomp::Check;
-using nvcomp::CudaUtils;
-using nvcomp::NVCompException;
-using nvcomp::roundUpDiv;
-using nvcomp::roundUpTo;
-using nvcomp::roundUpToAlignment;
-
-namespace composite
+namespace nvcomp::cascaded::composite
 {
 
 /**
@@ -75,6 +73,9 @@ namespace composite
  * of the bitpacked metadata and the bitpacked data.
  * @param[in] use_bp Whether bitpacking should be used.
  * @param[in] data_is_deltas Whether the data pointed to by input is deltas.
+ *
+ * All threads in the block must call this function. The caller must synchronize
+ * the block after it returns before reusing \p input or \p temp_storage.
  */
 template <typename data_type, typename size_type, int threadblock_size>
 __device__ BlockIOStatus block_write(
@@ -122,6 +123,111 @@ __device__ BlockIOStatus block_write(
   return BlockIOStatus::success;
 }
 
+template <typename data_type, typename size_type, int threadblock_size>
+__device__ size_type block_encoded_size(
+  const data_type *const input,
+  const size_type num_elements,
+  uint32_t *const bitpacking_metadata,
+  const bool use_bitpacking,
+  const bool data_is_deltas
+)
+{
+  size_type encoded_bytes;
+  if (use_bitpacking)
+  {
+    auto frame_of_reference = reinterpret_cast<data_type *>(bitpacking_metadata);
+    uint32_t *const bitwidth_ptr = roundUpToAlignment<uint32_t>(frame_of_reference + 1);
+    if (std::is_signed_v<data_type> || data_is_deltas)
+    {
+      using signed_data_type = std::make_signed_t<data_type>;
+      modules::get_for_bitwidth<signed_data_type, size_type, threadblock_size>(
+        reinterpret_cast<const signed_data_type *>(input),
+        num_elements,
+        reinterpret_cast<signed_data_type *>(frame_of_reference),
+        bitwidth_ptr
+      );
+    }
+    else
+    {
+      modules::get_for_bitwidth<data_type, size_type, threadblock_size>(
+        input,
+        num_elements,
+        frame_of_reference,
+        bitwidth_ptr
+      );
+    }
+    __syncthreads();
+
+    const uint32_t bitwidth = *bitwidth_ptr >> 16;
+    // The frame of reference is followed by a 4B bitwidth/element-count word.
+    // Padding aligns that word and the subsequent packed uint32_t data to both
+    // 4B and data_type, including when data_type is only 1B or 2B.
+    encoded_bytes = roundUpTo(sizeof(data_type) + sizeof(uint32_t), max(size_t{4}, sizeof(data_type))) +
+                    roundUpDiv(num_elements * bitwidth, sizeof(uint32_t) * modules::num_bits_per_byte) *
+                      sizeof(uint32_t);
+    __syncthreads();
+  }
+  else
+  {
+    encoded_bytes = num_elements * sizeof(data_type);
+  }
+  return encoded_bytes;
+}
+
+template <typename data_type, typename size_type>
+struct ChunkEncodeState
+{
+  data_type *shared_input_buffer;
+  data_type *shared_output_buffer;
+  uint32_t *current_output_ptr;
+  size_type num_elements;
+  size_type best_final_bytes;
+  int consecutive_rejections;
+  uint32_t applied_stages;
+  bool current_is_signed;
+  bool final_output_written;
+};
+
+template <typename data_type, typename size_type>
+struct StageCandidate
+{
+  data_type *input;
+  data_type *output;
+  uint32_t *next_stage_ptr;
+  size_type num_elements;
+  size_type final_bytes;
+};
+
+struct SizedFieldLayout
+{
+  uint32_t *size_ptr;
+  uint32_t *payload_ptr;
+  uint32_t *next_ptr;
+};
+
+__device__ __forceinline__ SizedFieldLayout reserve_sized_field(uint32_t *const base, const size_t payload_bytes)
+{
+  uint32_t *const payload = base + 1;
+  return {base, payload, payload + roundUpDiv(payload_bytes, sizeof(uint32_t))};
+}
+
+template <typename data_type, typename size_type>
+__device__ __forceinline__ void accept_stage(
+  ChunkEncodeState<data_type, size_type> &state,
+  const StageCandidate<data_type, size_type> &candidate,
+  const uint32_t stage_mask
+)
+{
+  state.applied_stages |= stage_mask;
+  state.consecutive_rejections = 0;
+  state.current_output_ptr = candidate.next_stage_ptr;
+  state.shared_input_buffer = candidate.input;
+  state.shared_output_buffer = candidate.output;
+  state.num_elements = candidate.num_elements;
+  state.best_final_bytes = candidate.final_bytes;
+  state.final_output_written = false;
+}
+
 /**
  * @brief Batched cascaded compression kernel.
  *
@@ -153,17 +259,17 @@ __device__ void do_composite_compression(
   const size_type *uncompressed_bytes,
   void *const *compressed_data,
   size_type *compressed_bytes,
-  nvcompBatchedCascadedCompressOpts_t comp_opts
+  AdaptiveCompressionOptions comp_opts
 )
 {
   using run_type = uint16_t;
-  constexpr int chunk_num_elements = chunk_size / sizeof(data_type);
+  constexpr int CHUNK_NUM_ELEMENTS = chunk_size / sizeof(data_type);
 
-  // We need to guarantee the `chunk_num_elements` is smaller than the limit of
+  // We need to guarantee the `CHUNK_NUM_ELEMENTS` is smaller than the limit of
   // uint16_t for two reasons:
   // 1. We use uint16_t to represent run counts.
   // 2. We use 16 bits to represent number of elements in the bitpacking layer.
-  assert(chunk_num_elements < 65536);
+  assert(CHUNK_NUM_ELEMENTS < 65536);
 
   // `shared_element_storage_0` and `shared_element_storage_1` are shared memory
   // storage used for holding input and output of the current layer.
@@ -183,7 +289,7 @@ __device__ void do_composite_compression(
   __shared__ shared_storage_type shared_element_storage_1[storage_num_elements];
   data_type *shared_element_buffer_1 = reinterpret_cast<data_type *>(shared_element_storage_1);
 
-  constexpr int shared_counts_storage_size = roundUpTo(chunk_num_elements * sizeof(run_type), 4);
+  constexpr int shared_counts_storage_size = roundUpTo(CHUNK_NUM_ELEMENTS * sizeof(run_type), 4);
   // Shared memory buffer used by RLE for holding run counts
   __shared__ uint32_t shared_count_buffer[shared_counts_storage_size / sizeof(uint32_t)];
   // Temporary storage used by RLE
@@ -191,22 +297,6 @@ __device__ void do_composite_compression(
   // frame of reference (2B) and bit-width and number of elements (4B). So, in
   // total the metadata needs 6B. 8B is allocated for 4B alignment.
   __shared__ uint32_t shared_tmp_buffer[shared_counts_storage_size / sizeof(uint32_t) + 8 / sizeof(uint32_t)];
-
-  // `chunk_metadata` is a shared-memory staging buffer for the metadata of the
-  // current chunk before flushing it to global memory. Here we assume the chunk
-  // metadata is at most 64B large.
-  // This must be aligned to at least sizeof(data_type) to avoid delta_header
-  // below being shifted depending on the alignment.
-  __shared__ alignas(8) uint32_t chunk_metadata[max_chunk_metadata_size / sizeof(uint32_t)];
-  const int chunk_metadata_size = get_chunk_metadata_size<data_type>(comp_opts.num_RLEs, comp_opts.num_deltas);
-  assert(chunk_metadata_size <= max_chunk_metadata_size);
-
-  // Pointer to the delta section of chunk metadata in shared memory. Padding
-  // will be added if necessary to make the pointer `data_type` aligned.
-  // Explanation of the math here: from the start of a chunk metadata, we need
-  // to skip the size of the chunk (4B), and (num_RLEs + 1) RLE offsets
-  // (4B each) to get to the start of the delta header.
-  data_type *const delta_header = roundUpToAlignment<data_type>(chunk_metadata + 1 + comp_opts.num_RLEs + 1);
 
   // Number of output elements for the RLE layer
   __shared__ size_type num_outputs;
@@ -218,53 +308,52 @@ __device__ void do_composite_compression(
     const auto input_bytes = uncompressed_bytes[partition_idx];
     assert(input_bytes <= UINT32_MAX);
     const size_type num_input_elements = input_bytes / sizeof(data_type);
+
+    if (input_buffer == nullptr || input_bytes == 0)
+    {
+      if (threadIdx.x == 0)
+      {
+        // Zero compressed bytes fully represents empty input; no output buffer
+        // or header is required.
+        compressed_bytes[partition_idx] = 0;
+      }
+      continue;
+    }
+
     auto output_buffer = static_cast<uint32_t *>(compressed_data[partition_idx]);
     // `output_limit` points to the end of the output compressed buffer of the
     // current partition. The size of the compressed buffer should be at least
     // 8B larger than the input uncompressed buffer. It needs to be 8B larger
     // because in the fallback path, the compressed buffer still needs to store
     // the metadata. It is users responsibility to guarantee this requirement.
-    uint32_t *output_limit = output_buffer + roundUpDiv(universal_header::header_size_bytes, sizeof(uint32_t)) +
+    uint32_t *output_limit = output_buffer + roundUpDiv(universal_header::HEADER_SIZE_BYTES, sizeof(uint32_t)) +
                              roundUpDiv(input_bytes, sizeof(uint32_t));
-
-    if (input_buffer == nullptr || input_bytes == 0)
-    {
-      if (threadIdx.x == 0)
-      {
-        compressed_bytes[partition_idx] = 0;
-      }
-      continue;
-    }
 
     // Global flag on whether we will compress the current partition. If
     // compressed size is larger than the uncompressed size (i.e. compression
     // ratio < 1), we will use the fallback path of directly copying from the
     // input buffer to the compressed buffer, and set this flag to false.
-    bool use_compression = true;
-
-    if (comp_opts.num_RLEs == 0 && comp_opts.num_deltas == 0 && comp_opts.use_bp == 0)
-    {
-      use_compression = false;
-    }
+    bool use_compression = comp_opts.num_RLEs != 0 || comp_opts.num_deltas != 0 || comp_opts.use_bp != 0;
 
     // Pointer to the first chunk of the current partition
     auto current_output_ptr = reinterpret_cast<uint32_t *>(
-      roundUpToAlignment<data_type>(output_buffer + roundUpDiv(universal_header::header_size_bytes, sizeof(uint32_t)))
+      roundUpToAlignment<data_type>(output_buffer + roundUpDiv(universal_header::HEADER_SIZE_BYTES, sizeof(uint32_t)))
     );
 
-    const int num_chunks = roundUpDiv(num_input_elements, chunk_num_elements);
+    const int num_chunks = roundUpDiv(num_input_elements, CHUNK_NUM_ELEMENTS);
 
     for (int chunk_idx = 0; chunk_idx < num_chunks && use_compression; chunk_idx++)
     {
       // Save a pointer at the start of the chunk
       uint32_t *chunk_start_ptr = current_output_ptr;
 
-      // Move current output pointer as the end of chunk metadata
-      current_output_ptr += chunk_metadata_size / sizeof(uint32_t);
+      // Adaptive chunks begin with a fixed two-word prefix containing the
+      // packed chunk size / accepted-round count and final stream size.
+      current_output_ptr += ADAPTIVE_CHUNK_PREFIX_SIZE / sizeof(uint32_t);
 
-      auto input_buffer_current_chunk = input_buffer + chunk_num_elements * chunk_idx;
+      auto input_buffer_current_chunk = input_buffer + CHUNK_NUM_ELEMENTS * chunk_idx;
       size_type num_elements_current_chunk =
-        min(num_input_elements - chunk_idx * chunk_num_elements, static_cast<size_type>(chunk_num_elements));
+        min(num_input_elements - chunk_idx * CHUNK_NUM_ELEMENTS, static_cast<size_type>(CHUNK_NUM_ELEMENTS));
 
       // Threadblock collectively loads current chunk from input uncompressed
       // buffer to shared memory buffer
@@ -274,172 +363,351 @@ __device__ void do_composite_compression(
       }
       __syncthreads();
 
-      int rle_remaining = comp_opts.num_RLEs;
-      int delta_remaining = comp_opts.num_deltas;
-      int delta_skipped = 0;
-
-      data_type *shared_input_buffer = shared_element_buffer_0;
-      data_type *shared_output_buffer = shared_element_buffer_1;
-
-      for (int layer_idx = 0; layer_idx < max(comp_opts.num_RLEs, comp_opts.num_deltas); layer_idx++)
+      const bool use_rle = comp_opts.num_RLEs > 0;
+      const bool use_delta = comp_opts.num_deltas > 0;
+      const uint32_t max_stages = min(comp_opts.num_RLEs + comp_opts.num_deltas, ADAPTIVE_MAX_NUM_STAGES);
+      ChunkEncodeState<data_type, size_type> state{
+        shared_element_buffer_0,
+        shared_element_buffer_1,
+        current_output_ptr,
+        num_elements_current_chunk,
+        0,
+        0,
+        0,
+        false,
+        false
+      };
+      if (max_stages > 0)
       {
-        if (rle_remaining > 0)
+        state.best_final_bytes = block_encoded_size<data_type, size_type, threadblock_size>(
+          state.shared_input_buffer,
+          state.num_elements,
+          shared_tmp_buffer,
+          comp_opts.use_bp,
+          false
+        );
+      }
+
+      uint32_t rle_stage_mask = 0u;
+      for (uint32_t stage_idx = 0; stage_idx < max_stages && state.num_elements > 0; ++stage_idx)
+      {
+        auto best_final_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(state.current_output_ptr));
+        const auto final_output_status = block_write<data_type, size_type, threadblock_size>(
+          state.shared_input_buffer,
+          state.num_elements,
+          best_final_ptr,
+          output_limit,
+          &state.best_final_bytes,
+          reinterpret_cast<uint32_t *>(state.shared_output_buffer),
+          comp_opts.use_bp,
+          state.current_is_signed
+        );
+        __syncthreads();
+        state.final_output_written = final_output_status == BlockIOStatus::success;
+
+        const bool stage_is_rle = use_rle && (!use_delta || (stage_idx & 1) == 0);
+        if (stage_is_rle)
         {
-          // Run RLE
+          rle_stage_mask |= get_adaptive_stage_mask(stage_idx);
+        }
+        size_type candidate_elements = state.num_elements;
+        data_type *candidate_input = state.shared_input_buffer;
+        data_type *candidate_output = state.shared_output_buffer;
+
+        if (stage_is_rle)
+        {
+          size_type candidate_count_bytes;
           modules::block_rle_compress<data_type, size_type, run_type, threadblock_size>(
-            shared_input_buffer,
-            num_elements_current_chunk,
-            shared_output_buffer,
+            candidate_input,
+            candidate_elements,
+            candidate_output,
             reinterpret_cast<run_type *>(shared_count_buffer),
             &num_outputs,
             reinterpret_cast<run_type *>(shared_tmp_buffer)
           );
           __syncthreads();
-          assert(num_outputs <= (storage_num_elements * sizeof(shared_storage_type)) / sizeof(data_type));
-
-          // Save run counts to the compressed buffer
-          if (block_write<run_type, size_type, threadblock_size>(
-                reinterpret_cast<run_type *>(shared_count_buffer),
-                num_outputs,
-                current_output_ptr,
-                output_limit,
-                &out_bytes,
-                shared_tmp_buffer,
-                comp_opts.use_bp,
-                false
-              ) != BlockIOStatus::success)
+          candidate_elements = num_outputs;
+          assert(candidate_elements <= (storage_num_elements * sizeof(shared_storage_type)) / sizeof(data_type));
+          cuda::std::swap(candidate_input, candidate_output);
+          candidate_count_bytes = block_encoded_size<run_type, size_type, threadblock_size>(
+            reinterpret_cast<run_type *>(shared_count_buffer),
+            candidate_elements,
+            shared_tmp_buffer,
+            comp_opts.use_bp,
+            false
+          );
+          size_type candidate_final_bytes;
+          candidate_final_bytes = block_encoded_size<data_type, size_type, threadblock_size>(
+            candidate_input,
+            candidate_elements,
+            shared_tmp_buffer,
+            comp_opts.use_bp,
+            state.current_is_signed
+          );
+          const auto counts = reserve_sized_field(state.current_output_ptr, candidate_count_bytes);
+          const auto candidate_final_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(counts.next_ptr));
+          const size_type best_storage_bytes = get_adaptive_record_size<data_type, size_type>(
+            reinterpret_cast<uintptr_t>(state.current_output_ptr),
+            reinterpret_cast<uintptr_t>(best_final_ptr),
+            state.best_final_bytes
+          );
+          const size_type candidate_storage_bytes = get_adaptive_record_size<data_type, size_type>(
+            reinterpret_cast<uintptr_t>(state.current_output_ptr),
+            reinterpret_cast<uintptr_t>(candidate_final_ptr),
+            candidate_final_bytes
+          );
+          if (candidate_storage_bytes >= best_storage_bytes)
           {
-            use_compression = false;
-            goto afterlastchunk;
-          }
-
-          current_output_ptr += roundUpDiv(out_bytes, 4);
-
-          // Store the size into chunk metadata
-          if (threadIdx.x == 0)
-          {
-            chunk_metadata[comp_opts.num_RLEs - rle_remaining + 1] = out_bytes;
-          }
-
-          // Revert the role of input and ouput buffer
-          auto temp_ptr = shared_output_buffer;
-          shared_output_buffer = shared_input_buffer;
-          shared_input_buffer = temp_ptr;
-
-          num_elements_current_chunk = num_outputs;
-
-          rle_remaining--;
-        }
-
-        if (delta_remaining > 0)
-        {
-          // A previous delta pass may have removed the last element,
-          // but delta needs at least one element, so skip if none
-          if (num_elements_current_chunk == 0)
-          {
-            ++delta_skipped;
-            if (threadIdx.x == 0)
+            if (++state.consecutive_rejections == 2)
             {
-              // Arbitrary zero, so that it's initialized
-              delta_header[comp_opts.num_deltas - delta_remaining] = 0;
+              break;
             }
-            --delta_remaining;
-            // Even though there are no elements left, to maintain compatibility
-            // with cases before this fix was introduced, still do any remaining
-            // RLE passes, because they may write a frame of reference value for
-            // bit packing, and they initialize entries in chunk_metadata
             continue;
           }
 
-          // Run Delta
-          assert(num_elements_current_chunk <= (storage_num_elements * sizeof(shared_storage_type)) / sizeof(data_type));
-          modules::block_delta_compress<data_type, size_type>(
-            shared_input_buffer,
-            num_elements_current_chunk,
-            shared_output_buffer
+          const auto count_write_status = block_write<run_type, size_type, threadblock_size>(
+            reinterpret_cast<run_type *>(shared_count_buffer),
+            candidate_elements,
+            counts.payload_ptr,
+            output_limit,
+            &out_bytes,
+            shared_tmp_buffer,
+            comp_opts.use_bp,
+            false
           );
-
+          __syncthreads();
+          if (count_write_status != BlockIOStatus::success)
+          {
+            use_compression = false;
+            break;
+          }
+          assert(out_bytes == candidate_count_bytes);
           if (threadIdx.x == 0)
           {
-            delta_header[comp_opts.num_deltas - delta_remaining] = shared_input_buffer[0];
+            *counts.size_ptr = static_cast<uint32_t>(out_bytes);
           }
-
-          // Revert the role of input and ouput buffer
-          auto temp_ptr = shared_output_buffer;
-          shared_output_buffer = shared_input_buffer;
-          shared_input_buffer = temp_ptr;
-
-          // Number of elements is decreased by 1 since the first element is
-          // excluded for the subsequent operations.
-          num_elements_current_chunk -= 1;
-
-          delta_remaining--;
+          accept_stage(
+            state,
+            StageCandidate<data_type, size_type>{
+              candidate_input,
+              candidate_output,
+              counts.next_ptr,
+              candidate_elements,
+              candidate_final_bytes
+            },
+            get_adaptive_stage_mask(stage_idx)
+          );
+          continue;
         }
 
-        __syncthreads();
-      }
-
-      // Save final output to output buffer
-      auto final_output_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(current_output_ptr));
-
-      if (delta_skipped != 0)
-      {
-        assert(num_elements_current_chunk == 0);
-        // A negative out_bytes value is used to indicate that some number of
-        // delta passes were skipped.
-        out_bytes = size_type(-delta_skipped);
-        current_output_ptr = final_output_ptr;
-        if (reinterpret_cast<uintptr_t>(current_output_ptr) > reinterpret_cast<uintptr_t>(output_limit))
+        data_type candidate_delta_first{};
+        if (threadIdx.x == 0)
         {
-          use_compression = false;
-          goto afterlastchunk; // This is set to avoid flushing the chunk header below
+          candidate_delta_first = candidate_input[0];
         }
-      }
-      else
-      {
-        if (block_write<data_type, size_type, threadblock_size>(
-              shared_input_buffer,
-              num_elements_current_chunk,
-              final_output_ptr,
-              output_limit,
-              &out_bytes,
-              reinterpret_cast<uint32_t *>(shared_output_buffer),
-              comp_opts.use_bp,
-              comp_opts.num_deltas != 0
-            ) != BlockIOStatus::success)
+        modules::block_delta_compress<data_type, size_type>(candidate_input, candidate_elements, candidate_output);
+        __syncthreads();
+        cuda::std::swap(candidate_input, candidate_output);
+        --candidate_elements;
+
+        size_type candidate_final_bytes;
+        candidate_final_bytes = block_encoded_size<data_type, size_type, threadblock_size>(
+          candidate_input,
+          candidate_elements,
+          shared_tmp_buffer,
+          comp_opts.use_bp,
+          true
+        );
+        uint32_t *const candidate_delta_ptr = state.current_output_ptr;
+        auto candidate_stage_ptr = candidate_delta_ptr + roundUpDiv(sizeof(data_type), sizeof(uint32_t));
+        const auto candidate_final_ptr =
+          reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(candidate_stage_ptr));
+        const size_type best_storage_bytes = get_adaptive_record_size<data_type, size_type>(
+          reinterpret_cast<uintptr_t>(state.current_output_ptr),
+          reinterpret_cast<uintptr_t>(best_final_ptr),
+          state.best_final_bytes
+        );
+        const size_type candidate_storage_bytes = get_adaptive_record_size<data_type, size_type>(
+          reinterpret_cast<uintptr_t>(state.current_output_ptr),
+          reinterpret_cast<uintptr_t>(candidate_final_ptr),
+          candidate_final_bytes
+        );
+        if (candidate_storage_bytes < best_storage_bytes)
+        {
+          if (threadIdx.x == 0)
+          {
+            serialize_value(candidate_delta_ptr, candidate_delta_first);
+          }
+          state.current_is_signed = true;
+          accept_stage(
+            state,
+            StageCandidate<data_type, size_type>{
+              candidate_input,
+              candidate_output,
+              candidate_stage_ptr,
+              candidate_elements,
+              candidate_final_bytes
+            },
+            get_adaptive_stage_mask(stage_idx)
+          );
+          continue;
+        }
+
+        ++state.consecutive_rejections;
+        const bool can_look_ahead = use_rle && stage_idx + 1 < max_stages && candidate_elements > 0;
+        if (!can_look_ahead)
+        {
+          if (state.consecutive_rejections == 2)
+          {
+            break;
+          }
+          continue;
+        }
+        rle_stage_mask |= get_adaptive_stage_mask(stage_idx + 1);
+
+        // A locally losing Delta can expose long runs. Evaluate the following
+        // RLE exactly before rejecting both stages; if the pair also loses, the
+        // two-rejection rule terminates the search, so the overwritten working
+        // buffer is no longer needed.
+        modules::block_rle_compress<data_type, size_type, run_type, threadblock_size>(
+          candidate_input,
+          candidate_elements,
+          candidate_output,
+          reinterpret_cast<run_type *>(shared_count_buffer),
+          &num_outputs,
+          reinterpret_cast<run_type *>(shared_tmp_buffer)
+        );
+        __syncthreads();
+        candidate_elements = num_outputs;
+        cuda::std::swap(candidate_input, candidate_output);
+
+        size_type candidate_count_bytes;
+        candidate_count_bytes = block_encoded_size<run_type, size_type, threadblock_size>(
+          reinterpret_cast<run_type *>(shared_count_buffer),
+          candidate_elements,
+          shared_tmp_buffer,
+          comp_opts.use_bp,
+          false
+        );
+        candidate_final_bytes = block_encoded_size<data_type, size_type, threadblock_size>(
+          candidate_input,
+          candidate_elements,
+          shared_tmp_buffer,
+          comp_opts.use_bp,
+          true
+        );
+        const auto counts = reserve_sized_field(candidate_stage_ptr, candidate_count_bytes);
+        candidate_stage_ptr = counts.next_ptr;
+        const auto pair_final_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(candidate_stage_ptr));
+        const size_type pair_storage_bytes = get_adaptive_record_size<data_type, size_type>(
+          reinterpret_cast<uintptr_t>(state.current_output_ptr),
+          reinterpret_cast<uintptr_t>(pair_final_ptr),
+          candidate_final_bytes
+        );
+        if (pair_storage_bytes >= best_storage_bytes)
+        {
+          if (!state.final_output_written)
+          {
+            use_compression = false;
+          }
+          break;
+        }
+
+        const auto count_write_status = block_write<run_type, size_type, threadblock_size>(
+          reinterpret_cast<run_type *>(shared_count_buffer),
+          candidate_elements,
+          counts.payload_ptr,
+          output_limit,
+          &out_bytes,
+          shared_tmp_buffer,
+          comp_opts.use_bp,
+          false
+        );
+        __syncthreads();
+        if (count_write_status != BlockIOStatus::success)
         {
           use_compression = false;
           break;
         }
-
-        current_output_ptr = final_output_ptr + roundUpDiv(out_bytes, 4);
-        current_output_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(current_output_ptr));
+        if (threadIdx.x == 0)
+        {
+          serialize_value(candidate_delta_ptr, candidate_delta_first);
+          *counts.size_ptr = static_cast<uint32_t>(out_bytes);
+        }
+        state.current_is_signed = true;
+        accept_stage(
+          state,
+          StageCandidate<data_type, size_type>{
+            candidate_input,
+            candidate_output,
+            candidate_stage_ptr,
+            candidate_elements,
+            candidate_final_bytes
+          },
+          get_adaptive_stage_mask(stage_idx, 2)
+        );
+        ++stage_idx;
       }
 
-      // Flush chunk header from shared memory to output buffer
+      if (!use_compression)
+      {
+        break;
+      }
+
+      auto final_output_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(state.current_output_ptr));
+      if (!state.final_output_written)
+      {
+        const auto final_write_status = block_write<data_type, size_type, threadblock_size>(
+          state.shared_input_buffer,
+          state.num_elements,
+          final_output_ptr,
+          output_limit,
+          &out_bytes,
+          reinterpret_cast<uint32_t *>(state.shared_output_buffer),
+          comp_opts.use_bp,
+          state.current_is_signed
+        );
+        __syncthreads();
+        if (final_write_status != BlockIOStatus::success)
+        {
+          use_compression = false;
+          break;
+        }
+      }
+      if (state.final_output_written)
+      {
+        out_bytes = state.best_final_bytes;
+      }
+      current_output_ptr = final_output_ptr + roundUpDiv(out_bytes, 4);
+      current_output_ptr = reinterpret_cast<uint32_t *>(roundUpToAlignment<data_type>(current_output_ptr));
+
+      // Flush the fixed chunk prefix. Per-round metadata is already stored
+      // inline with each accepted stage.
       if (threadIdx.x == 0)
       {
         const uint32_t chunk_output_size = reinterpret_cast<uintptr_t>(current_output_ptr) -
                                            reinterpret_cast<uintptr_t>(chunk_start_ptr);
-        chunk_metadata[0] = chunk_output_size;
-        chunk_metadata[comp_opts.num_RLEs + 1] = out_bytes;
-
-        for (int idx = 0; idx < chunk_metadata_size / 4; idx++)
-        {
-          chunk_start_ptr[idx] = chunk_metadata[idx];
-        }
+        chunk_start_ptr[0] =
+          pack_adaptive_chunk_size(chunk_output_size, state.applied_stages, state.applied_stages & rle_stage_mask);
+        chunk_start_ptr[1] = static_cast<uint32_t>(out_bytes);
       }
 
       __syncthreads();
     }
 
-  afterlastchunk:
+    // Reserve the exact uncompressed-size encoding for the raw fallback so
+    // decompression can distinguish it without another universal-header flag.
+    if (use_compression && current_output_ptr >= output_limit)
+    {
+      use_compression = false;
+    }
+
     if (!use_compression)
     {
       // Compressed size is larger than uncompressed size, so we fallback to
       // directly copy input array to output
       data_type *direct_output_buffer =
-        roundUpToAlignment<data_type>(output_buffer + universal_header::header_size_words);
+        roundUpToAlignment<data_type>(output_buffer + universal_header::HEADER_SIZE_WORDS);
       for (int element_idx = threadIdx.x; element_idx < num_input_elements; element_idx += blockDim.x)
       {
         direct_output_buffer[element_idx] = input_buffer[element_idx];
@@ -451,16 +719,15 @@ __device__ void do_composite_compression(
     {
       auto partition_metadata_ptr = reinterpret_cast<uint8_t *>(output_buffer);
 
-      uint32_t uncompressed_size_bytes = static_cast<uint32_t>(num_input_elements * sizeof(data_type));
+      const uint32_t uncompressed_size_bytes = static_cast<uint32_t>(num_input_elements * sizeof(data_type));
       if (use_compression)
       {
-        universal_header::write_legacy_header(
+        universal_header::write_cascaded_next_header(
           partition_metadata_ptr,
-          cascaded::d_TypeOf<data_type>(),
-          uncompressed_size_bytes, // swap into 3rd slot
-          comp_opts.num_RLEs,
-          comp_opts.num_deltas,
-          comp_opts.use_bp
+          d_TypeOf<data_type>(),
+          uncompressed_size_bytes,
+          universal_header::CompressionMode::Asymmetric,
+          universal_header::TerminalCodec::CascadedBitpack
         );
 
         compressed_bytes[partition_idx] = reinterpret_cast<uintptr_t>(current_output_ptr) -
@@ -471,10 +738,11 @@ __device__ void do_composite_compression(
         universal_header::write_dummy_header(
           partition_metadata_ptr,
           cascaded::d_TypeOf<data_type>(),
-          uncompressed_size_bytes
+          uncompressed_size_bytes,
+          universal_header::CompressionMode::Asymmetric
         );
 
-        compressed_bytes[partition_idx] = roundUpTo(universal_header::header_size_bytes, sizeof(data_type)) +
+        compressed_bytes[partition_idx] = roundUpTo(universal_header::HEADER_SIZE_BYTES, sizeof(data_type)) +
                                           roundUpTo(num_input_elements * sizeof(data_type), 4);
       }
     }
@@ -510,7 +778,7 @@ __global__ void composite_compression_kernel(
   const size_type *uncompressed_bytes,
   void *const *compressed_data,
   size_type *compressed_bytes,
-  nvcompBatchedCascadedCompressOpts_t comp_opts
+  AdaptiveCompressionOptions comp_opts
 )
 {
   do_composite_compression<data_type, size_type, threadblock_size, chunk_size>(
@@ -527,7 +795,7 @@ __global__ void composite_compression_kernel(
 
 template <typename data_type>
 void composite_batched_compression_typed(
-  const nvcompBatchedCascadedCompressOpts_t format_opts,
+  const AdaptiveCompressionOptions format_opts,
   const void *const *device_uncompressed_chunk_ptrs,
   const size_t *device_uncompressed_bytes,
   size_t batch_size,
@@ -539,8 +807,8 @@ void composite_batched_compression_typed(
 {
   constexpr int threadblock_size = composite_compress_threadblock_size;
   composite_compression_kernel<data_type, size_t, threadblock_size>
-    <<<nvcomp::cuda_dim_cast(batch_size), threadblock_size, 0, stream>>>(
-      nvcomp::narrow_cast<int>(batch_size),
+    <<<cuda_dim_cast(batch_size), threadblock_size, 0, stream>>>(
+      narrow_cast<int>(batch_size),
       reinterpret_cast<const data_type *const *>(device_uncompressed_chunk_ptrs),
       device_uncompressed_bytes,
       device_compressed_ptrs,
@@ -550,7 +818,7 @@ void composite_batched_compression_typed(
   CUDA_CHECK(cudaGetLastError());
 
   // mark compression successful
-  nvcomp::try_clear_device_statuses(batch_size, device_statuses, stream);
+  try_clear_device_statuses(batch_size, device_statuses, stream);
 }
 
 nvcompStatus_t compressAsync(
@@ -566,12 +834,22 @@ nvcompStatus_t compressAsync(
   cudaStream_t stream
 )
 {
+  if (num_chunks == 0)
+  {
+    // The batch size doubles as the grid size, and an empty grid is an invalid
+    // launch configuration. There is nothing to compress either way.
+    return nvcompSuccess;
+  }
+
   try
   {
+    const AdaptiveStageCounts stage_counts =
+      map_adaptive_stage_counts(comp_opts.compression_level, comp_opts.fine_grained_encoding_flags);
+    const AdaptiveCompressionOptions adaptive_opts{stage_counts.num_RLEs, stage_counts.num_deltas, true};
     NVCOMP_TYPE_ONE_SWITCH(
-      comp_opts.data_type,
+      comp_opts.common_opts.data_type,
       composite_batched_compression_typed,
-      comp_opts,
+      adaptive_opts,
       device_uncompressed_chunk_ptrs,
       device_uncompressed_chunk_bytes,
       num_chunks,
@@ -590,4 +868,4 @@ nvcompStatus_t compressAsync(
   return nvcompSuccess;
 }
 
-} // namespace composite
+} // namespace nvcomp::cascaded::composite

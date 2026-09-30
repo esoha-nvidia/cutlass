@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA CORPORATION and its licensors retain all intellectual property
  * and proprietary rights in and to this software, related documentation
@@ -22,7 +22,6 @@ namespace gdeflate
 
 // Class to cooperatively read the swizzled bitstream
 template <
-  bool check_bounds,
   typename T = uint32_t, // Type of the input gdeflate stream
   typename Tb = uint64_t, // Type of the internal bitstream state in registers
   unsigned int N = WARP_SIZE_U> // Number of SIMD lanes
@@ -44,19 +43,13 @@ class warp_bitreader
     unsigned int offset = __popc(ballot & ltMask()) - 1;
     if (active)
     {
-      if constexpr (check_bounds)
-      {
-        corrupted |= (input + offset >= input_end);
-      }
+      corrupted |= (input + offset >= input_end);
       buf |= corrupted ? 0 : ((Tb)(input[offset]) << cnt);
       cnt += width;
     }
     // Advance the input pointer for all threads
     input += __popc(ballot);
-    if constexpr (check_bounds)
-    {
-      corrupted = (__any_sync(WARP_ALL, corrupted) != 0);
-    }
+    corrupted = (__any_sync(WARP_ALL, corrupted) != 0);
   }
 
 public:
@@ -70,10 +63,7 @@ public:
       , corrupted{false}
       , end_pos{false}
   {
-    if constexpr (check_bounds)
-    {
-      corrupted |= (input + WARP_SIZE_U > input_end);
-    }
+    corrupted |= (input + WARP_SIZE_U > input_end);
     cnt = width;
     buf = corrupted ? 0 : (Tb)input[threadIdx.x];
     input += WARP_SIZE_U;

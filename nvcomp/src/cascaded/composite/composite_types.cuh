@@ -28,7 +28,7 @@
 
 #pragma once
 
-namespace composite
+namespace nvcomp::cascaded::composite
 {
 
 /**
@@ -49,4 +49,4 @@ enum class BlockIOStatus
   out_of_bound
 };
 
-} // namespace composite
+} // namespace nvcomp::cascaded::composite

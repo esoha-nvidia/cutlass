@@ -37,6 +37,7 @@
 
 #include "allocators/host_pinned.hpp"
 #include "common.h"
+#include "common_utils.hpp"
 #include "CRC32.hpp"
 #include "CudaUtils.h"
 #include "highlevel/CompressionConfigs.hpp"
@@ -131,6 +132,7 @@ protected: // members
   ChecksumPolicy checksum_policy;
   FormatSpecHeader format_spec;
   BitstreamKind bitstream_kind;
+  ExecutionPolicy execution_policy;
   nvcompAlignmentRequirements_t compress_alignment;
   nvcompAlignmentRequirements_t decompress_alignment;
 
@@ -157,6 +159,7 @@ public: // API
     DecompressOpts_t decompress_opts,
     cudaStream_t user_stream,
     ChecksumPolicy checksum_policy,
+    ExecutionPolicy execution_policy,
     BitstreamKind bitstream_kind,
     DecompressFn_t decompress_fn,
     DecompressScratchFn_t decomp_scratch_size_fn,
@@ -178,6 +181,7 @@ public: // API
       , checksum_policy(checksum_policy)
       , format_spec()
       , bitstream_kind(bitstream_kind)
+      , execution_policy(execution_policy)
       , compress_alignment(compress_alignment)
       , decompress_alignment(decompress_alignment)
       , use_async_mem_ops(false)
@@ -280,6 +284,22 @@ public: // API
     {
       std::cerr << "Fatal error in ManagerBase destructor:" << std::endl << err.what() << std::endl;
     }
+  }
+
+  nvcompAlignmentRequirements_t get_required_compression_alignments() const final
+  {
+    const size_t output_alignment = bitstream_kind == BitstreamKind::NVCOMP_NATIVE
+                                      ? std::max(compress_alignment.output, alignof(CommonHeader))
+                                      : compress_alignment.output;
+    return {compress_alignment.input, output_alignment, 1 /* not used */};
+  }
+
+  nvcompAlignmentRequirements_t get_required_decompression_alignments() const final
+  {
+    const size_t input_alignment = bitstream_kind == BitstreamKind::NVCOMP_NATIVE
+                                     ? std::max(decompress_alignment.input, alignof(CommonHeader))
+                                     : decompress_alignment.input;
+    return {input_alignment, decompress_alignment.output, 1 /* not used */};
   }
 
   size_t get_compressed_output_size(const uint8_t *comp_buffer) final;
@@ -412,32 +432,6 @@ private: // helpers
   }
 
   /**
-   * @brief Validate that a user-supplied buffer pointer satisfies the required alignment.
-   *
-   * @param ptr The buffer pointer to validate.
-   * @param alignment The required alignment in bytes. Alignments of 0 or 1
-   *        impose no constraint and are skipped.
-   * @param what Human-readable description of the buffer for the error message.
-   *
-   * @throws NVCompException(nvcompErrorAlignment) if @p ptr is not a multiple of @p alignment.
-   */
-  static void check_buffer_alignment(const void *ptr, size_t alignment, const char *what)
-  {
-    if (alignment <= 1)
-    {
-      return;
-    }
-    if (reinterpret_cast<uintptr_t>(ptr) % alignment != 0)
-    {
-      throw NVCompException(
-        nvcompErrorAlignment,
-        std::string(what) + " buffer is not aligned to the required alignment of " + std::to_string(alignment) +
-          " bytes."
-      );
-    }
-  }
-
-  /**
    * @brief Required helper that actually does the compression in NVCOMP_NATIVE for a single element
    * For param meaning see nvcompManager::compress()
    */
@@ -516,7 +510,7 @@ private: // helpers
   );
 
   /**
-   * @brief Device path: pass pinned batch metadata directly to setup kernel, decompress, max-reduce statuses.
+   * @brief Device path: pass the batch metadata to the setup kernel, decompress, max-reduce statuses.
    */
   void run_decompress_chunked_batched_device_path(
     uint8_t **pinned_input_comp_buffers,

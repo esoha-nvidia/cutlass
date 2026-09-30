@@ -61,7 +61,7 @@ nvcompStatus_t nvcompBatchedCascadedDecompressAsyncEx(
   size_t temp_bytes, // not used
   void *const *device_uncompressed_chunk_ptrs,
   nvcompStatus_t *device_statuses,
-  nvcompBatchedCascadedCompressOpts_t compress_opts, // not used
+  nvcompBatchedCascadedCompressOpts_t compress_opts,
   nvcompBatchedCascadedDecompressOpts_t decompress_opts,
   cudaStream_t stream,
   const void *const *host_comp_chunk_buffers

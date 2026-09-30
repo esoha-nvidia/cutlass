@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #pragma once
 
@@ -116,18 +100,19 @@ void logBatchedCompressGetRequiredAlignments(
 }
 
 template <typename... Args>
-void logBatchedCompressGetTempSizeAsync(
+void logBatchedCompressGetTempSize(
   const char *const function_name,
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
+  cudaStream_t stream,
   const char *const options_format_string = "",
   Args &&...options_args
 )
 {
   std::string format_string = std::string("num_chunks={}, max_uncomp_chunk_bytes={}, options=(") +
-                              options_format_string + "), temp_bytes={:#x}, max_total_uncomp_bytes={}";
+                              options_format_string + "), temp_bytes={:#x}, max_total_uncomp_bytes={}, stream={:#x}";
   fmt::string_view str = format_string;
   logApi(
     function_name,
@@ -136,7 +121,8 @@ void logBatchedCompressGetTempSizeAsync(
     max_uncompressed_chunk_bytes,
     std::forward<Args>(options_args)...,
     reinterpret_cast<uintptr_t>(temp_bytes),
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    reinterpret_cast<uintptr_t>(stream)
   );
 }
 
@@ -216,18 +202,19 @@ void logBatchedDecompressGetRequiredAlignments(
 }
 
 template <typename... Args>
-void logBatchedDecompressGetTempSizeAsync(
+void logBatchedDecompressGetTempSize(
   const char *const function_name,
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   size_t *temp_bytes,
   size_t max_uncompressed_total_bytes,
+  cudaStream_t stream,
   const char *const options_format_string = "",
   Args &&...options_args
 )
 {
   std::string format_string = std::string("num_chunks={}, max_uncompressed_chunk_bytes={}, decomp_opts=(") +
-                              options_format_string + "), temp_bytes={:#x}, max_uncomp_total_bytes={}";
+                              options_format_string + "), temp_bytes={:#x}, max_uncomp_total_bytes={}, stream={:#x}";
   fmt::string_view str = format_string;
   logApi(
     function_name,
@@ -236,7 +223,8 @@ void logBatchedDecompressGetTempSizeAsync(
     max_uncompressed_chunk_bytes,
     std::forward<Args>(options_args)...,
     reinterpret_cast<uintptr_t>(temp_bytes),
-    max_uncompressed_total_bytes
+    max_uncompressed_total_bytes,
+    reinterpret_cast<uintptr_t>(stream)
   );
 }
 

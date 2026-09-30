@@ -42,21 +42,38 @@ typedef struct
    * - NVCOMP_TYPE_(U)CHAR: 1-byte, generic data type
    * - NVCOMP_TYPE_FLOAT16: 2-byte floating-point data type. Applicable to all half-precision data formats.
    * - NVCOMP_TYPE_FLOAT8_E4M3: 1-byte FP8 (E4M3) floating-point data type.
+   * - NVCOMP_TYPE_FLOAT32: 4-byte IEEE-754 single-precision floating-point data type.
    */
   nvcompType_t data_type;
   /**
    * @brief Maximum sub chunk count override for compression.
-   * 0 = auto-compute from GPU properties and batch size (default).
-   * Nonzero = must be a power-of-2 between 4 and 64.
+   * 0: default of 8. Nonzero must be a power-of-2 between 4 and 64.
    * Leave zero unless you can tune the performance of your e2e application based on this value.
-   * Recommend starting with a value of 64 for small batches, 8 for large batches.
    */
   uint8_t max_sub_chunk_count;
+  /**
+   * @brief Number of interleaved rANS states per lane.
+   * 0: auto (default): two interleaved streams for every data type.
+   * 1: single stream.
+   * 2: two interleaved streams.
+   * "2 states" improves performance but adds an overhead of 128B per sub chunk, impacting
+   * compression ratio; the relative cost grows as the sub chunk shrinks.
+   */
+  uint8_t states_per_lane;
+  /**
+   * @brief Reduces the amount of data used to build the histogram by this log2 factor.
+   * 0: exact model (default). N keeps 1/2^N of the slice (1 = 1/2, 2 = 1/4, 3 = 1/8,
+   * up to nvcompANSMaxHistogramReductionLog2). Useful to speed up compression when
+   * full chunks are known to be sampled from a common distribution.
+   * Applies to every data type. Chunks below 4096 ANS symbols are always histogrammed
+   * exactly, whatever the requested reduction.
+   */
+  uint8_t histogram_reduction_log2;
   /**
    * @brief These bytes are unused and must be zeroed. This ensures
    *        compatibility if additional fields are added in the future.
    */
-  char reserved[55];
+  char reserved[53];
 } nvcompBatchedANSCompressOpts_t;
 
 /**
@@ -71,41 +88,52 @@ typedef struct
   /**
    * @brief ANS data type to use for decompression.
    *
-   * The ANS format spec is self-describing, so the data type argument is optional.
-   * If NVCOMP_TYPE_CHAR (0, the default), is set, the data type will be determined
-   * from the bitstream. Otherwise, the data type selected here must match what's in
-   * the bitstream. If this does not match, decompression will not complete
-   * and nvcompStatus values will be set to nvcompErrorCannotDecompress.
+   * - NVCOMP_TYPE_BITS: unknown (the default). The type is read from the bitstream, so any
+   *   ANS stream decodes; naming a type instead must match the bitstream.
+   * - NVCOMP_TYPE_(U)CHAR: 1-byte, generic data type
+   * - NVCOMP_TYPE_FLOAT16: 2-byte floating-point data type. Applicable to all half-precision data formats.
+   * - NVCOMP_TYPE_FLOAT8_E4M3: 1-byte FP8 (E4M3) floating-point data type.
+   * - NVCOMP_TYPE_FLOAT32: 4-byte IEEE-754 single-precision floating-point data type.
    */
   nvcompType_t data_type;
   /**
-   * @brief Maximum sub chunk count override for compression.
-   * 0 = auto-compute from GPU properties and batch size (default).
-   * For decompression -- if the user does not have the setting used during compression, 0 should be used to
-   * autodetect the right value. If a nonzero value that is less than the compression setting is used, decompression will fail.
-   * Nonzero = must be a power-of-2 between 4 and 64.
-   * Leave zero unless you can tune the performance of your e2e application based on this value.
-   * Recommend starting with a value of 64 for small batches, 8 for large batches.
+   * @brief Maximum sub chunk count override for decompression.
+   * 0: infer the value from the compressed bitstream.
+   * Nonzero must be a power-of-2 between 4 and 64; smaller than the stream's
+   * count fails decompression.
    */
   uint8_t max_sub_chunk_count;
+  /**
+   * @brief Number of interleaved rANS states per lane used during compression.
+   * 0: infer the value from the compressed bitstream. Otherwise it must match the bitstream,
+   *    and setting it lets a more specialized kernel be launched once data_type names a type.
+   * 1: single stream.
+   * 2: two interleaved streams.
+   */
+  uint8_t states_per_lane;
+
+  /**
+   * @brief Skip per-chunk validation in the decompress kernel.
+   */
+  uint8_t skip_validate;
   /**
    * @brief These bytes are unused and must be zeroed. This ensures
    *        compatibility if additional fields are added in the future.
    */
-  char reserved[55];
+  char reserved[53];
 } nvcompBatchedANSDecompressOpts_t;
 
 /**
  * @brief Default ANS compression options
  */
 static const nvcompBatchedANSCompressOpts_t nvcompBatchedANSCompressDefaultOpts =
-  {nvcomp_rANS, NVCOMP_TYPE_CHAR, 0, {0}};
+  {nvcomp_rANS, NVCOMP_TYPE_CHAR, 0, 0, 0, {0}};
 
 /**
  * @brief Default ANS decompression options
  */
 static const nvcompBatchedANSDecompressOpts_t nvcompBatchedANSDecompressDefaultOpts =
-  {NVCOMP_DECOMPRESS_BACKEND_DEFAULT, NVCOMP_TYPE_CHAR, 0, {0}};
+  {NVCOMP_DECOMPRESS_BACKEND_DEFAULT, NVCOMP_TYPE_BITS, 0, 0, 0, {0}};
 
 /**
  * @brief The maximum supported uncompressed chunk size in bytes for the ANS compressor.
@@ -119,13 +147,19 @@ static const size_t nvcompANSCompressionMaxAllowedChunkSize = 1 << 24;
 static const size_t nvcompANSDecompressionMaxAllowedChunkSize = 1ull << 25;
 
 /**
+ * @brief Maximum `histogram_reduction_log2` for ANS compression. N keeps 1/2^N of each
+ * warp's histogram slice, so this cap is 1/256.
+ */
+static const uint8_t nvcompANSMaxHistogramReductionLog2 = 8;
+
+/**
  * @brief The most restrictive of the minimum alignment requirements for void-type CUDA memory buffers
  * used for input, output, or temporary memory, passed to compression functions.
  *
  * @note In all cases, typed memory buffers must still be aligned to their type's size,
  * e.g., 4 bytes for `int`.
  */
-static const size_t nvcompANSRequiredCompressionAlignment = 8;
+static const size_t nvcompANSRequiredCompressionAlignment = 16;
 
 /**
  * @brief Get the minimum buffer alignment requirements for compression.
@@ -146,10 +180,9 @@ nvcompStatus_t nvcompBatchedANSCompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for compression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for compression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks The number of chunks of memory in the batch.
  * @param[in] max_uncompressed_chunk_bytes The maximum size of a chunk in the
@@ -160,15 +193,18 @@ nvcompStatus_t nvcompBatchedANSCompressGetRequiredAlignments(
  * @param[in] max_total_uncompressed_bytes Upper bound on the total uncompressed
  * size of all chunks
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedANSCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedANSCompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedANSCompressOpts_t compress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -232,39 +268,6 @@ nvcompStatus_t nvcompBatchedANSCompressGetMaxOutputChunkSize(
 );
 
 /**
- * @brief Parameters for calling `nvcompDeviceANSCompressChunk` from another kernel.
- *
- * The device compressor is char/uint8 rANS and requires a CTA of
- * `*block_threads` threads (256) with at least `*smem_bytes` of aligned shared
- * memory. `*max_sub_chunk_size` and `*slot_words` must be forwarded unchanged
- * into the device call. Use the same `compress_opts` and `num_chunks` as a
- * later `nvcompBatchedANSCompressAsync` if the bitstreams need to match.
- *
- * @param[in] num_chunks Number of chunks that will be compressed (occupancy
- *                       auto-config when `compress_opts.max_sub_chunk_count` is 0).
- * @param[in] max_uncompressed_chunk_bytes Maximum uncompressed chunk size.
- * @param[in] compress_opts Compression options (same as the host batched API).
- * @param[out] max_sub_chunk_size Sub-chunk size in symbols.
- * @param[out] slot_words Worst-case sub-chunk slot stride in uint32 words.
- * @param[out] smem_bytes Shared memory required by the device compressor.
- * @param[out] smem_alignment Alignment required for that shared memory.
- * @param[out] block_threads Required CTA thread count.
- *
- * @return nvcompSuccess if successful, and an error code otherwise.
- */
-NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
-  size_t num_chunks,
-  size_t max_uncompressed_chunk_bytes,
-  nvcompBatchedANSCompressOpts_t compress_opts,
-  int *max_sub_chunk_size,
-  uint32_t *slot_words,
-  size_t *smem_bytes,
-  size_t *smem_alignment,
-  int *block_threads
-);
-
-/**
  * @brief Perform batched asynchronous compression.
  *
  * @warning Violating any of the conditions listed in the parameter descriptions
@@ -283,6 +286,8 @@ nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
  * @param[in] device_uncompressed_chunk_bytes Array with size \p num_chunks of
  * sizes of the uncompressed chunks in bytes.
  * The sizes should reside in device-accessible memory.
+ * Each size must be a multiple of the byte width of \p compress_opts.data_type
+ * (four bytes for `NVCOMP_TYPE_FLOAT32`).
  * @param[in] max_uncompressed_chunk_bytes The size of the largest uncompressed chunk.
  * @param[in] num_chunks Number of chunks of data to compress.
  * @param[in] device_temp_ptr The temporary GPU workspace, could be NULL in case
@@ -337,7 +342,7 @@ nvcompStatus_t nvcompBatchedANSCompressAsync(
  * @note In all cases, typed memory buffers must still be aligned to their type's size,
  * e.g., 4 bytes for `int`.
  */
-static const size_t nvcompANSRequiredDecompressionAlignment = 8;
+static const size_t nvcompANSRequiredDecompressionAlignment = 16;
 
 /**
  * @brief Get the minimum buffer alignment requirements for decompression.
@@ -358,10 +363,9 @@ nvcompStatus_t nvcompBatchedANSDecompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for decompression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for decompression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks Number of chunks of data to be decompressed.
  * @param[in] max_uncompressed_chunk_bytes The size of the largest chunk in bytes
@@ -371,15 +375,18 @@ nvcompStatus_t nvcompBatchedANSDecompressGetRequiredAlignments(
  * during decompression. The value is returned on the host side.
  * @param[in] max_total_uncompressed_bytes The total decompressed size of all the chunks.
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedANSDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedANSDecompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedANSDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -489,7 +496,7 @@ nvcompStatus_t nvcompBatchedANSGetDecompressSizeAsync(
  * overflow chunk to `nvcompErrorCannotDecompress`.
  * @param[out] device_uncompressed_chunk_bytes Array with size \p num_chunks to
  * be filled with the actual number of bytes decompressed for every chunk.
- * This argument needs to be preallocated.
+ * This argument needs to be preallocated in device-accessible memory.
  * @param[in] num_chunks Number of chunks of data to decompress.
  * @param[in] device_temp_ptr The temporary GPU space, could be NULL in case temporary space is not needed.
  * Must be aligned to the value in the `temp` member of the
@@ -510,7 +517,6 @@ nvcompStatus_t nvcompBatchedANSGetDecompressSizeAsync(
  * `nvcompSuccess`. If the decompression is not successful, for example due to
  * the corrupted input or out-of-bound errors, the status will be set to
  * `nvcompErrorCannotDecompress`.
- * Can be NULL if desired, in which case error status is not reported.
  * @param[in] stream The CUDA stream to operate on.
  *
  * @return nvcompSuccess if successfully launched, and an error code otherwise.

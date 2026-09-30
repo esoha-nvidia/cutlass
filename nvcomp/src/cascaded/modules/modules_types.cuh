@@ -30,9 +30,10 @@
 
 #include <type_traits>
 
-namespace modules
+namespace nvcomp::cascaded::modules
 {
 
+// TODO (uhofmann): refactor to NUM_BITS_PER_BYTE
 constexpr size_t num_bits_per_byte = 8;
 
 /**
@@ -47,4 +48,4 @@ struct make_larger
 template <typename U, typename T>
 using larger_t = typename make_larger<U, T>::type;
 
-} // namespace modules
+} // namespace nvcomp::cascaded::modules

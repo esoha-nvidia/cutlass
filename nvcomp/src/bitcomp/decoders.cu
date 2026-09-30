@@ -90,7 +90,7 @@ __launch_bounds__(256)
 
 __device__ void setChunkStatus(nvcompStatus_t *statuses, int chunk_id, nvcompStatus_t status)
 {
-  assert(statuses != nullptr); // Already checked in the kernel launcher, but just in case
+  assert(statuses != nullptr);
   if (threadIdx.x == 0)
   {
     statuses[chunk_id] = status;
@@ -101,12 +101,7 @@ __device__ void setChunkStatus(nvcompStatus_t *statuses, int chunk_id, nvcompSta
 // Generic batch decoder kernel. Does not support partial decompression
 // Each CTA works on one batch and decompresses all the 8KB blocks sequentially
 
-template <
-  bitcompAlgorithm_t ALGORITHM,
-  typename T,
-  bitcompMode_t COMP_MODE,
-  bitcompIntFormat_t INT_FORMAT,
-  bool STATUS_AND_SIZES_ARRAYS_PRESENT>
+template <bitcompAlgorithm_t ALGORITHM, typename T, bitcompMode_t COMP_MODE, bitcompIntFormat_t INT_FORMAT>
 #if defined(__CUDA_ARCH__)
 #if __CUDA_ARCH__ == 750
 // Note: 750 is the Geforce line of Turing that only allowed a maximum of 1024 resident threads per SM
@@ -142,18 +137,15 @@ __launch_bounds__(256, 6)
   const uint64 hdrlenw = header::getHeaderLengthInWords(p_in);
   const uint64 uncompressed_bytes = header::getUncompressedSize(p_in);
 
-  if constexpr (STATUS_AND_SIZES_ARRAYS_PRESENT)
+  if (!header::hasValidMagicNumber(p_in))
   {
-    if (!header::hasValidMagicNumber(p_in))
-    {
-      setChunkStatus(statuses, chunk_id, nvcompErrorCannotDecompress);
-      return;
-    }
-    if (output_buffer_sizes[chunk_id] < uncompressed_bytes)
-    {
-      setChunkStatus(statuses, chunk_id, nvcompErrorOutputBufferTooSmall);
-      return;
-    }
+    setChunkStatus(statuses, chunk_id, nvcompErrorCannotDecompress);
+    return;
+  }
+  if (output_buffer_sizes[chunk_id] < uncompressed_bytes)
+  {
+    setChunkStatus(statuses, chunk_id, nvcompErrorOutputBufferTooSmall);
+    return;
   }
 
   int nblocks = nvcomp::roundUpDiv(uncompressed_bytes, NOMINAL_BLOCK_SIZE);
@@ -193,14 +185,11 @@ __launch_bounds__(256, 6)
     p_out += NOMINAL_BLOCK_SIZE;
     __syncthreads();
   }
-  if constexpr (STATUS_AND_SIZES_ARRAYS_PRESENT)
+  if (threadIdx.x == 0)
   {
-    if (threadIdx.x == 0)
-    {
-      uncompressed_sizes[chunk_id] = uncompressed_bytes;
-    }
-    setChunkStatus(statuses, chunk_id, nvcompSuccess);
+    uncompressed_sizes[chunk_id] = uncompressed_bytes;
   }
+  setChunkStatus(statuses, chunk_id, nvcompSuccess);
 }
 
 // *******************************************************************************************************************
@@ -274,21 +263,12 @@ nvcompStatus_t launchBatchDecoder(
 
   const unsigned int blocks = nvcomp::cuda_dim_cast(batch_size);
   constexpr unsigned int THREADS = 256;
-  const bool status_and_sizes_arrays_present = output_buffer_sizes != nullptr && statuses != nullptr;
 
 #define BITCOMP_LAUNCH_BATCH_DECODER(ALGORITHM, T, COMP_MODE, INT_FORMAT)                                              \
   do                                                                                                                   \
   {                                                                                                                    \
-    if (status_and_sizes_arrays_present)                                                                               \
-    {                                                                                                                  \
-      batch_decoder_kernel<ALGORITHM, T, COMP_MODE, INT_FORMAT, true>                                                  \
-        <<<blocks, THREADS, 0, stream>>>(input, output, output_buffer_sizes, uncompressed_sizes, statuses);            \
-    }                                                                                                                  \
-    else                                                                                                               \
-    {                                                                                                                  \
-      batch_decoder_kernel<ALGORITHM, T, COMP_MODE, INT_FORMAT, false>                                                 \
-        <<<blocks, THREADS, 0, stream>>>(input, output, output_buffer_sizes, uncompressed_sizes, statuses);            \
-    }                                                                                                                  \
+    batch_decoder_kernel<ALGORITHM, T, COMP_MODE, INT_FORMAT>                                                          \
+      <<<blocks, THREADS, 0, stream>>>(input, output, output_buffer_sizes, uncompressed_sizes, statuses);              \
   } while (0)
 
 #define BITCOMP_DISPATCH_BATCH_DECODER(ALGORITHM)                                                                      \

@@ -28,8 +28,8 @@
 
 #pragma once
 
+#include "ans/EncodePolicy.hpp"
 #include "ans/histogram_common.cuh"
-#include "ans/types.cuh"
 
 namespace ans_gpu_lib
 {
@@ -46,7 +46,7 @@ struct WarpHistRange
 
 // Partition `num` symbols (or FP8 pairs) evenly across `num_warps`, rounding each
 // warp's share up to `align` so the warp-level loads stay aligned. Replaces the
-// three copies of this rounding/min/max block (char/fp16/fp8).
+// per-type copies of this rounding/min/max block (char/fp16/fp8/fp32).
 inline __device__ WarpHistRange partition_symbols_across_warps(IndexT num, uint32_t wid, uint32_t num_warps, int align)
 {
   const int max_per_warp = static_cast<int>(nvcomp::roundUpTo(nvcomp::roundUpDiv(num, num_warps), align));
@@ -56,34 +56,35 @@ inline __device__ WarpHistRange partition_symbols_across_warps(IndexT num, uint3
   return {in_start, size};
 }
 
-// Generic CTA-wide Phase-1 histogram. Policy-specific behavior (symbol count, chunk
-// prefix, side-band layout, count rows, warp kernel) comes from EncodePolicy.
-// Writes the chunk size prefix and returns the ANS bitstream start via
-// ans_comp_chunk. All warps accumulate into one CTA-shared count row in
-// shared_cta_counts[0..NV_SYMBOL_COUNT). Ends CTA-synchronized.
-template <typename EncodePolicy, int BLOCK_DIM_X, typename CG>
+// Symbols this warp counts: the whole slice when shift == 0, else its leading 1/(2^shift).
+// A nonempty slice always keeps at least one symbol, so a sample never contributes nothing.
+inline __device__ int sampled_hist_size(int slice_size, uint32_t shift)
+{
+  return min(slice_size, max(slice_size >> shift, 1));
+}
+
+// Generic CTA-wide Phase-1 histogram. Policy-specific behavior (symbol count,
+// mantissa layout, count rows, warp kernel) comes from EncodePolicy.
+// All warps accumulate into one CTA-shared count row in shared_cta_counts[0..NV_SYMBOL_COUNT).
+// Ends CTA-synchronized.
+template <typename EncodePolicy, int BLOCK_DIM_X>
 __device__ void compute_histogram(
   const void *uncomp_chunk,
   uint8_t *comp_chunk,
   IndexT uncomp_chunk_size_bytes,
-  uint8_t *&ans_comp_chunk,
+  uint8_t num_sub_chunks,
   uint32_t *shared_cta_counts,
-  CG &group
+  uint32_t sample_shift, // 0 = exact; else count only this warp's leading range >> shift
+  uint8_t *hist_stage, // [NUM_WARPS][stage_bytes_per_warp] cp.async window
+  int stage_bytes_per_warp
 )
 {
-  const int tid = group.thread_rank();
+  const int tid = static_cast<int>(threadIdx.x);
   const int idx_in_warp = tid % WARP_SIZE;
   const int wid = tid / WARP_SIZE;
   constexpr int NUM_WARPS = BLOCK_DIM_X / WARP_SIZE;
 
   const IndexT num = EncodePolicy::num_symbols(uncomp_chunk_size_bytes);
-
-  // First bytes of comp_chunk carry the size prefix so the decoder knows where the
-  // ANS bitstream (and, for fp16/fp8, the side-band) start.
-  if (tid == 0)
-  {
-    ans_comp_chunk = EncodePolicy::histogram_write_chunk_prefix(comp_chunk, uncomp_chunk_size_bytes);
-  }
 
   // Zero the single CTA-shared count row.
   for (int i = tid; i < NV_SYMBOL_COUNT; i += BLOCK_DIM_X)
@@ -95,18 +96,40 @@ __device__ void compute_histogram(
   const WarpHistRange range = partition_symbols_across_warps(num, wid, NUM_WARPS, EncodePolicy::PARTITION_ALIGN);
 
   const uint8_t *ip = reinterpret_cast<const uint8_t *>(uncomp_chunk) + EncodePolicy::input_byte_offset(range.in_start);
-  uint8_t *sideband = EncodePolicy::histogram_sideband_warp_base(comp_chunk, range.in_start);
+  uint8_t *mantissas = nullptr;
+  if constexpr (!EncodePolicy::ENCODE_WRITES_MANTISSAS)
+  {
+    mantissas = EncodePolicy::histogram_mantissas_warp_base(comp_chunk, range.in_start, num_sub_chunks);
+  }
 
-  // Run this warp's slice through the shared engine; the peel is enabled iff the
-  // policy declares it (char only). All warps accumulate into the one shared row.
-  histogram_warp_impl<EncodePolicy, EncodePolicy::HAS_PEEL>(idx_in_warp, shared_cta_counts, ip, range.size, sideband);
+  // Run this warp's slice through the shared engine. All warps accumulate into the
+  // one shared row.
+  //
+  // SAMPLING: when sample_shift > 0 the histogram counts only the LEADING 1/(2^shift) of
+  // this warp's symbols
+  const int hist_size = sampled_hist_size(range.size, sample_shift);
+  static_assert(
+    EncodePolicy::HIST_FLOOR == HistFloor::None || EncodePolicy::ENCODE_WRITES_MANTISSAS ||
+      EncodePolicy::MANTISSA_BYTES_PER_SYMBOL == 0,
+    "a sampled histogram walks only the leading part of each warp's slice, so it cannot also be "
+    "responsible for writing the mantissas: a sampling policy must either emit them from the encode "
+    "pass (ENCODE_WRITES_MANTISSAS) or have none (MANTISSA_BYTES_PER_SYMBOL == 0)"
+  );
+  histogram_warp_impl<EncodePolicy>(
+    idx_in_warp,
+    shared_cta_counts,
+    ip,
+    hist_size,
+    mantissas,
+    hist_stage + wid * stage_bytes_per_warp
+  );
 
   if (tid == 0)
   {
-    EncodePolicy::write_chunk_tail(comp_chunk, uncomp_chunk, uncomp_chunk_size_bytes);
+    EncodePolicy::write_chunk_tail(comp_chunk, uncomp_chunk, uncomp_chunk_size_bytes, num_sub_chunks);
   }
 
-  group.sync();
+  __syncthreads();
 }
 
 } // namespace detail

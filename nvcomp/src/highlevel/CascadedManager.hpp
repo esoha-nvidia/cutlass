@@ -1,32 +1,16 @@
-#pragma once
-
 /*
- * Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
+
+#pragma once
 
 #include "CRC32.hpp"
 #include "highlevel/ManagerBase.hpp"
@@ -44,66 +28,79 @@ struct CascadedManagerImpl
     : ManagerBase<
         CascadedFormatSpecHeader,
         decltype(nvcompBatchedCascadedDecompressAsyncEx) *,
-        decltype(nvcompBatchedCascadedDecompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedCascadedDecompressGetTempSize) *,
         decltype(nvcompBatchedCascadedGetDecompressSizeAsync) *,
         decltype(nvcompBatchedCascadedCompressAsync) *,
-        decltype(nvcompBatchedCascadedCompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedCascadedCompressGetTempSize) *,
         decltype(nvcompBatchedCascadedCompressGetMaxOutputChunkSize) *,
         nvcompBatchedCascadedCompressOpts_t,
         nvcompBatchedCascadedDecompressOpts_t,
         nvcompFormatType_t::Cascaded>
 {
+  static nvcompBatchedCascadedDecompressOpts_t make_targeted_decompress_opts(
+    const nvcompBatchedCascadedCompressOpts_t &format_opts,
+    nvcompBatchedCascadedDecompressOpts_t decompress_opts
+  )
+  {
+    decompress_opts.common_opts = format_opts.common_opts;
+    return decompress_opts;
+  }
+
   CascadedManagerImpl(
     size_t uncomp_chunk_size,
     nvcompBatchedCascadedCompressOpts_t format_opts,
     nvcompBatchedCascadedDecompressOpts_t decompress_opts,
     cudaStream_t user_stream,
     ChecksumPolicy checksum_policy,
+    ExecutionPolicy execution_policy,
     BitstreamKind bitstream_kind
   )
       : ManagerBase(
           uncomp_chunk_size,
           format_opts,
-          decompress_opts,
+          make_targeted_decompress_opts(format_opts, decompress_opts),
           user_stream,
           checksum_policy,
+          execution_policy,
           bitstream_kind,
           nvcompBatchedCascadedDecompressAsyncEx,
-          nvcompBatchedCascadedDecompressGetTempSizeAsync,
+          nvcompBatchedCascadedDecompressGetTempSize,
           nvcompBatchedCascadedGetDecompressSizeAsync,
           nvcompBatchedCascadedCompressAsync,
-          nvcompBatchedCascadedCompressGetTempSizeAsync,
+          nvcompBatchedCascadedCompressGetTempSize,
           nvcompBatchedCascadedCompressGetMaxOutputChunkSize,
           query_alignment_requirements(nvcompBatchedCascadedCompressGetRequiredAlignments, format_opts),
-          query_alignment_requirements(nvcompBatchedCascadedDecompressGetRequiredAlignments, decompress_opts)
+          query_alignment_requirements(
+            nvcompBatchedCascadedDecompressGetRequiredAlignments,
+            make_targeted_decompress_opts(format_opts, decompress_opts)
+          )
         )
   {
     static_assert(
-      offsetof(CascadedFormatSpecHeader, internal_chunk_bytes) ==
-      offsetof(nvcompBatchedCascadedCompressOpts_t, internal_chunk_bytes)
+      offsetof(CascadedFormatSpecHeader, common_opts) == offsetof(nvcompBatchedCascadedCompressOpts_t, common_opts)
     );
     static_assert(
-      offsetof(CascadedFormatSpecHeader, data_type) == offsetof(nvcompBatchedCascadedCompressOpts_t, data_type)
+      offsetof(CascadedFormatSpecHeader, compression_level) ==
+      offsetof(nvcompBatchedCascadedCompressOpts_t, compression_level)
     );
     static_assert(
-      offsetof(CascadedFormatSpecHeader, num_RLEs) == offsetof(nvcompBatchedCascadedCompressOpts_t, num_RLEs)
+      offsetof(CascadedFormatSpecHeader, fine_grained_encoding_flags) ==
+      offsetof(nvcompBatchedCascadedCompressOpts_t, fine_grained_encoding_flags)
     );
-    static_assert(
-      offsetof(CascadedFormatSpecHeader, num_deltas) == offsetof(nvcompBatchedCascadedCompressOpts_t, num_deltas)
-    );
-    static_assert(offsetof(CascadedFormatSpecHeader, use_bp) == offsetof(nvcompBatchedCascadedCompressOpts_t, use_bp));
   }
 
-  ~CascadedManagerImpl() {}
+  ~CascadedManagerImpl() noexcept {}
 };
 
+// C++ does not allow extern-template declarations through a type alias, so the
+// specialization's argument list must be repeated here.
 extern template struct ManagerBase<
   CascadedFormatSpecHeader,
   decltype(nvcompBatchedCascadedDecompressAsyncEx) *,
-  decltype(nvcompBatchedCascadedDecompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedCascadedDecompressGetTempSize) *,
   decltype(nvcompBatchedCascadedGetDecompressSizeAsync) *,
   decltype(nvcompBatchedCascadedCompressAsync) *,
-  decltype(nvcompBatchedCascadedCompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedCascadedCompressGetTempSize) *,
   decltype(nvcompBatchedCascadedCompressGetMaxOutputChunkSize) *,
   nvcompBatchedCascadedCompressOpts_t,
   nvcompBatchedCascadedDecompressOpts_t,
@@ -115,6 +112,7 @@ CascadedManager::CascadedManager(
   const nvcompBatchedCascadedDecompressOpts_t &decompress_opts,
   cudaStream_t user_stream,
   ChecksumPolicy checksum_policy,
+  ExecutionPolicy execution_policy,
   BitstreamKind bitstream_kind
 )
 {
@@ -124,10 +122,11 @@ CascadedManager::CascadedManager(
     decompress_opts,
     user_stream,
     checksum_policy,
+    execution_policy,
     bitstream_kind
   );
 }
 
-CascadedManager::~CascadedManager() {}
+CascadedManager::~CascadedManager() noexcept {}
 
 } // namespace nvcomp

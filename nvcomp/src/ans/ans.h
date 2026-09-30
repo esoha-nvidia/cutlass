@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA CORPORATION and its licensors retain all intellectual property
  * and proprietary rights in and to this software, related documentation
@@ -18,6 +18,25 @@
 
 namespace ans
 {
+
+inline uint8_t resolveDecompressStatesPerLane(
+  uint8_t decompress_states_per_lane,
+  uint8_t compress_states_per_lane,
+  [[maybe_unused]] nvcompType_t data_type
+)
+{
+  if (decompress_states_per_lane != 0)
+  {
+    return decompress_states_per_lane;
+  }
+  if (compress_states_per_lane != 0)
+  {
+    return compress_states_per_lane;
+  }
+  // Must mirror ans_default_states_per_lane(), which this cannot call: it lives in a .cuh
+  // and this header is consumed by host-only translation units.
+  return uint8_t{2};
+}
 
 /**
  * @brief Get temporary space required for compression.
@@ -39,24 +58,13 @@ void compressGetTempSize(
  * @brief Get the maximum size any chunk could compress to in the batch. That is, the minimum amount of output memory required to be given compressAsync() for each batch item.
  *
  * @param max_chunk_size The maximum size of a chunk in the batch.
+ * @param format_opts Compression options (data type, sub-chunk count, states per lane).
  * @param max_compressed_size The maximum compressed size of the largest chunk (output).
  */
-void compressGetMaxOutputChunkSize(size_t max_chunk_size, size_t *max_compressed_size);
-
-/**
- * @brief Launch parameters for the in-kernel (device) char-ANS compressor.
- *        Block width is 256 threads so it can run in the CUTLASS 128x128 SIMT CTA.
- */
-void compressGetDeviceLaunchParams(
-  size_t num_chunks,
-  size_t max_uncompressed_chunk_size,
+void compressGetMaxOutputChunkSize(
+  size_t max_chunk_size,
   nvcompBatchedANSCompressOpts_t format_opts,
-  cudaStream_t stream,
-  int *max_sub_chunk_size,
-  uint32_t *slot_words,
-  size_t *smem_bytes,
-  size_t *smem_alignment,
-  int *block_threads
+  size_t *max_compressed_size
 );
 
 /**
@@ -70,7 +78,7 @@ void compressGetDeviceLaunchParams(
  * @param temp_ptr The temporary GPU workspace.
  * @param temp_bytes The size of the temporary GPU workspace.
  * @param device_out_ptr The pointers on the GPU, to the output location for each compressed batch item (output).
- * Each pointer must be aligned to a 8-byte boundary.
+ * Each pointer must be aligned to a 16-byte boundary.
  * @param device_out_bytes The compressed size of each chunk on the GPU (output).
  * @param stream The stream to operate on.
  */
@@ -103,7 +111,7 @@ void decompressGetTempSize(size_t num_chunks, size_t max_uncompressed_chunk_size
  *
  * @param type The ANS compression algorithm type.
  * @param device_in_ptrs The pointers on the GPU, to the compressed chunks. Each compressed
- * chunk must be aligned to a 8-byte boundary.
+ * chunk must be aligned to a 16-byte boundary.
  * @param device_in_bytes The size of each compressed chunk on the GPU.
  * @param device_out_bytes The size of each uncompressed chunk buffer on the GPU.
  * @param device_actual_out_bytes The return sizes of each uncompressed chunk on the GPU.
@@ -113,8 +121,13 @@ void decompressGetTempSize(size_t num_chunks, size_t max_uncompressed_chunk_size
  * @param temp_bytes The size of the temporary GPU space.
  * @param device_out_ptrs The pointers on the GPU, to where to uncompress each chunk (output).
  * @param device_statuses The status of each chunk's decompression on the GPU (output).
- * @param max_sub_chunk_count The maximum number of sub-chunks per chunk.
- * @param data_type The ANS data type to decode (must match compression).
+ * @param max_sub_chunk_count The maximum number of sub-chunks per chunk. 0 uses whatever compression used.
+ * @param data_type The ANS data type to decode. NVCOMP_TYPE_BITS reads the type from the
+ *        bitstream, so any stream decodes; any other value must match it (CHAR == UCHAR).
+ * @param states_per_lane 0 (auto / self-describing), 1 (single stream), or 2 (two
+ *        interleaved streams). Must match the compressed bitstream when non-zero; used
+ *        to pick a specialized decompress kernel.
+ * @param skip_validate Nonzero skips per-chunk header/request checks.
  * @param stream The stream to operate on.
  *
  */
@@ -130,6 +143,8 @@ void decompressAsync(
   nvcompStatus_t *device_statuses,
   uint8_t max_sub_chunk_count,
   nvcompType_t data_type,
+  uint8_t states_per_lane,
+  uint8_t skip_validate,
   cudaStream_t stream
 );
 

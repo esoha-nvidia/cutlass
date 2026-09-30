@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA CORPORATION and its licensors retain all intellectual property
  * and proprietary rights in and to this software, related documentation
@@ -512,7 +512,7 @@ inline __device__ void storeBytes(uint8_t *outp, uint4 bytes, uint32_t cnt, uint
 #endif
 #endif
 
-template <bool check_bounds, bool should_output>
+template <bool should_output>
 __device__ void write_output(
   unsigned char *output,
   uint16_t sym,
@@ -528,14 +528,11 @@ __device__ void write_output(
   {
     return;
   }
-  if (check_bounds)
+  corrupted |= (active && (sym != 256)) ? (output + length > output_end_ptr) : false;
+  corrupted = (__any_sync(WARP_ALL, corrupted) != 0);
+  if (corrupted)
   {
-    corrupted |= (active && (sym != 256)) ? (output + length > output_end_ptr) : false;
-    corrupted = (__any_sync(WARP_ALL, corrupted) != 0);
-    if (corrupted)
-    {
-      return;
-    }
+    return;
   }
 
   bool isLiteral = (active && !isCopy && (sym < 256));
@@ -657,142 +654,7 @@ __device__ void write_output(
 #endif
 }
 
-template <bool check_bounds, bool should_output>
-__device__ void write_output_without_copies(
-  unsigned char *output,
-  uint16_t sym,
-  uint16_t length,
-  uint32_t distance,
-  bool isCopy,
-  bool active,
-  unsigned char *output_end_ptr,
-  uint32_t *copies,
-  bool &corrupted
-)
-{
-
-  if (!should_output)
-  {
-    return;
-  }
-  if (check_bounds)
-  {
-    corrupted |= (active && (sym != 256)) ? (output + length > output_end_ptr) : false;
-    corrupted = __shfl_sync(WARP_ALL, corrupted, 0);
-    if (corrupted)
-    {
-      return;
-    }
-  }
-  bool isLiteral = (active && !isCopy && (sym < 256));
-  uint4 buf = {0, 0, 0, 0};
-  uint16_t bytesCopied = 0;
-  if (isLiteral)
-  {
-    buf.x = (uint32_t)sym;
-    bytesCopied = 1;
-  }
-
-#ifdef IGNORE_COPIES
-  storeBytes(output, buf, bytesCopied, output_end_ptr, 0); //TODO reduce
-#else
-
-  // Independent copies
-  bool isIndependentMatch = false;
-  unsigned char *matchEndPtr = output - distance + 16; // Compute the distance of the match copy end
-  isIndependentMatch = isCopy && (matchEndPtr < output); // Check if match copy ends before the high water mark
-  // TODO: Add stricter condition to only check intersection with other matches in this CW
-  if (isIndependentMatch)
-  {
-    bytesCopied = min(length, 16); // we can only copy 16B max in one shot
-    buf = loadBytes(output - distance, bytesCopied); // Copy independent match data
-  }
-
-  // flush to the output stream - dense copy
-  uint16_t storeBytesToCopy = (isIndependentMatch || isLiteral) ? bytesCopied : 0;
-  storeBytes(output, buf, storeBytesToCopy, output_end_ptr, 0); //TODO reduce
-  __syncwarp();
-
-  // now process all pending matches cooperatively one-by-one, including tails of long independent copies
-  bool dependentMatch = isCopy && (!(isIndependentMatch) || (bytesCopied < length));
-  dependentMatch = __shfl_sync(WARP_ALL, dependentMatch, 0);
-  //TODO reduce
-  if (dependentMatch)
-  {
-    int tid = 0;
-    int currOffset = __shfl_sync(WARP_ALL, distance, tid); // Broadcast this distance
-    int currLength = __shfl_sync(WARP_ALL, length, tid); // Broadcast this length
-    int currBytesCopied = __shfl_sync(WARP_ALL, bytesCopied, tid); // Broadcast this bytesCopied
-    uint8_t *currDst = (uint8_t *)(__shfl_sync(WARP_ALL, (uintptr_t)(output), tid)); // Broadcast this output
-
-    // cooperatively copy data
-    uint8_t *currSrc = &currDst[0 - currOffset];
-    // for long independent matches (>16B) we already copied the first 16 bytes, skip those
-#ifdef VECTORIZED_DEPENDENT_COPIES
-    bool isNotLoopingMatch = (currOffset >= currLength);
-    if (isNotLoopingMatch)
-    {
-      // Use vectorized reads and writes for non looping matches
-      // Assign bytes evenly to each thread except thread 0 that
-      // handles the extra initial (up to 3) bytes until a word boundary
-      uint8_t *currSrcAligned = (uint8_t *)((size_t)(currSrc + 3) & ~(3)); // Get higher 4B aligned pointer
-      uint8_t unalignedBytes = (uint8_t)(currSrcAligned - currSrc);
-      int bytesPerThread = (currLength - currBytesCopied - unalignedBytes + WARP_SIZE - 1) / WARP_SIZE;
-      int start = currBytesCopied + threadIdx.x * bytesPerThread + ((threadIdx.x > 0) ? unalignedBytes : 0);
-      bytesPerThread += ((threadIdx.x == 0) ? unalignedBytes : 0);
-      int bytes = (start < currLength) ? min(bytesPerThread, currLength - start) : 0;
-      buf = loadBytes(currSrc + start, bytes);
-      storeBytes(currDst + start, buf, bytes, output_end_ptr, threadIdx.x);
-    }
-    else
-    {
-      for (int i = threadIdx.x + currBytesCopied; i < currLength; i += WARP_SIZE_U)
-      {
-        currDst[i] = currSrc[i % currOffset]; // take care of the overlapping copies with modulo
-      }
-    }
-#else // VECTORIZED_DEPENDENT_COPIES
-    if (currLength - currBytesCopied <= 32)
-    {
-      // Process "short" copies to avoid any additional logic
-      int i = threadIdx.x + currBytesCopied;
-      if (i < currLength)
-      {
-        currDst[i] = currSrc[i % currOffset]; // take care of the overlapping copies with modulo
-      }
-    }
-    else
-    {
-      // Branch for "long" copies
-      // Manually unrolled loop twice for better ILP
-      for (int i = threadIdx.x + currBytesCopied; i < currLength; i += 2 * WARP_SIZE_U)
-      {
-        uint8_t v1 = 0;
-        uint8_t v2 = 0;
-
-        // Load both values
-        v1 = currSrc[i % currOffset]; // take care of the overlapping copies with modulo
-        if (i + WARP_SIZE_U < currLength)
-        {
-          v2 = currSrc[(i + WARP_SIZE_U) % currOffset]; // take care of the overlapping copies with modulo
-        }
-
-        // Write to output
-        currDst[i] = v1;
-        if (i + WARP_SIZE_U < currLength)
-        {
-          currDst[i + WARP_SIZE_U] = v2;
-        }
-      }
-    }
-#endif // VECTORIZED_DEPENDENT_COPIES
-    __syncwarp();
-  }
-
-#endif
-}
-
-template <bool check_bounds, bool should_output, bool deflate64, typename Treader>
+template <bool should_output, bool deflate64, typename Treader>
 __device__ unsigned char *parse_symbols(
   unsigned char *output,
   unsigned char *output_end_ptr,
@@ -808,7 +670,7 @@ __device__ unsigned char *parse_symbols(
   gdeflate_trace *&trace
 )
 {
-  if (check_bounds && corrupted)
+  if (corrupted)
   {
     return nullptr;
   }
@@ -870,16 +732,8 @@ __device__ unsigned char *parse_symbols(
     outputptr += prefixSum(output_bytes, WARP_ALL);
 
     // Write literals and process copies
-    write_output<check_bounds, should_output>(
-      isCopy ? copyptr : outputptr,
-      sym,
-      length,
-      distance,
-      isCopy,
-      active,
-      output_end_ptr,
-      corrupted
-    );
+    write_output<
+      should_output>(isCopy ? copyptr : outputptr, sym, length, distance, isCopy, active, output_end_ptr, corrupted);
 
     // Save copy pointer for next decode step
     if (sym > 256)
@@ -889,13 +743,10 @@ __device__ unsigned char *parse_symbols(
 
     br.eat(numbits, active);
 
-    if (check_bounds)
+    corrupted |= br.is_corrupted();
+    if (corrupted)
     {
-      corrupted |= br.is_corrupted();
-      if (corrupted)
-      {
-        return nullptr;
-      }
+      return nullptr;
     }
 
 #ifdef GDEFLATE_LOG_TRACE
@@ -919,17 +770,14 @@ __device__ unsigned char *parse_symbols(
     uint16_t numbits = isCopy ? decode_distance<deflate64>(dist, bits, code, sym, distance) : 0;
 
     // Write literals and process copies
-    write_output<check_bounds, should_output>(copyptr, sym, length, distance, isCopy, isCopy, output_end_ptr, corrupted);
+    write_output<should_output>(copyptr, sym, length, distance, isCopy, isCopy, output_end_ptr, corrupted);
 
     br.eat(numbits, isCopy);
 
-    if (check_bounds)
+    corrupted |= br.is_corrupted();
+    if (corrupted)
     {
-      corrupted |= br.is_corrupted();
-      if (corrupted)
-      {
-        return nullptr;
-      }
+      return nullptr;
     }
 
 #ifdef GDEFLATE_LOG_TRACE
@@ -941,12 +789,12 @@ __device__ unsigned char *parse_symbols(
   return outputptr - 1; // Account for last thread adding 1
 }
 
-template <bool check_bounds, bool should_output, typename Treader>
+template <bool should_output, typename Treader>
 __device__ unsigned char *
 copy_uncompressed(unsigned char *output, unsigned char *output_end_ptr, Treader &br, uint32_t size, bool &corrupted)
 {
 
-  if (check_bounds && should_output && (output + size > output_end_ptr))
+  if (should_output && (output + size > output_end_ptr))
   {
     corrupted = true;
     return output + size;
@@ -975,15 +823,11 @@ copy_uncompressed(unsigned char *output, unsigned char *output_end_ptr, Treader 
     }
   }
 
-  if (check_bounds)
-  {
-    corrupted |= br.is_corrupted();
-  }
+  corrupted |= br.is_corrupted();
   return output + size;
 }
 
 template <
-  bool check_bounds = true,
   bool should_output = true,
   typename status_t = gdeflateStatus_t,
   status_t success = gdeflateSuccess,
@@ -1003,7 +847,7 @@ __device__ void decompress_tile(
   gdeflate_trace *trace
 )
 {
-  warp_bitreader<check_bounds, uint32_t> br(input, input + (input_size / sizeof(uint32_t)));
+  warp_bitreader<uint32_t> br(input, input + (input_size / sizeof(uint32_t)));
   uint32_t header, bfinal = 0, btype;
   bool tid0 = threadIdx.x == 0;
 #ifdef GDEFLATE_ENABLE_DEFLATE64
@@ -1055,7 +899,7 @@ __device__ void decompress_tile(
 
         read_lencodes(codelen, br, hclen, corrupted);
         unpack_codelens(codelen, hlit + hdist, br, codelen, counts, symbols, offset, basecode, corrupted);
-        output = parse_symbols<check_bounds, should_output, deflate64>(
+        output = parse_symbols<should_output, deflate64>(
           output,
           output_end_ptr,
           br,
@@ -1073,7 +917,7 @@ __device__ void decompress_tile(
       }
       case 1: {
         fixed_codelens(codelen);
-        output = parse_symbols<check_bounds, should_output, deflate64>(
+        output = parse_symbols<should_output, deflate64>(
           output,
           output_end_ptr,
           br,
@@ -1100,12 +944,12 @@ __device__ void decompress_tile(
 
         // Broadcast size to all other threads and copy data
         size = __shfl_sync(WARP_ALL, size, 0);
-        output = copy_uncompressed<check_bounds, should_output>(output, output_end_ptr, br, size, corrupted);
+        output = copy_uncompressed<should_output>(output, output_end_ptr, br, size, corrupted);
         break;
       }
     }
 
-    if (check_bounds && corrupted)
+    if (corrupted)
     {
       if (tid0)
       {
@@ -1113,10 +957,7 @@ __device__ void decompress_tile(
         {
           *decomp_status = failure;
         }
-        if (decomp_size)
-        {
-          *decomp_size = 0;
-        }
+        *decomp_size = 0;
       }
       return;
     }
@@ -1126,12 +967,8 @@ __device__ void decompress_tile(
   size_t decomp_size_reg = output - output_start_ptr;
   if (tid0)
   {
-    // if (check_bounds && decomp_size) *decomp_size = output - output_start_ptr;
-    if (check_bounds && decomp_size)
-    {
-      *decomp_size = decomp_size_reg;
-    }
-    if (check_bounds && should_output)
+    *decomp_size = decomp_size_reg;
+    if (should_output)
     {
       *decomp_status = success;
     }
@@ -1141,7 +978,6 @@ __device__ void decompress_tile(
 
 template <
   int WARPS_PER_CTA,
-  bool check_bounds = true,
   bool should_output = true,
   typename status_t = gdeflateStatus_t,
   status_t success = gdeflateSuccess,
@@ -1157,8 +993,6 @@ __launch_bounds__(WARP_SIZE *WARPS_PER_CTA) __global__ void gdeflateDecompress(
   gdeflate_trace *trace
 )
 {
-  static_assert(check_bounds || should_output, "gdeflateDecompress: either check_bounds or should_output must be true!");
-
   __shared__ uint16_t codelen[WARPS_PER_CTA][gdeflate_total_symbols_smem];
   __shared__ uint16_t symbols[WARPS_PER_CTA][gdeflate_total_symbols_smem];
   __shared__ uint16_t counts[WARPS_PER_CTA][32];
@@ -1169,7 +1003,7 @@ __launch_bounds__(WARP_SIZE *WARPS_PER_CTA) __global__ void gdeflateDecompress(
   unsigned int stride = gridDim.x * blockDim.y;
   for (unsigned int bid = block_id * blockDim.y + threadIdx.y; bid < num_streams; bid += stride)
   {
-    decompress_tile<check_bounds, should_output, status_t, success, failure>(
+    decompress_tile<should_output, status_t, success, failure>(
       data_ptr[bid],
       should_output ? dest_ptr[bid] : nullptr,
       (uint32_t)data_size[bid],
@@ -1179,8 +1013,8 @@ __launch_bounds__(WARP_SIZE *WARPS_PER_CTA) __global__ void gdeflateDecompress(
       counts[threadIdx.y],
       offset[threadIdx.y],
       basecode[threadIdx.y],
-      check_bounds ? decomp_size + bid : nullptr,
-      (check_bounds && should_output) ? decomp_status + bid : nullptr,
+      decomp_size + bid,
+      should_output ? decomp_status + bid : nullptr,
       trace
     );
   }
@@ -1209,7 +1043,7 @@ void gdeflateDecompressTemplatedWrapper(
   // NOTE(pgmerek): If this API is re-activated, we need to consider adding a device guard here
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, gdeflateDecompress<warpsPerSM>, threads, 0);
   cudaEventRecord(eventStart, stream);
-  gdeflateDecompress<warpsPerSM, false, true><<<grid, block, 0, stream>>>(
+  gdeflateDecompress<warpsPerSM><<<grid, block, 0, stream>>>(
     data_ptr,
     dest_ptr,
     data_size,

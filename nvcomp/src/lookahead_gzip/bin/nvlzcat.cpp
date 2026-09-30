@@ -270,9 +270,12 @@ public:
     {
       CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-      if (mode.getTempSize(&temp_bytes) != nvcompSuccess)
+      const nvcompStatus_t status = mode.getTempSize(&temp_bytes);
+      if (status != nvcompSuccess)
       {
-        throw std::runtime_error("Failed to determine required GPU memory");
+        throw std::runtime_error(
+          std::string("Failed to initialize streaming operation - ") + nvcompGetStatusString(status)
+        );
       }
 
       CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));

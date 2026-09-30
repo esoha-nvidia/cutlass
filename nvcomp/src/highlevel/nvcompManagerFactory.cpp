@@ -12,9 +12,14 @@
 
 #include "nvcomp/nvcompManagerFactory.hpp"
 
+#include <type_traits>
+#include <utility>
+
 #include "common.h"
+#include "common_utils.hpp"
 #include "CudaUtils.h"
 #include "exception.hpp"
+#include "Logging.h"
 #include "nvcomp.hpp"
 #include "nvcomp/ans.hpp"
 #include "nvcomp/bitcomp.hpp"
@@ -33,12 +38,27 @@
 namespace nvcomp
 {
 
+namespace
+{
+
+// TODO (cpp20): move this to concept
+template <typename DecompressOptsT, typename = void>
+constexpr bool HAS_ALGORITHM_FIELD = false;
+
+template <typename DecompressOptsT>
+constexpr bool HAS_ALGORITHM_FIELD<DecompressOptsT, std::void_t<decltype(std::declval<DecompressOptsT &>().algorithm)>> =
+  true;
+
+} // namespace
+
 template <typename FormatSpecHeader, typename ManagerType, typename OptsConvFn_t>
 std::shared_ptr<nvcompManagerBase> do_create_manager(
   const uint8_t *comp_buffer,
   ChecksumPolicy checksum_policy,
+  ExecutionPolicy execution_policy,
   OptsConvFn_t &&format_opts_fn,
   const CommonHeader &cpu_common_header,
+  const int algorithm,
   cudaStream_t stream
 )
 {
@@ -61,19 +81,40 @@ std::shared_ptr<nvcompManagerBase> do_create_manager(
     }
   }
 
+  if (!reserved_bytes_all_zero(format_spec.reserved))
+  {
+    throw NVCompException(nvcompErrorInvalidValue, "Invalid FormatSpec header: reserved bytes must be zero");
+  }
+
   auto [compress_opts, decompress_opts] = format_opts_fn(format_spec);
+  if constexpr (HAS_ALGORITHM_FIELD<decltype(decompress_opts)>)
+  {
+    decompress_opts.algorithm = static_cast<decltype(decompress_opts.algorithm)>(algorithm);
+  }
+  else if (algorithm != 0)
+  {
+    LOG_INFO("Algorithm field is not supported for this format, ignoring algorithm value: " + std::to_string(algorithm));
+  }
 
   return std::make_shared<ManagerType>(
     cpu_common_header.uncomp_chunk_size,
     compress_opts,
     decompress_opts,
     stream,
-    checksum_policy
+    checksum_policy,
+    execution_policy,
+    BitstreamKind::NVCOMP_NATIVE
   );
 }
 
 void get_common_header(const uint8_t *comp_buffer, cudaStream_t stream, CommonHeader *cpu_common_header)
 {
+  if (comp_buffer == nullptr)
+  {
+    throw NVCompException(nvcompErrorInvalidValue, "The passed compressed buffer is nullptr.");
+  }
+  check_buffer_alignment(comp_buffer, alignof(CommonHeader), "Compressed input");
+
   if (CudaUtils::is_host_pointer(reinterpret_cast<const void *>(comp_buffer)))
   {
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -97,8 +138,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
   const uint8_t *comp_buffer,
   cudaStream_t stream,
   ChecksumPolicy checksum_policy,
+  ExecutionPolicy execution_policy,
   nvcompDecompressBackend_t backend,
-  bool use_de_sort
+  bool use_de_sort,
+  int algorithm
 )
 {
   CommonHeader cpu_common_header;
@@ -108,30 +151,19 @@ std::shared_ptr<nvcompManagerBase> create_manager(
   {
     case nvcompFormatType_t::LZ4: {
       auto opts_fn = [backend, use_de_sort](auto format_spec) {
-        const uint8_t msb = format_spec.bytes[3];
-        nvcompBitshuffleMode_t mode = NVCOMP_BITSHUFFLE_NONE;
-        if ((msb & 0x80) && !(msb & 0x40))
-        {
-          mode = NVCOMP_BITSHUFFLE_LSB_FIRST;
-        }
-        else if ((msb & 0x40) && !(msb & 0x80))
-        {
-          mode = NVCOMP_BITSHUFFLE_MSB_FIRST;
-        }
-        // Clear the bitshuffle mask byte before getting the data type.
-        auto data_type_spec = format_spec;
-        data_type_spec.bytes[3] = 0;
-        const nvcompType_t data_type = data_type_spec.data_type;
-        nvcompBatchedLZ4CompressOpts_t compress_opts = {data_type, mode, {0}};
-        nvcompBatchedLZ4DecompressOpts_t decompress_opts = {backend, use_de_sort ? 1 : 0, data_type, mode, {0}};
+        nvcompBatchedLZ4CompressOpts_t compress_opts = {format_spec.data_type, format_spec.bitshuffle_mode, {0}};
+        nvcompBatchedLZ4DecompressOpts_t decompress_opts =
+          {backend, use_de_sort ? 1 : 0, format_spec.data_type, format_spec.bitshuffle_mode, {0}};
         return std::make_pair(compress_opts, decompress_opts);
       };
 
       return do_create_manager<LZ4FormatSpecHeader, LZ4Manager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -145,8 +177,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<GzipFormatSpecHeader, GzipManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -160,8 +194,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<SnappyFormatSpecHeader, SnappyManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -175,8 +211,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<GdeflateFormatSpecHeader, GdeflateManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -190,8 +228,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<DeflateFormatSpecHeader, DeflateManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -211,53 +251,61 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<BitcompFormatSpecHeader, BitcompManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
     case nvcompFormatType_t::ANS: {
-      // The format spec header in nvCOMP <= 5.2 was unused, and set to zero. Zero in > 5.2 (before major version bump),
-      // indicates default subchunk count and data type. (works with any buffer)
+      // A zeroed spec is the 6.0 default (rANS, CHAR, auto states_per_lane, default sub-chunk count of 8).
+      // ANS 6.0 compressed buffers are not compatible with earlier nvCOMP versions.
       auto opts_fn = [backend](auto format_spec) {
-        const uint8_t max_sub_chunk_count = format_spec.get_max_sub_chunk_count();
-        const nvcompType_t data_type = format_spec.get_data_type();
-        nvcompBatchedANSCompressOpts_t comp_opts = nvcompBatchedANSCompressDefaultOpts;
-        comp_opts.max_sub_chunk_count = max_sub_chunk_count;
-        comp_opts.data_type = data_type;
+        nvcompBatchedANSCompressOpts_t compress_opts{
+          format_spec.type,
+          format_spec.data_type,
+          format_spec.max_sub_chunk_count,
+          format_spec.states_per_lane,
+          format_spec.histogram_reduction_log2,
+          {0}
+        };
         nvcompBatchedANSDecompressOpts_t decomp_opts = nvcompBatchedANSDecompressDefaultOpts;
         decomp_opts.backend = backend;
-        decomp_opts.max_sub_chunk_count = max_sub_chunk_count;
-        decomp_opts.data_type = data_type;
-        return std::make_pair(comp_opts, decomp_opts);
+        decomp_opts.data_type = format_spec.data_type;
+        decomp_opts.max_sub_chunk_count = format_spec.max_sub_chunk_count;
+        decomp_opts.states_per_lane = format_spec.states_per_lane;
+        return std::make_pair(compress_opts, decomp_opts);
       };
       return do_create_manager<ANSFormatSpecHeader, ANSManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
     case nvcompFormatType_t::Cascaded: {
       auto opts_fn = [backend](auto format_spec) {
-        return std::make_pair(
-          nvcompBatchedCascadedCompressOpts_t{
-            format_spec.internal_chunk_bytes,
-            format_spec.data_type,
-            format_spec.num_RLEs,
-            format_spec.num_deltas,
-            format_spec.use_bp,
-            {0}
-          },
-          nvcompBatchedCascadedDecompressOpts_t{backend, {0}}
-        );
+        nvcompBatchedCascadedCompressOpts_t compress_opts = nvcompBatchedCascadedCompressDefaultOpts;
+        compress_opts.common_opts = format_spec.common_opts;
+        compress_opts.compression_level = format_spec.compression_level;
+        compress_opts.fine_grained_encoding_flags = format_spec.fine_grained_encoding_flags;
+
+        nvcompBatchedCascadedDecompressOpts_t decompress_opts = nvcompBatchedCascadedDecompressDefaultOpts;
+        decompress_opts.backend = backend;
+        decompress_opts.common_opts = format_spec.common_opts;
+        return std::make_pair(compress_opts, decompress_opts);
       };
       return do_create_manager<CascadedFormatSpecHeader, CascadedManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }
@@ -268,8 +316,10 @@ std::shared_ptr<nvcompManagerBase> create_manager(
       return do_create_manager<ZstdFormatSpecHeader, ZstdManager>(
         comp_buffer,
         checksum_policy,
+        execution_policy,
         opts_fn,
         cpu_common_header,
+        algorithm,
         stream
       );
     }

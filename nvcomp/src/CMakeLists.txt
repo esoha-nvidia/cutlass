@@ -110,6 +110,7 @@ cpmaddpackage(
   git
   apply
   "${nvcomp_SOURCE_DIR}/cmake/cccl-fix-undef.patch"
+  "${nvcomp_SOURCE_DIR}/cmake/cccl-fix-destructor-throw.patch"
   ||
   echo
   "Patch failed or reapplied")

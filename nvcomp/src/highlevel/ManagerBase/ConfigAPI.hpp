@@ -66,6 +66,12 @@ std::vector<size_t> HEAD::get_compressed_output_size(const uint8_t *const *comp_
   std::vector<size_t> output_sizes;
   output_sizes.reserve(batch_size);
 
+  const size_t required_alignment = get_required_decompression_alignments().input;
+  for (size_t idx = 0; idx < batch_size; ++idx)
+  {
+    check_buffer_alignment(comp_buffers[idx], required_alignment, "Compressed input");
+  }
+
   // Check if the compressed buffers are accessible on the host
   // Currently we are only checking if the array of pointers is accessible on the host, and also the very first pointer.
   // The rationale behind the first pointer in the array is that it is unlikely the user would provide a mixed array.
@@ -115,6 +121,12 @@ std::vector<size_t> HEAD::get_decompressed_output_size(const uint8_t *const *com
   std::vector<size_t> decompressed_output_sizes;
   decompressed_output_sizes.reserve(batch_size);
 
+  const size_t required_alignment = get_required_decompression_alignments().input;
+  for (size_t idx = 0; idx < batch_size; ++idx)
+  {
+    check_buffer_alignment(comp_buffers[idx], required_alignment, "Compressed input");
+  }
+
   // Check if the compressed buffers are accessible on the host
   // Currently we are only checking if the array of pointers is accessible on the host, and also the very first pointer.
   // The rationale behind the first pointer in the array is that it is unlikely the user would provide a mixed array.
@@ -156,8 +168,9 @@ CompressionConfig HEAD::configure_compression(const size_t uncomp_buffer_size)
   CompressionConfig comp_config{uncomp_buffer_size};
 
   comp_config.num_chunks = roundUpDiv(uncomp_buffer_size, uncomp_chunk_size);
-  comp_config.compute_checksums = (checksum_policy == ComputeAndNoVerify) || (checksum_policy == ComputeAndVerify) ||
-                                  (checksum_policy == ComputeAndVerifyIfPresent);
+  comp_config.compute_checksums = (checksum_policy == ChecksumPolicy::ComputeAndNoVerify) ||
+                                  (checksum_policy == ChecksumPolicy::ComputeAndVerify) ||
+                                  (checksum_policy == ChecksumPolicy::ComputeAndVerifyIfPresent);
 
   size_t max_comp_buff_size = 0;
   if (comp_config.num_chunks > 1)
@@ -234,7 +247,7 @@ DecompressionConfig HEAD::extract_decomp_config(const CommonHeader *common_heade
   if (!common_header->include_per_chunk_comp_buffer_checksums ||
       !common_header->include_per_chunk_decomp_buffer_checksums)
   {
-    if (checksum_policy == ComputeAndVerify)
+    if (checksum_policy == ChecksumPolicy::ComputeAndVerify)
     {
       throw NVCompException(
         nvcompErrorCannotVerifyChecksums,
@@ -261,6 +274,8 @@ DecompressionConfig HEAD::configure_decompression(const uint8_t *comp_buffer, co
   {
     return configure_decompression(&comp_buffer, 1, comp_size)[0];
   }
+
+  check_buffer_alignment(comp_buffer, get_required_decompression_alignments().input, "Decompression input");
   const CommonHeader *common_header = reinterpret_cast<const CommonHeader *>(comp_buffer);
 
   // Allocate the pinned host scratch (if necessary)
@@ -285,6 +300,11 @@ HEAD::configure_decompression(const uint8_t *const *comp_buffers, size_t batch_s
     }
 
     return decomp_configs;
+  }
+
+  for (size_t idx = 0; idx < batch_size; ++idx)
+  {
+    check_buffer_alignment(comp_buffers[idx], get_required_decompression_alignments().input, "Decompression input");
   }
 
   std::vector<DecompressionConfig> decomp_configs(batch_size);
@@ -321,13 +341,54 @@ HEAD::configure_decompression(const uint8_t *const *comp_buffers, size_t batch_s
       force_sync
     ));
 
+    // With ExecutionPolicy::Latency the buffer pointers the size kernel dereferences per chunk
+    // are staged in device memory, instead of being read over PCIe from pinned memory.
+    const bool stage_metadata_on_device = execution_policy == ExecutionPolicy::Latency;
+
+    const uint8_t **device_comp_buffers = nullptr;
+    size_t *device_uncomp_chunk_sizes = nullptr;
+    if (stage_metadata_on_device)
+    {
+      allocate_gpu_scratch(batch_size * (sizeof(const uint8_t *) + sizeof(size_t)) + alignof(size_t) - 1);
+
+      // Scratch memory layout
+      // [ Compressed buffer pointers (batch_size, const uint8_t*) ]
+      // [ Uncompressed chunk sizes (batch_size, size_t) ]
+      device_comp_buffers = reinterpret_cast<const uint8_t **>(roundUpToAlignment<size_t>(scratch_buffer));
+      device_uncomp_chunk_sizes = reinterpret_cast<size_t *>(device_comp_buffers + batch_size);
+
+      CUDA_CHECK(cudaMemcpyAsync(
+        device_comp_buffers,
+        pinned_comp_buffers,
+        batch_size * sizeof(const uint8_t *),
+        cudaMemcpyHostToDevice,
+        user_stream
+      ));
+    }
+
+    const uint8_t **kernel_comp_buffers = stage_metadata_on_device ? device_comp_buffers : pinned_comp_buffers;
+    size_t *kernel_uncomp_chunk_sizes = stage_metadata_on_device ? device_uncomp_chunk_sizes
+                                                                 : pinned_uncomp_chunk_sizes;
+
     ManagerBase::check<FnType::DecompressSize>(decomp_size_fn(
-      reinterpret_cast<const void *const *>(pinned_comp_buffers),
+      reinterpret_cast<const void *const *>(kernel_comp_buffers),
       comp_sizes,
-      pinned_uncomp_chunk_sizes,
+      kernel_uncomp_chunk_sizes,
       batch_size,
       user_stream
     ));
+
+    if (stage_metadata_on_device)
+    {
+      // Bring the sizes back so that the loop below is unchanged.
+      CUDA_CHECK(cudaMemcpyAsync(
+        pinned_uncomp_chunk_sizes,
+        device_uncomp_chunk_sizes,
+        batch_size * sizeof(size_t),
+        cudaMemcpyDeviceToHost,
+        user_stream
+      ));
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(user_stream));
 

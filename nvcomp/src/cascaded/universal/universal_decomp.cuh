@@ -29,23 +29,12 @@
 #pragma once
 
 #include "cascaded/composite/composite_decomp_kernels.cuh"
-#include "common.h"
 #include "CudaUtils.h"
 #include "exception.hpp"
 #include "lowlevel/Check.h"
-#include "nvcomp.h"
-#include "nvcomp/cascaded.h"
-#include "type_macros.h"
 #include "universal_header.cuh"
 
-using nvcomp::Check;
-using nvcomp::CudaUtils;
-using nvcomp::isAligned;
-using nvcomp::roundUpDiv;
-using nvcomp::roundUpTo;
-using nvcomp::roundUpToAlignment;
-
-namespace universal_header
+namespace nvcomp::cascaded::universal_header
 {
 
 __global__ void get_decompress_size_kernel(
@@ -58,7 +47,7 @@ __global__ void get_decompress_size_kernel(
   for (size_t ix_chunk = blockIdx.x * blockDim.x + threadIdx.x; ix_chunk < num_chunks;
        ix_chunk += gridDim.x * blockDim.x)
   {
-    if (device_compressed_bytes[ix_chunk] < universal_header::header_size_bytes)
+    if (device_compressed_bytes[ix_chunk] < universal_header::HEADER_SIZE_BYTES)
     {
       // The compressed buffer should always have enough space for metadata. If
       // not, we report error.
@@ -67,8 +56,31 @@ __global__ void get_decompress_size_kernel(
     else
     {
       const uint8_t *comp_buffer = reinterpret_cast<const uint8_t *>(device_compressed_ptrs[ix_chunk]);
-      device_uncompressed_bytes[ix_chunk] = universal_header::get_uncompressed_size(comp_buffer);
+      device_uncompressed_bytes[ix_chunk] = !universal_header::is_legacy_compressed(comp_buffer) &&
+                                                universal_header::has_supported_preamble(comp_buffer)
+                                              ? universal_header::get_uncompressed_size(comp_buffer)
+                                              : 0u;
     }
+  }
+}
+
+// Initialize the decompression outputs of every partition to not
+// decompressed.
+__global__ void initialize_decompression_outputs_kernel(
+  const size_t *device_compressed_bytes,
+  size_t *device_uncompressed_bytes, ///< [out]
+  nvcompStatus_t *device_statuses, ///< [out]
+  const size_t num_chunks
+)
+{
+  for (size_t ix_chunk = blockIdx.x * blockDim.x + threadIdx.x; ix_chunk < num_chunks;
+       ix_chunk += gridDim.x * blockDim.x)
+  {
+    composite::set_empty_chunk_outputs(
+      device_compressed_bytes[ix_chunk],
+      device_uncompressed_bytes[ix_chunk],
+      device_statuses[ix_chunk]
+    );
   }
 }
 
@@ -80,13 +92,20 @@ inline nvcompStatus_t GetDecompressSizeAsync(
   cudaStream_t stream
 )
 {
+  if (num_chunks == 0)
+  {
+    // An empty grid is an invalid launch configuration, and there are no sizes
+    // to report either way.
+    return nvcompSuccess;
+  }
+
   try
   {
-    constexpr int universal_get_decomp_size_threadblock_size = 128;
+    constexpr int GET_DECOMP_THREADBLOCK_SIZE = 128;
 
     get_decompress_size_kernel<<<
-      nvcomp::cuda_dim_cast(roundUpDiv(num_chunks, universal_get_decomp_size_threadblock_size)),
-      universal_get_decomp_size_threadblock_size,
+      nvcomp::cuda_dim_cast(roundUpDiv(num_chunks, GET_DECOMP_THREADBLOCK_SIZE)),
+      GET_DECOMP_THREADBLOCK_SIZE,
       0,
       stream>>>(
       device_compressed_chunk_ptrs,
@@ -123,18 +142,37 @@ nvcompStatus_t DecompressAsync(
   // TODO: pass decomp options into this function (already given in API)
   // TODO: let users prune the number of kernel calls down to what is necessary
 
+  if (num_chunks == 0)
+  {
+    // The batch size doubles as the grid size, and an empty grid is an invalid
+    // launch configuration. There is nothing to decompress either way.
+    return nvcompSuccess;
+  }
+
   try
   {
     // Just call kernel to perform compression. Macro for datatype happens
     // within kernel
-    constexpr int threadblock_size = composite::composite_decompress_threadblock_size;
+    constexpr int THREADBLOCK_SIZE = composite::composite_decompress_threadblock_size;
+
+    // Report every partition as not decompressed up front, so that partitions
+    // none of the launches below claims fail rather than being left
+    // uninitialized.
+    constexpr int INITIALIZE_OUTPUTS_THREADBLOCK_SIZE = 128;
+    initialize_decompression_outputs_kernel<<<
+      nvcomp::cuda_dim_cast(roundUpDiv(num_chunks, INITIALIZE_OUTPUTS_THREADBLOCK_SIZE)),
+      INITIALIZE_OUTPUTS_THREADBLOCK_SIZE,
+      0,
+      stream>>>(device_compressed_chunk_bytes, device_uncompressed_chunk_bytes, device_statuses, num_chunks);
+    CUDA_CHECK(cudaGetLastError());
 
     // call for all 4 possible sizes, all except the correct one will
     // immediately exit.
 
     // CHAR or UCHAR
-    composite::type_checked_composite_decompression_kernel<1, size_t, threadblock_size>
-      <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
+    composite::
+      type_checked_composite_decompression_kernel<1, size_t, THREADBLOCK_SIZE, /*SKIP_TYPE_MISMATCHED_BATCH=*/true>
+      <<<nvcomp::cuda_dim_cast(num_chunks), THREADBLOCK_SIZE, 0, stream>>>(
         nvcomp::narrow_cast<int>(num_chunks),
         device_compressed_chunk_ptrs,
         device_compressed_chunk_bytes,
@@ -146,8 +184,9 @@ nvcompStatus_t DecompressAsync(
     CUDA_CHECK(cudaGetLastError());
 
     // SHORT or USHORT
-    composite::type_checked_composite_decompression_kernel<2, size_t, threadblock_size>
-      <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
+    composite::
+      type_checked_composite_decompression_kernel<2, size_t, THREADBLOCK_SIZE, /*SKIP_TYPE_MISMATCHED_BATCH=*/true>
+      <<<nvcomp::cuda_dim_cast(num_chunks), THREADBLOCK_SIZE, 0, stream>>>(
         nvcomp::narrow_cast<int>(num_chunks),
         device_compressed_chunk_ptrs,
         device_compressed_chunk_bytes,
@@ -159,8 +198,9 @@ nvcompStatus_t DecompressAsync(
     CUDA_CHECK(cudaGetLastError());
 
     // INT or UINT
-    composite::type_checked_composite_decompression_kernel<4, size_t, threadblock_size>
-      <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
+    composite::
+      type_checked_composite_decompression_kernel<4, size_t, THREADBLOCK_SIZE, /*SKIP_TYPE_MISMATCHED_BATCH=*/true>
+      <<<nvcomp::cuda_dim_cast(num_chunks), THREADBLOCK_SIZE, 0, stream>>>(
         nvcomp::narrow_cast<int>(num_chunks),
         device_compressed_chunk_ptrs,
         device_compressed_chunk_bytes,
@@ -172,8 +212,9 @@ nvcompStatus_t DecompressAsync(
     CUDA_CHECK(cudaGetLastError());
 
     // LONGLONG or ULONGLONG
-    composite::type_checked_composite_decompression_kernel<8, size_t, threadblock_size>
-      <<<nvcomp::cuda_dim_cast(num_chunks), threadblock_size, 0, stream>>>(
+    composite::
+      type_checked_composite_decompression_kernel<8, size_t, THREADBLOCK_SIZE, /*SKIP_TYPE_MISMATCHED_BATCH=*/true>
+      <<<nvcomp::cuda_dim_cast(num_chunks), THREADBLOCK_SIZE, 0, stream>>>(
         nvcomp::narrow_cast<int>(num_chunks),
         device_compressed_chunk_ptrs,
         device_compressed_chunk_bytes,
@@ -193,4 +234,4 @@ nvcompStatus_t DecompressAsync(
   return nvcompSuccess;
 }
 
-} // namespace universal_header
+} // namespace nvcomp::cascaded::universal_header

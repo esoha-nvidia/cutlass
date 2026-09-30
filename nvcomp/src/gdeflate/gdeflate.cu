@@ -1,12 +1,14 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <thrust/scan.h>
 
@@ -142,10 +144,10 @@ __global__ void zeroOutput(
  * @param device_compressed_ptr The pointers on the GPU, to the compressed chunks.
  * @param device_compressed_bytes The size of each compressed chunk on the GPU.
  * @param device_uncompressed_bytes The size of each uncompressed chunk on the GPU (max available space).
- * @param device_actual_uncompressed_bytes Actual bytes of uncompressed chunk data. Can be set to nullptr to turn off bounds checking.
+ * @param device_actual_uncompressed_bytes Actual bytes of uncompressed chunk data.
  * @param batch_size The number of batch items.
  * @param device_uncompressed_ptr The pointers on the GPU, to where to uncompress each chunk (output).
- * @param device_statuses Pointer to per chunk decompression status (success or failure). Can be set to nullptr to turn off bounds checking.
+ * @param device_statuses Pointer to per chunk decompression status (success or failure).
  * @param stream The stream to operate on.
  *
  */
@@ -160,12 +162,6 @@ void decompressAsync(
   cudaStream_t stream
 )
 {
-
-  bool check_bounds = true;
-  if ((device_actual_uncompressed_bytes == nullptr) || (device_statuses == nullptr))
-  {
-    check_bounds = false;
-  }
 
 #ifndef SIMPLE_STORES
   // Zero out output buffer
@@ -184,33 +180,16 @@ void decompressAsync(
   dim3 block = {WARP_SIZE_U, warps_per_cta, 1};
 
   gdeflate_trace *trace = nullptr;
-  switch (check_bounds)
-  {
-    case true:
-      gdeflateDecompress<warps_per_cta><<<grid, block, 0, stream>>>(
-        (const uint32_t *const *)device_compressed_ptr,
-        (uint8_t *const *)device_uncompressed_ptr,
-        device_compressed_bytes,
-        device_uncompressed_bytes,
-        narrow_cast<unsigned int>(batch_size),
-        device_actual_uncompressed_bytes,
-        device_statuses,
-        trace
-      );
-      break;
-    case false:
-      gdeflateDecompress<warps_per_cta, false, true><<<grid, block, 0, stream>>>(
-        (const uint32_t *const *)device_compressed_ptr,
-        (uint8_t *const *)device_uncompressed_ptr,
-        device_compressed_bytes,
-        device_uncompressed_bytes,
-        narrow_cast<unsigned int>(batch_size),
-        device_actual_uncompressed_bytes,
-        device_statuses,
-        trace
-      );
-      break;
-  }
+  gdeflateDecompress<warps_per_cta><<<grid, block, 0, stream>>>(
+    reinterpret_cast<const uint32_t *const *>(device_compressed_ptr),
+    reinterpret_cast<uint8_t *const *>(device_uncompressed_ptr),
+    device_compressed_bytes,
+    device_uncompressed_bytes,
+    narrow_cast<unsigned int>(batch_size),
+    device_actual_uncompressed_bytes,
+    device_statuses,
+    trace
+  );
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -255,19 +234,15 @@ void getDecompressSizeAsync(
   auto grid = cuda_dim_cast(roundUpDiv(batch_size, warps_per_cta));
   dim3 block = {WARP_SIZE_U, warps_per_cta, 1};
 
-  uint8_t *const *device_uncompressed_ptr = nullptr;
-  const size_t *device_uncompressed_bytes = nullptr;
-  gdeflateStatus_t *device_statuses = nullptr;
-
   gdeflate_trace *trace = nullptr;
-  gdeflateDecompress<warps_per_cta, true, false><<<grid, block, 0, stream>>>(
-    (const uint32_t *const *)device_compressed_ptr,
-    device_uncompressed_ptr,
+  gdeflateDecompress<warps_per_cta, false, gdeflateStatus_t><<<grid, block, 0, stream>>>(
+    reinterpret_cast<const uint32_t *const *>(device_compressed_ptr),
+    nullptr, // device_uncompressed_ptr
     device_compressed_bytes,
-    device_uncompressed_bytes,
+    nullptr, // device_uncompressed_bytes
     narrow_cast<unsigned int>(batch_size),
     device_actual_uncompressed_bytes,
-    device_statuses,
+    nullptr, // device_statuses
     trace
   );
   CUDA_CHECK(cudaGetLastError());

@@ -151,21 +151,23 @@ nvcompStatus_t nvcompBatchedGzipDecompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedGzipDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGzipDecompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGzipDecompressOpts_t decompress_opts,
   size_t *const temp_bytes,
-  const size_t max_total_uncompressed_bytes
+  const size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream
 )
 {
   GZIP_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   GZIP_CHECK_DECOMPRESS_OPTS(decompress_opts);
@@ -189,7 +191,7 @@ nvcompStatus_t nvcompBatchedGzipDecompressGetTempSizeAsync(
     if (decompress_opts.algorithm == NVCOMP_GZIP_DECOMPRESS_ALGORITHM_LOOKAHEAD)
     {
       lookaheadGzipConfig_t config;
-      lookahead_gzip::LookaheadGzipOneshotClient::createConfig(num_chunks, nullptr, &config);
+      lookahead_gzip::LookaheadGzipOneshotClient::createConfig(num_chunks, stream, &config);
       lookahead_gzip::LookaheadGzipOneshotClient::decompressGetTempSize(&config, temp_bytes);
     }
     else
@@ -216,7 +218,7 @@ nvcompStatus_t nvcompBatchedGzipDecompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedGzipDecompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedGzipDecompressGetTempSize()");
   }
   return nvcompSuccess;
 }
@@ -241,12 +243,13 @@ nvcompStatus_t nvcompBatchedGzipDecompressGetTempSizeSync(
     return result;
   }
 
-  return nvcompBatchedGzipDecompressGetTempSizeAsync(
+  return nvcompBatchedGzipDecompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     decompress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
@@ -285,7 +288,9 @@ nvcompStatus_t nvcompBatchedGzipDecompressAsync(
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_ptrs);
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
 
   try
   {
@@ -370,6 +375,10 @@ nvcompStatus_t nvcompBatchedGzipDecompressAsyncEx(
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
   NVCOMP_CHECK_NOT_NULL(device_statuses);
+  if (temp_bytes > 0)
+  {
+    NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
+  }
 
   try
   {
@@ -578,14 +587,25 @@ nvcompStatus_t nvcompBatchedGzipCompressAsync(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedGzipCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGzipCompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGzipCompressOpts_t format_opts,
   size_t *temp_bytes,
-  [[maybe_unused]] size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
 )
 {
+  GZIP_LOG_WITH_COMPRESS_OPTS(
+    nvcomp::logBatchedCompressGetTempSize,
+    format_opts,
+    num_chunks,
+    max_uncompressed_chunk_bytes,
+    temp_bytes,
+    max_total_uncompressed_bytes,
+    stream
+  );
+
   GZIP_CHECK_COMPRESS_OPTS(format_opts);
   NVCOMP_CHECK_NOT_NULL(temp_bytes);
   NVCOMP_CHECK_ALIGNMENT(temp_bytes);
@@ -610,7 +630,7 @@ nvcompStatus_t nvcompBatchedGzipCompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedGzipCompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedGzipCompressGetTempSize()");
   }
 
   return nvcompSuccess;
@@ -624,15 +644,16 @@ nvcompStatus_t nvcompBatchedGzipCompressGetTempSizeSync(
   nvcompBatchedGzipCompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
-  [[maybe_unused]] cudaStream_t stream
+  cudaStream_t stream
 )
 {
-  return nvcompBatchedGzipCompressGetTempSizeAsync(
+  return nvcompBatchedGzipCompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     compress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 

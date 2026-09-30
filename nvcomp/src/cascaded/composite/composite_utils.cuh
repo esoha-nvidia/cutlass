@@ -28,23 +28,82 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+
 #include "cascaded/modules/bitpack.cuh"
 #include "cascaded/modules/delta.cuh"
 #include "cascaded/modules/rle.cuh"
+#include "composite_constants.cuh"
 #include "Reduction.cuh"
 
-using nvcomp::roundUpDiv;
-using nvcomp::roundUpTo;
-
-namespace composite
+namespace nvcomp::cascaded::composite
 {
+
+// Adaptive chunks have a fixed two-word prefix. The first word stores the
+// record size and two stage bitmaps; bit zero represents the first optional
+// stage. The RLE bitmap is a subset of the applied-stage bitmap, and an applied
+// stage without its RLE bit is a Delta stage. The second word stores the final
+// stream size.
+constexpr uint32_t ADAPTIVE_CHUNK_PREFIX_SIZE = 2u * sizeof(uint32_t);
+constexpr uint32_t ADAPTIVE_CHUNK_SIZE_MASK = 0xffffu;
+constexpr uint32_t ADAPTIVE_CHUNK_STAGES_SHIFT = 16u;
+constexpr uint32_t ADAPTIVE_CHUNK_STAGES_MASK = 0xffu;
+constexpr uint32_t ADAPTIVE_CHUNK_RLE_STAGES_SHIFT = 24u;
+
+struct AdaptiveCompressionOptions
+{
+  uint32_t num_RLEs;
+  uint32_t num_deltas;
+  bool use_bp;
+};
+
+template <typename data_type>
+inline __device__ void serialize_value(uint32_t *const destination, const data_type &value)
+{
+  memcpy(destination, &value, sizeof(data_type));
+}
+
+template <typename data_type>
+inline __device__ data_type deserialize_value(const uint32_t *const source)
+{
+  data_type value;
+  memcpy(&value, source, sizeof(data_type));
+  return value;
+}
+
+inline __device__ uint32_t
+pack_adaptive_chunk_size(const uint32_t chunk_size_bytes, const uint32_t applied_stages, const uint32_t rle_stages)
+{
+  assert(chunk_size_bytes <= ADAPTIVE_CHUNK_SIZE_MASK);
+  assert(applied_stages <= ADAPTIVE_CHUNK_STAGES_MASK);
+  assert((rle_stages & ~applied_stages) == 0u);
+  return chunk_size_bytes | (applied_stages << ADAPTIVE_CHUNK_STAGES_SHIFT) |
+         (rle_stages << ADAPTIVE_CHUNK_RLE_STAGES_SHIFT);
+}
+
+inline __device__ uint32_t get_adaptive_chunk_size(const uint32_t packed_chunk_size)
+{
+  return packed_chunk_size & ADAPTIVE_CHUNK_SIZE_MASK;
+}
+
+inline __device__ uint32_t get_adaptive_applied_stages(const uint32_t packed_chunk_size)
+{
+  return (packed_chunk_size >> ADAPTIVE_CHUNK_STAGES_SHIFT) & ADAPTIVE_CHUNK_STAGES_MASK;
+}
+
+inline __device__ uint32_t get_adaptive_rle_stages(const uint32_t packed_chunk_size)
+{
+  return (packed_chunk_size >> ADAPTIVE_CHUNK_RLE_STAGES_SHIFT) & ADAPTIVE_CHUNK_STAGES_MASK;
+}
 
 /**
  * Helper function to calculate the size in byte of the chunk metadata. The size
  * is guaranteed to be a multiple of the data type size, and a multiple of 4.
  */
 template <typename data_type>
-__device__ int get_chunk_metadata_size(int num_RLEs, int num_deltas)
+__device__ int get_chunk_metadata_size(const int num_RLEs, const int num_deltas)
 {
   const int chunk_metadata_size = roundUpTo(4 + 4 * (num_RLEs + 1), sizeof(data_type)) +
                                   roundUpTo(sizeof(data_type) * num_deltas, 4);
@@ -76,4 +135,4 @@ constexpr __device__ int compute_decompress_smem_size()
   return 64 + tot_elt_storage + tot_count_bytes + (4 * 8);
 }
 
-} // namespace composite
+} // namespace nvcomp::cascaded::composite

@@ -28,16 +28,21 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+
+#include "nvcomp/cascaded.h"
 #include "nvcomp/utils.hpp"
 
-namespace composite
+namespace nvcomp::cascaded::composite
 {
+// TODO (uhofmann): all those constexpr variables here have the wrong case
 
 constexpr int default_chunk_size = 4096;
 
 constexpr int max_chunk_metadata_size = 64;
 
-constexpr int max_num_rle_layers = 7;
+constexpr int MAX_NUM_RLE_LAYERS = 7;
 
 // Resulting function from rearranging the formula in "get_chunk_metadata_size"
 // to solve for the number of delta layers, given the max chunk metadata size and the number of RLE layers.
@@ -51,9 +56,40 @@ constexpr int get_max_num_delta_layers(int num_RLEs, int max_chunk_metadata_size
 
 // Since max number of RLE layers is 7, and max_chunk_metadata_size is 64,
 // the function get_max_num_delta_layers constrains the max number of delta layers to be 3, assuming the data has a maximum size of 8B.
-constexpr int max_num_delta_layers = get_max_num_delta_layers(max_num_rle_layers, max_chunk_metadata_size);
+constexpr int MAX_NUM_DELTA_LAYERS = get_max_num_delta_layers(MAX_NUM_RLE_LAYERS, max_chunk_metadata_size);
+
+// Maximum optional encoding stages considered by asymmetric Cascaded.
+constexpr uint32_t ADAPTIVE_MAX_NUM_STAGES = 8;
+
+struct AdaptiveStageCounts
+{
+  uint32_t num_RLEs;
+  uint32_t num_deltas;
+};
+
+/**
+ * @brief Map public Cascaded compress options to the RLE/Delta stage budget.
+ *
+ * Host-callable single source of truth for compressAsync and tests.
+ */
+inline AdaptiveStageCounts
+map_adaptive_stage_counts(const uint8_t compression_level, const uint64_t fine_grained_encoding_flags)
+{
+  const uint32_t adaptive_stages = std::min<uint32_t>(compression_level, ADAPTIVE_MAX_NUM_STAGES);
+  const bool use_rle = (fine_grained_encoding_flags & NVCOMP_CASCADED_FINE_GRAINED_ENCODING_RLE) != 0u;
+  const bool use_delta = (fine_grained_encoding_flags & NVCOMP_CASCADED_FINE_GRAINED_ENCODING_DELTA) != 0u;
+  if (use_rle && use_delta)
+  {
+    const uint32_t alternating_stages = std::min(adaptive_stages, static_cast<uint32_t>(2 * MAX_NUM_DELTA_LAYERS + 1));
+    return {(alternating_stages + 1) / 2, alternating_stages / 2};
+  }
+  return {
+    use_rle ? std::min(adaptive_stages, static_cast<uint32_t>(MAX_NUM_RLE_LAYERS)) : 0,
+    use_delta ? std::min(adaptive_stages, static_cast<uint32_t>(MAX_NUM_DELTA_LAYERS)) : 0
+  };
+}
 
 constexpr int composite_compress_threadblock_size = 128;
 constexpr int composite_decompress_threadblock_size = 128;
 
-} // namespace composite
+} // namespace nvcomp::cascaded::composite

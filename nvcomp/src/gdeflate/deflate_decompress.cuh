@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1120,13 +1120,13 @@ __device__ void init_distance_lut(inflate_state_s *s, int t)
 
 /// @brief WARP1: process symbols and output uncompressed stream
 template <bool should_output, bool CORRECTNESS_CHECK>
-__device__ void general_process_symbols(inflate_state_s *s, int t, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
+__device__ void
+general_process_symbols(inflate_state_s *s, int t, int *ix_output, DeflateCorrectnessChecker<CORRECTNESS_CHECK> *checker)
 {
   uint8_t *out = s->outmid;
   int batch = 0;
   bool end = false;
 
-  __shared__ int ix_output[WARP_SIZE]; //Could be reduced to uint16_t, if chunk_size <= 64KB
   ix_output[t] = 0;
   int seq_num = 0;
 
@@ -1428,7 +1428,7 @@ __device__ void prefetch_warp(volatile inflate_state_s *s, int t)
  * @param outputs Decompression status buffer per block
  * @param hdr_parser If nonzero, indicates that the compressed bitstream includes a GZIP header
  **/
-template <bool should_output = true, bool get_decomp_bytes = true, bool CORRECTNESS_CHECK = false>
+template <bool should_output = true, bool CORRECTNESS_CHECK = false>
 __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
   const void *const *__restrict__ device_compressed_ptr,
   const size_t *__restrict__ device_compressed_bytes,
@@ -1440,7 +1440,9 @@ __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
   bool hdr_parser
 )
 {
+  // TODO: investigate why having state_g instantiated after ix_output causes test failures on SM100 with CUDA 12.9
   __shared__ __align__(16) inflate_state_s state_g;
+  __shared__ int ix_output[WARP_SIZE];
 
   int t = threadIdx.x;
   int z = blockIdx.x;
@@ -1630,7 +1632,12 @@ __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
       else if (t < 2 * WARP_SIZE)
       {
         // WARP1: perform LZ77 using length and distance codes from WARP0
-        general_process_symbols<should_output, CORRECTNESS_CHECK>(state, t & (WARP_SIZE - 1), correctness_checker);
+        general_process_symbols<should_output, CORRECTNESS_CHECK>(
+          state,
+          t & (WARP_SIZE - 1),
+          ix_output,
+          correctness_checker
+        );
       }
 #if ENABLE_PREFETCH
       else if (t < 3 * WARP_SIZE)
@@ -1659,10 +1666,7 @@ __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
   // Output decompression status and length
   if (t == 0)
   {
-    if (get_decomp_bytes)
-    {
-      device_actual_uncompressed_bytes[z] = state->out - state->outbase;
-    }
+    device_actual_uncompressed_bytes[z] = state->out - state->outbase;
 
     // Can happen even if no OOB accesses occurred, since bitbuf is still 64 bits.
     if (state->err == deflateSuccess && state->cur + ((state->bitpos + 7) >> 3) > state->end)
@@ -1671,7 +1675,7 @@ __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
       state->err = deflateErrorCannotDecompress;
     }
     else if (should_output && state->err == deflateSuccess &&
-             (!get_decomp_bytes || device_actual_uncompressed_bytes[z] > device_uncompressed_bytes[z]))
+             device_actual_uncompressed_bytes[z] > device_uncompressed_bytes[z])
     {
       // Output buffer too small
       // Error should have been caught already by correctness checker
@@ -1688,7 +1692,7 @@ __global__ void __launch_bounds__(NUMTHREADS) inflate_kernel(
     {
       state->err = deflateErrorCannotDecompress;
     }
-    if (device_statuses != nullptr)
+    if constexpr (should_output)
     {
       device_statuses[z] = state->err;
     }

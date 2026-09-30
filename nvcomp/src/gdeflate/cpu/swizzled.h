@@ -1,12 +1,14 @@
 /*
- * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #pragma once
 
@@ -14,8 +16,11 @@
 #include <vector>
 
 #include "deflate.h"
+#include "gdeflate/common.h"
 #include "gdeflate/gdeflate_constants.h"
 
+namespace nvcomp
+{
 namespace gdeflate
 {
 
@@ -68,7 +73,7 @@ class swizzler
 
   void add_bits(unsigned int bits, unsigned int nbits)
   {
-    bitbuf[idx] |= static_cast<uint64_t>(bits & mask<unsigned int>(nbits)) << bitcount[idx];
+    bitbuf[idx] |= static_cast<uint64_t>(bits & ::gdeflate::mask<unsigned int>(nbits)) << bitcount[idx];
     bitcount[idx] += nbits;
     input_bitcount[idx] -= nbits;
     if (bitcount[idx] >= static_cast<int>(PACKET_BITS))
@@ -207,7 +212,7 @@ public:
   {
     write_prev_round_copies();
     add_bits(bits, len + xlen);
-    if (sym >= gdeflate_literal_symbols)
+    if (sym >= ::gdeflate::gdeflate_literal_symbols)
     {
       copies[idx].round = round;
     }
@@ -221,7 +226,7 @@ public:
   void dist(unsigned int /*i*/, unsigned int bits, unsigned int len, unsigned int xlen, unsigned int /*sym*/)
   {
     unsigned int lane = (idx + N - 1) % N;
-    copies[lane].bits = bits & mask<unsigned int>(len + xlen);
+    copies[lane].bits = bits & ::gdeflate::mask<unsigned int>(len + xlen);
     copies[lane].nbits = len + xlen;
   }
 
@@ -243,3 +248,4 @@ public:
 };
 
 } // namespace gdeflate
+} // namespace nvcomp

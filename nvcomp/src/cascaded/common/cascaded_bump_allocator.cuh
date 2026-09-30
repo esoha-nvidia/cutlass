@@ -15,11 +15,10 @@
 #include <cassert>
 #include <cstdint>
 
-namespace cascaded
-{
+#include "CudaConstants.h"
 
-// TODO: remove this, use constant created by other MR
-constexpr uint32_t WARP_SIZE = 32;
+namespace nvcomp::cascaded
+{
 
 // =============================================================================
 // Bump allocator for variable-length writes with a contiguous header table.
@@ -294,4 +293,4 @@ __device__ __forceinline__ bool warp_bump_pop(BumpReader &reader, BumpPopResult 
   return false;
 }
 
-} // namespace cascaded
+} // namespace nvcomp::cascaded

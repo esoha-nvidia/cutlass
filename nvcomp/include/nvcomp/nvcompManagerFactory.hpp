@@ -36,8 +36,12 @@ namespace nvcomp
  *                        The buffer can be either in host or device memory.
  * @param[in] stream The CUDA stream to perform the operation on.
  * @param[in] checksum_policy The checksum policy to use.
+ * @param[in] execution_policy Setting to configure whether the manager favors kernel
+ *                             latency or concurrency with other device work.
  * @param[in] backend The backend (CUDA / hardware decompress engine) to use.
  * @param[in] use_de_sort Whether to sort before hardware decompression for load balancing (for LZ4, Snappy, Deflate, and Gzip).
+ * @param[in] algorithm The decompression algorithm to use when the format's
+ *                      decompression options support selecting an algorithm.
  *
  * @return The constructed manager instance.
  */
@@ -45,9 +49,11 @@ NVCOMP_EXPORT
 std::shared_ptr<nvcompManagerBase> create_manager(
   const uint8_t *comp_buffer,
   cudaStream_t stream = 0,
-  ChecksumPolicy checksum_policy = NoComputeNoVerify,
+  ChecksumPolicy checksum_policy = ChecksumPolicy::NoComputeNoVerify,
+  ExecutionPolicy execution_policy = ExecutionPolicy::Concurrency,
   nvcompDecompressBackend_t backend = NVCOMP_DECOMPRESS_BACKEND_DEFAULT,
-  bool use_de_sort = false
+  bool use_de_sort = false,
+  int algorithm = 0
 );
 
 /**

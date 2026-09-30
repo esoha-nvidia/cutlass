@@ -71,8 +71,9 @@ void HEAD::compress(
   size_t *comp_size
 )
 {
-  ManagerBase::check_buffer_alignment(uncomp_buffer, compress_alignment.input, "Compression input");
-  ManagerBase::check_buffer_alignment(comp_buffer, compress_alignment.output, "Compression output");
+  const nvcompAlignmentRequirements_t required_alignments = get_required_compression_alignments();
+  check_buffer_alignment(uncomp_buffer, required_alignments.input, "Compression input");
+  check_buffer_alignment(comp_buffer, required_alignments.output, "Compression output");
 
   if (bitstream_kind == BitstreamKind::NVCOMP_NATIVE)
   {
@@ -96,11 +97,12 @@ void HEAD::compress(
 )
 {
   size_t batch_count = comp_configs.size();
+  const nvcompAlignmentRequirements_t required_alignments = get_required_compression_alignments();
 
   for (size_t idx = 0; idx < batch_count; ++idx)
   {
-    ManagerBase::check_buffer_alignment(uncomp_buffers[idx], compress_alignment.input, "Compression input");
-    ManagerBase::check_buffer_alignment(comp_buffers[idx], compress_alignment.output, "Compression output");
+    check_buffer_alignment(uncomp_buffers[idx], required_alignments.input, "Compression input");
+    check_buffer_alignment(comp_buffers[idx], required_alignments.output, "Compression output");
   }
 
   // Check if the compression configuration is the same across all batches
@@ -153,8 +155,9 @@ void HEAD::decompress(
   size_t *comp_size
 )
 {
-  ManagerBase::check_buffer_alignment(comp_buffer, decompress_alignment.input, "Decompression input");
-  ManagerBase::check_buffer_alignment(decomp_buffer, decompress_alignment.output, "Decompression output");
+  const nvcompAlignmentRequirements_t required_alignments = get_required_decompression_alignments();
+  check_buffer_alignment(comp_buffer, required_alignments.input, "Decompression input");
+  check_buffer_alignment(decomp_buffer, required_alignments.output, "Decompression output");
 
   if (bitstream_kind == BitstreamKind::NVCOMP_NATIVE)
   {
@@ -190,10 +193,15 @@ void HEAD::decompress(
   const uint8_t *const *host_comp_buffers
 )
 {
+  const nvcompAlignmentRequirements_t required_alignments = get_required_decompression_alignments();
   for (size_t idx = 0; idx < batch_count; ++idx)
   {
-    ManagerBase::check_buffer_alignment(comp_buffers[idx], decompress_alignment.input, "Decompression input");
-    ManagerBase::check_buffer_alignment(decomp_buffers[idx], decompress_alignment.output, "Decompression output");
+    check_buffer_alignment(comp_buffers[idx], required_alignments.input, "Decompression input");
+    check_buffer_alignment(decomp_buffers[idx], required_alignments.output, "Decompression output");
+    if (host_comp_buffers != nullptr)
+    {
+      check_buffer_alignment(host_comp_buffers[idx], required_alignments.input, "Host decompression input");
+    }
   }
 
   //Check if the decompression configurations for all the batches are the same.

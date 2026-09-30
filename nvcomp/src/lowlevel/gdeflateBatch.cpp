@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2017-2021, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cassert>
 #include <iostream>
@@ -190,21 +174,23 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGdeflateDecompressOpts_t decompress_opts,
   size_t *const temp_bytes,
-  const size_t max_total_uncompressed_bytes
+  const size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
 )
 {
   GDEFLATE_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   GDEFLATE_CHECK_DECOMPRESS_OPTS(decompress_opts);
@@ -219,7 +205,7 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedGdeflateDecompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedGdeflateDecompressGetTempSize()");
   }
 
   return nvcompSuccess;
@@ -245,12 +231,13 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressGetTempSizeSync(
     return result;
   }
 
-  return nvcompBatchedGdeflateDecompressGetTempSizeAsync(
+  return nvcompBatchedGdeflateDecompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     decompress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
@@ -258,13 +245,13 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressAsync(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,
   const size_t *device_uncompressed_buffer_bytes,
-  size_t *device_uncompressed_chunk_bytes, // optional
+  size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
   void *const device_temp_ptr, // unused, except for logging
   size_t temp_bytes, // unused, except for logging
   void *const *device_uncompressed_chunk_ptrs,
   nvcompBatchedGdeflateDecompressOpts_t decompress_opts,
-  nvcompStatus_t *device_statuses, // optional
+  nvcompStatus_t *device_statuses,
   cudaStream_t stream
 )
 {
@@ -291,11 +278,13 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressAsync(
   NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
-  if ((device_uncompressed_chunk_bytes == nullptr) != (device_statuses == nullptr))
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
+  if (temp_bytes > 0)
   {
-    LOG_ERROR("Both device_uncompressed_chunk_bytes and device_statuses should be valid or nullptr");
-    return nvcompErrorInvalidValue;
+    NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
   }
+
   GDEFLATE_CHECK_DECOMPRESS_OPTS(decompress_opts);
 
   // Check device pointer alignment
@@ -334,10 +323,7 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressAsync(
     );
 
     // Launch a kernel to convert the output statuses
-    if (gdeflate_device_statuses)
-    {
-      nvcomp::convertGdeflateOutputStatuses(device_statuses, num_chunks, stream);
-    }
+    nvcomp::convertGdeflateOutputStatuses(device_statuses, num_chunks, stream);
   }
   catch (const std::exception &e)
   {
@@ -367,13 +353,13 @@ nvcompStatus_t nvcompBatchedGdeflateDecompressAsyncEx(
     device_compressed_chunk_ptrs,
     device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
-    device_uncompressed_chunk_bytes, // optional
+    device_uncompressed_chunk_bytes,
     num_chunks,
-    device_temp_ptr, // unused, except for logging
-    temp_bytes, // unused, except for logging
+    device_temp_ptr,
+    temp_bytes,
     device_uncompressed_chunk_ptrs,
     decompress_opts,
-    device_statuses, // optional
+    device_statuses,
     stream
   );
 }
@@ -451,21 +437,23 @@ nvcompStatus_t nvcompBatchedGdeflateCompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
   nvcompBatchedGdeflateCompressOpts_t format_opts,
   size_t *const temp_bytes,
-  const size_t max_total_uncompressed_bytes
-) // unused, except for logging
+  const size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
+)
 {
   GDEFLATE_LOG_WITH_COMPRESS_OPTS(
-    nvcomp::logBatchedCompressGetTempSizeAsync,
+    nvcomp::logBatchedCompressGetTempSize,
     format_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
   GDEFLATE_CHECK_COMPRESS_OPTS(format_opts);
 
@@ -482,7 +470,7 @@ nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedGdeflateCompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedGdeflateCompressGetTempSize()");
   }
   return nvcompSuccess;
 }
@@ -495,21 +483,22 @@ nvcompStatus_t nvcompBatchedGdeflateCompressGetTempSizeSync(
   nvcompBatchedGdeflateCompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
-  [[maybe_unused]] cudaStream_t stream
+  cudaStream_t stream
 )
 {
-  return nvcompBatchedGdeflateCompressGetTempSizeAsync(
+  return nvcompBatchedGdeflateCompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     compress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
 nvcompStatus_t nvcompBatchedGdeflateCompressGetMaxOutputChunkSize(
   size_t max_uncompressed_chunk_bytes,
-  nvcompBatchedGdeflateCompressOpts_t format_opts, // unused, except for logging
+  nvcompBatchedGdeflateCompressOpts_t format_opts,
   size_t *max_compressed_chunk_bytes
 )
 {

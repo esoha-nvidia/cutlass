@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -41,6 +41,8 @@ static constexpr uint32_t LOG2_WARP_SIZE = 5;
 //       More: https://en.cppreference.com/w/c/language/conversion
 static constexpr int32_t WARP_SIZE = 1 << LOG2_WARP_SIZE;
 static constexpr uint32_t WARP_SIZE_U = 1u << LOG2_WARP_SIZE;
+static constexpr int32_t HALF_WARP_SIZE = WARP_SIZE / 2;
+static constexpr uint32_t HALF_WARP_SIZE_U = WARP_SIZE_U / 2u;
 // Mask that indicates the participation of all threads within the warp
 static constexpr uint32_t WARP_ALL = 0xffffffff;
 

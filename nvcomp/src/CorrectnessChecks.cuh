@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -798,7 +798,7 @@ public:
    * during decompression.
    * @param line_number The line number where the check is performed.
    * @param function_name The name of the function where the check is performed.
-   * @param status Pointer to the nvcompStatus_t variable to update in case of
+   * @param status Reference to the nvcompStatus_t variable to update in case of
    * error.
    * @param checker The checker instance to update.
    */
@@ -807,7 +807,7 @@ public:
     const uint32_t actual_output_size,
     const int line_number,
     const char *function_name,
-    nvcompStatus_t *status,
+    nvcompStatus_t &status,
     SnappyCorrectnessChecker<CORRECTNESS_CHECK> *checker
   )
   {
@@ -826,7 +826,7 @@ public:
         );
         if (checker->getThreadRank() == 0)
         {
-          *status = nvcompErrorCannotDecompress;
+          status = nvcompErrorCannotDecompress;
         }
         mapperExit(checker);
       }

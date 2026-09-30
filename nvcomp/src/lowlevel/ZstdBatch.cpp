@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cassert>
 #include <iostream>
@@ -61,7 +45,14 @@ constexpr const char *zstd_decompress_opts_format_str = "{{backend={:d}}}";
 #define ZSTD_LOG_WITH_DECOMPRESS_OPTS(log_func, opts, ...)                                                             \
   ZSTD_WITH_TRAILING_DECOMPRESS_OPTS_ARGS(log_func, opts, __func__, __VA_ARGS__, zstd_decompress_opts_format_str)
 
+#define ZSTD_CHECK_COMPRESS_OPTS(opts) NVCOMP_WRAP_CHECK_FUNC(check_compress_opts, opts)
+
 #define ZSTD_CHECK_DECOMPRESS_OPTS(opts) NVCOMP_WRAP_CHECK_FUNC(check_decompress_opts, opts)
+
+nvcompStatus_t check_compress_opts([[maybe_unused]] const nvcompBatchedZstdCompressOpts_t &opts)
+{
+  return nvcompSuccess;
+}
 
 nvcompStatus_t check_decompress_opts(const nvcompBatchedZstdDecompressOpts_t &opts)
 {
@@ -133,21 +124,23 @@ nvcompStatus_t nvcompBatchedZstdDecompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedZstdDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedZstdDecompressGetTempSize(
   size_t num_chunks,
-  size_t max_uncompressed_chunk_bytes, // unused, except for logging
+  size_t max_uncompressed_chunk_bytes,
   nvcompBatchedZstdDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream // unused, except for logging
 )
 {
   ZSTD_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   // Error check inputs
@@ -166,7 +159,7 @@ nvcompStatus_t nvcompBatchedZstdDecompressGetTempSizeAsync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedZstdDecompressGetTempSizeAsync()");
+    return Check::exception_to_error(e, "nvcompBatchedZstdDecompressGetTempSize()");
   }
 
   return nvcompSuccess;
@@ -176,10 +169,10 @@ nvcompStatus_t nvcompBatchedZstdDecompressGetTempSizeSync(
   const void *const *const device_compressed_chunk_ptrs,
   const size_t *const device_compressed_chunk_bytes, // unused, except for logging
   size_t num_chunks,
-  size_t max_uncompressed_chunk_bytes, // unused, except for logging
+  size_t max_uncompressed_chunk_bytes,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes, // unused, except for logging
-  nvcompBatchedZstdDecompressOpts_t decompress_opts, // unused, except for logging
+  nvcompBatchedZstdDecompressOpts_t decompress_opts,
   nvcompStatus_t *device_statuses,
   cudaStream_t stream
 )
@@ -358,76 +351,29 @@ nvcompStatus_t nvcompBatchedZstdCompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedZstdCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedZstdCompressGetTempSize(
   const size_t num_chunks,
   const size_t max_uncompressed_chunk_bytes,
-  [[maybe_unused]] const nvcompBatchedZstdCompressOpts_t compress_opts,
-  size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
-)
-{
-  nvcomp::logBatchedCompressGetTempSizeAsync(
-    __func__,
-    num_chunks,
-    max_uncompressed_chunk_bytes,
-    temp_bytes,
-    max_total_uncompressed_bytes
-  );
-
-  NVCOMP_CHECK_NOT_NULL(temp_bytes);
-  NVCOMP_CHECK_ALIGNMENT(temp_bytes);
-  NVCOMP_CHECK_CHUNK_SIZE(max_uncompressed_chunk_bytes, nvcompZstdCompressionMaxAllowedChunkSize);
-
-  try
-  {
-    int device_id;
-    CUDA_CHECK(cudaGetDevice(&device_id));
-    *temp_bytes = zstd::compress_compute_temp_size(
-      num_chunks,
-      max_uncompressed_chunk_bytes,
-      max_total_uncompressed_bytes,
-      CudaUtils::get_sm_count(device_id)
-    );
-  }
-  catch (const std::exception &e)
-  {
-    LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, "nvcompBatchedZstdCompressGetTempSizeAsync()");
-  }
-
-  return nvcompSuccess;
-}
-
-nvcompStatus_t nvcompBatchedZstdCompressGetTempSizeSync(
-  [[maybe_unused]] const void *const *const device_uncompressed_chunk_ptrs,
-  [[maybe_unused]] const size_t *const device_uncompressed_chunk_bytes,
-  size_t num_chunks,
-  size_t max_uncompressed_chunk_bytes,
-  [[maybe_unused]] nvcompBatchedZstdCompressOpts_t compress_opts,
+  const nvcompBatchedZstdCompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
   cudaStream_t stream
 )
 {
-  nvcomp::logApi(
+  nvcomp::logBatchedCompressGetTempSize(
     __func__,
-    "d_uncomp_ptrs={:#x}, d_uncomp_bytes={:#x}, num_chunks={}, max_uncomp_chunk_bytes={}, "
-    "temp_bytes={:#x}, max_total_uncomp_bytes={}, stream={:#x}",
-    reinterpret_cast<uintptr_t>(device_uncompressed_chunk_ptrs),
-    reinterpret_cast<uintptr_t>(device_uncompressed_chunk_bytes),
     num_chunks,
     max_uncompressed_chunk_bytes,
-    reinterpret_cast<uintptr_t>(temp_bytes),
+    temp_bytes,
     max_total_uncompressed_bytes,
-    reinterpret_cast<uintptr_t>(stream)
+    stream
   );
 
+  ZSTD_CHECK_COMPRESS_OPTS(compress_opts);
   NVCOMP_CHECK_NOT_NULL(temp_bytes);
   NVCOMP_CHECK_ALIGNMENT(temp_bytes);
   NVCOMP_CHECK_CHUNK_SIZE(max_uncompressed_chunk_bytes, nvcompZstdCompressionMaxAllowedChunkSize);
 
-  // Use the stream's SM count so callers on a green context stream receive a
-  // correctly-sized (smaller) temp buffer rather than the full-device upper bound.
   try
   {
     *temp_bytes = zstd::compress_compute_temp_size(
@@ -440,10 +386,31 @@ nvcompStatus_t nvcompBatchedZstdCompressGetTempSizeSync(
   catch (const std::exception &e)
   {
     LOG_ERROR("{}", e.what());
-    return Check::exception_to_error(e, __func__);
+    return Check::exception_to_error(e, "nvcompBatchedZstdCompressGetTempSize()");
   }
 
   return nvcompSuccess;
+}
+
+nvcompStatus_t nvcompBatchedZstdCompressGetTempSizeSync(
+  [[maybe_unused]] const void *const *const device_uncompressed_chunk_ptrs,
+  [[maybe_unused]] const size_t *const device_uncompressed_chunk_bytes,
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedZstdCompressOpts_t compress_opts,
+  size_t *temp_bytes,
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
+)
+{
+  return nvcompBatchedZstdCompressGetTempSize(
+    num_chunks,
+    max_uncompressed_chunk_bytes,
+    compress_opts,
+    temp_bytes,
+    max_total_uncompressed_bytes,
+    stream
+  );
 }
 
 nvcompStatus_t nvcompBatchedZstdCompressGetMaxOutputChunkSize(
@@ -509,10 +476,8 @@ nvcompStatus_t nvcompBatchedZstdDecompressAsync(
     NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
   }
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
-  // Note:
-  // In contrast to other decompressors, Zstd does not have checks for the absence of
-  // `device_uncompressed_chunk_bytes`, and hence it must be supplied.
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
 
   ZSTD_CHECK_DECOMPRESS_OPTS(decompress_opts);
 
@@ -591,7 +556,7 @@ nvcompStatus_t nvcompBatchedZstdDecompressAsyncEx(
 {
   return nvcompBatchedZstdDecompressAsync(
     device_compressed_chunk_ptrs,
-    device_compressed_chunk_bytes, // unused, except for logging
+    device_compressed_chunk_bytes,
     device_uncompressed_buffer_bytes,
     device_uncompressed_chunk_bytes,
     num_chunks,

@@ -1,30 +1,14 @@
 /*
- * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *  * Neither the name of NVIDIA CORPORATION nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+*/
 
 #include <cuda/std/cmath>
 
@@ -62,22 +46,7 @@ constexpr const char *bitcomp_decompress_opts_format_str = "{{backend={:d}}}";
 
 #define BITCOMP_CHECK_DECOMPRESS_OPTS(opts) NVCOMP_WRAP_CHECK_FUNC(check_decompress_opts, opts)
 
-double round_effective_delta(const double supplied_delta)
-{
-  return bitcomp::utilities::zeroMantissaBits(supplied_delta);
-}
-
-template <typename T>
-T convert_effective_delta(const double supplied_delta)
-{
-  return static_cast<T>(round_effective_delta(supplied_delta));
-}
-
-template <>
-half convert_effective_delta<half>(const double supplied_delta)
-{
-  return __double2half(round_effective_delta(supplied_delta));
-}
+using bitcomp::utilities::convert_effective_delta;
 
 template <typename T>
 bool valid_lossy_delta(const double supplied_delta)
@@ -457,13 +426,13 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsync(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes, // unused, except for logging
   const size_t *device_uncompressed_buffer_bytes,
-  size_t *device_uncompressed_chunk_bytes, // optional, to be used with device_status
+  size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
   void *const device_temp_ptr,
   size_t temp_bytes, // unused, except for logging
   void *const *device_uncompressed_chunk_ptrs,
   nvcompBatchedBitcompDecompressOpts_t decompress_opts,
-  nvcompStatus_t *device_statuses, // optional
+  nvcompStatus_t *device_statuses,
   cudaStream_t stream
 )
 {
@@ -486,11 +455,8 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsync(
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
   NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
-  if ((device_uncompressed_chunk_bytes == nullptr) != (device_statuses == nullptr))
-  {
-    LOG_ERROR("Both device_uncompressed_chunk_bytes and device_statuses should be valid or nullptr");
-    return nvcompErrorInvalidValue;
-  }
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
   BITCOMP_CHECK_DECOMPRESS_OPTS(decompress_opts);
 
   // Check device pointer alignment
@@ -499,11 +465,7 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsync(
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_ptrs);
   NVCOMP_CHECK_ALIGNMENT(device_statuses);
-
-  if (device_temp_ptr != nullptr)
-  {
-    NVCOMP_CHECK_ALIGNMENT(device_temp_ptr, alignof(batchCompInfo_t));
-  }
+  NVCOMP_CHECK_ALIGNMENT(device_temp_ptr, alignof(batchCompInfo_t));
 
   // Batch size is used as grid size, which CUDA limits to 2^31 - 1
   NVCOMP_CHECK_BATCH_SIZE(num_chunks, std::numeric_limits<int>::max());
@@ -549,12 +511,12 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsync(
 
 nvcompStatus_t nvcompBatchedBitcompDecompressAsyncEx(
   const void *const *device_compressed_chunk_ptrs,
-  const size_t *device_compressed_chunk_bytes, // not used
+  const size_t *device_compressed_chunk_bytes, // unused, except for logging
   const size_t *device_uncompressed_buffer_bytes,
   size_t *device_uncompressed_chunk_bytes,
   size_t num_chunks,
-  void *const device_temp_ptr, // not used
-  size_t temp_bytes, // not used
+  void *const device_temp_ptr,
+  size_t temp_bytes, // unused, except for logging
   void *const *device_uncompressed_chunk_ptrs,
   nvcompStatus_t *device_statuses,
   nvcompBatchedBitcompCompressOpts_t compress_opts,
@@ -582,11 +544,8 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsyncEx(
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
   NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
-  if ((device_uncompressed_chunk_bytes == nullptr) != (device_statuses == nullptr))
-  {
-    LOG_ERROR("Both device_uncompressed_chunk_bytes and device_statuses should be valid or nullptr");
-    return nvcompErrorInvalidValue;
-  }
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_statuses);
   BITCOMP_CHECK_COMPRESS_OPTS(compress_opts);
   BITCOMP_CHECK_DECOMPRESS_OPTS(decompress_opts);
 
@@ -595,7 +554,6 @@ nvcompStatus_t nvcompBatchedBitcompDecompressAsyncEx(
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_buffer_bytes);
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_bytes);
   NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_ptrs);
-  NVCOMP_CHECK_ALIGNMENT(device_statuses);
   NVCOMP_CHECK_ALIGNMENT(device_statuses);
 
   LOG_INFO("Launching SM decompression");
@@ -716,20 +674,22 @@ nvcompStatus_t nvcompBatchedBitcompCompressGetRequiredAlignments(
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompBatchedBitcompCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedBitcompCompressGetTempSize(
   size_t num_chunks, // unused, except for logging
   size_t max_uncompressed_chunk_bytes, // unused, except for logging
   nvcompBatchedBitcompCompressOpts_t format_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
-) // unused, except for logging
+  size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
+)
 {
-  nvcomp::logBatchedCompressGetTempSizeAsync(
+  nvcomp::logBatchedCompressGetTempSize(
     __func__,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
     max_total_uncompressed_bytes,
+    stream,
     bitcomp_compress_opts_format_str,
     static_cast<int>(format_opts.algorithm),
     static_cast<int>(format_opts.data_type),
@@ -755,33 +715,36 @@ nvcompStatus_t nvcompBatchedBitcompCompressGetTempSizeSync(
   nvcompBatchedBitcompCompressOpts_t compress_opts,
   size_t *temp_bytes,
   size_t max_total_uncompressed_bytes,
-  [[maybe_unused]] cudaStream_t stream
+  cudaStream_t stream
 )
 {
-  return nvcompBatchedBitcompCompressGetTempSizeAsync(
+  return nvcompBatchedBitcompCompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     compress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }
 
-nvcompStatus_t nvcompBatchedBitcompDecompressGetTempSizeAsync(
-  size_t num_chunks,
+nvcompStatus_t nvcompBatchedBitcompDecompressGetTempSize(
+  size_t num_chunks, // unused, except for logging
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedBitcompDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  [[maybe_unused]] size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes, // unused, except for logging
+  cudaStream_t stream // unused, except for logging
 )
 {
   BITCOMP_LOG_WITH_DECOMPRESS_OPTS(
-    nvcomp::logBatchedDecompressGetTempSizeAsync,
+    nvcomp::logBatchedDecompressGetTempSize,
     decompress_opts,
     num_chunks,
     max_uncompressed_chunk_bytes,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 
   BITCOMP_CHECK_DECOMPRESS_OPTS(decompress_opts);
@@ -813,11 +776,12 @@ nvcompStatus_t nvcompBatchedBitcompDecompressGetTempSizeSync(
     return result;
   }
 
-  return nvcompBatchedBitcompDecompressGetTempSizeAsync(
+  return nvcompBatchedBitcompDecompressGetTempSize(
     num_chunks,
     max_uncompressed_chunk_bytes,
     decompress_opts,
     temp_bytes,
-    max_total_uncompressed_bytes
+    max_total_uncompressed_bytes,
+    stream
   );
 }

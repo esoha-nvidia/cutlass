@@ -16,8 +16,129 @@
 #include "nvcomp.h"
 
 #ifdef __cplusplus
+#include <cstdint>
+#else
+#include <stdint.h>
+#endif // __cplusplus
+
+#ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief Selects the Cascaded compression mode.
+ */
+typedef enum nvcompCascadedMode_t
+{
+  /**
+   * @brief Cascaded common options are not specified.
+   *
+   * This value is only valid for decompression. An unspecified mode maximizes
+   * decompression support at the cost of decompression performance.
+   */
+  NVCOMP_CASCADED_MODE_UNSPECIFIED = 0u,
+  /**
+   * @brief Select adaptive asymmetric Cascaded compression.
+   */
+  NVCOMP_CASCADED_MODE_ASYMMETRIC = 1u,
+  /**
+   * @brief Select Terminal Cascaded compression and matching decompression.
+   *
+   * Supports signed and unsigned 32- and 64-bit integer types.
+   */
+  NVCOMP_CASCADED_MODE_SYMMETRIC = 2u
+} nvcompCascadedMode_t;
+
+/**
+ * @brief Terminal codecs considered during compression and supported during
+ * decompression.
+ *
+ * Values may be combined as a bit mask using bitwise OR. An enabled codec is
+ * considered by the compressor, but is not guaranteed to be used.
+ *
+ * NVCOMP_CASCADED_TERMINAL_CODEC_UNSPECIFIED is invalid for compression and
+ * for decompression when the mode is specified. It is ignored when the mode is
+ * NVCOMP_CASCADED_MODE_UNSPECIFIED.
+ *
+ * During decompression, the mask identifies the terminal codecs that may have
+ * been used to produce the input. If an input uses a terminal codec not included
+ * in this mask, decompression reports `nvcompErrorCannotDecompress` for that
+ * input.
+ */
+typedef enum
+{
+  NVCOMP_CASCADED_TERMINAL_CODEC_UNSPECIFIED = 0u,
+  NVCOMP_CASCADED_TERMINAL_CODEC_CASCADED_BITPACK = 1u << 0u
+} nvcompCascadedTerminalCodec_t;
+
+/**
+ * @brief Fine-grained encodings considered when Cascaded bitpacking is used as
+ * the terminal codec.
+ *
+ * Values may be combined as a bit mask using bitwise OR. For example,
+ * NVCOMP_CASCADED_FINE_GRAINED_ENCODING_DELTA | NVCOMP_CASCADED_FINE_GRAINED_ENCODING_RLE
+ * enables both encodings.
+ *
+ * Asymmetric mode currently requires
+ * NVCOMP_CASCADED_FINE_GRAINED_ENCODING_FOR to be enabled. In symmetric mode,
+ * Frame Of Reference encoding is optional.
+ */
+typedef enum nvcompCascadedFineGrainedEncoding_t
+{
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_NONE = 0u,
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_DELTA = 1u << 0u,
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_RLE = 1u << 1u,
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_FOR = 1u << 2u,
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_ALL = NVCOMP_CASCADED_FINE_GRAINED_ENCODING_DELTA |
+                                              NVCOMP_CASCADED_FINE_GRAINED_ENCODING_RLE |
+                                              NVCOMP_CASCADED_FINE_GRAINED_ENCODING_FOR
+} nvcompCascadedFineGrainedEncoding_t;
+
+/**
+ * @brief Coarse-grained encodings considered during compression and supported
+ * during decompression for the complete input stream.
+ *
+ * No coarse-grained encodings are currently supported.
+ */
+typedef enum nvcompCascadedCoarseGrainedEncoding_t
+{
+  NVCOMP_CASCADED_COARSE_GRAINED_ENCODING_NONE = 0u
+} nvcompCascadedCoarseGrainedEncoding_t;
+
+/**
+ * @brief Cascaded options required by compression and optionally used to narrow
+ * decompression support.
+ *
+ * Providing these options allows nvCOMP to improve decompression performance by
+ * only launching decompression implementations that are required by the input.
+ * If \p mode is NVCOMP_CASCADED_MODE_UNSPECIFIED, the remaining fields are
+ * ignored to maximize decompression support.
+ */
+typedef struct
+{
+  /**
+   * @brief The logical data type of the input.
+   *
+   * Asymmetric mode supports signed and unsigned 8-, 16-, 32-, and 64-bit
+   * integer types. Symmetric mode supports signed and unsigned 32- and 64-bit
+   * integer types. This field is ignored during universal decompression.
+   */
+  nvcompType_t data_type;
+  /**
+   * @brief The Cascaded mode used for compression and decompression.
+   */
+  nvcompCascadedMode_t mode;
+  /**
+   * @brief Mask of terminal codecs considered during compression or supported
+   * during decompression.
+   */
+  uint64_t terminal_codec_flags;
+  /**
+   * @brief Mask of coarse-grained encodings considered during compression or
+   * supported during decompression.
+   */
+  uint64_t coarse_grained_encoding_flags;
+} nvcompCascadedCommonOpts_t;
 
 /**
  * @brief Cascaded compression options for the low-level API
@@ -25,37 +146,28 @@ extern "C" {
 typedef struct
 {
   /**
-   * @brief The size of each internal chunk of data to decompress independently with
+   * @brief Options that may also be provided during decompression to improve
+   * performance.
+   */
+  nvcompCascadedCommonOpts_t common_opts;
+  /**
+   * @brief Mask of fine-grained encodings to consider.
+   */
+  uint64_t fine_grained_encoding_flags;
+  /**
+   * @brief Balances compression throughput and compression ratio.
    *
-   * Cascaded compression. The value should be in the range of [512, 16384]
-   * depending on the datatype of the input and the shared memory size of
-   * the GPU being used.  This is not the size of chunks passed into the API.
-   * Recommended size is 4096.
-   *
-   * @note Not currently used and a default of 4096 is just used.
+   * In asymmetric mode, higher levels consider more optional encoding stages.
+   * The current maximum useful level is 7, or 3 when only Delta is enabled.
+   * Higher values select the highest supported level. Symmetric mode currently
+   * ignores this option. The default is 3.
    */
-  size_t internal_chunk_bytes;
-  /**
-   * @brief The datatype used to define the bit-width for compression
-   */
-  nvcompType_t data_type;
-  /**
-   * @brief The number of Run Length Encodings to perform.
-   */
-  int num_RLEs;
-  /**
-   * @brief The number of Delta Encodings to perform.
-   */
-  int num_deltas;
-  /**
-   * @brief Whether or not to bitpack the final layers.
-   */
-  int use_bp;
+  uint8_t compression_level;
   /**
    * @brief These bytes are unused and must be zeroed. This ensures
    *        compatibility if additional fields are added in the future.
    */
-  char reserved[40];
+  char reserved[31];
 } nvcompBatchedCascadedCompressOpts_t;
 
 /**
@@ -68,23 +180,43 @@ typedef struct
    */
   nvcompDecompressBackend_t backend;
   /**
+   * @brief Options to narrow decompression support in favor of performance.
+   *
+   * Set \p common_opts.mode to NVCOMP_CASCADED_MODE_UNSPECIFIED to maximize
+   * decompression support.
+   */
+  nvcompCascadedCommonOpts_t common_opts;
+  /**
    * @brief These bytes are unused and must be zeroed. This ensures
    *        compatibility if additional fields are added in the future.
    */
-  char reserved[60];
+  char reserved[32];
 } nvcompBatchedCascadedDecompressOpts_t;
 
 /**
  * @brief Default Cascaded compression options
  */
-static const nvcompBatchedCascadedCompressOpts_t nvcompBatchedCascadedCompressDefaultOpts =
-  {4096, NVCOMP_TYPE_INT, 2, 1, 1, {0}};
+static const nvcompBatchedCascadedCompressOpts_t nvcompBatchedCascadedCompressDefaultOpts = {
+  {NVCOMP_TYPE_UINT,
+   NVCOMP_CASCADED_MODE_ASYMMETRIC,
+   NVCOMP_CASCADED_TERMINAL_CODEC_CASCADED_BITPACK,
+   NVCOMP_CASCADED_COARSE_GRAINED_ENCODING_NONE},
+  NVCOMP_CASCADED_FINE_GRAINED_ENCODING_ALL,
+  3u,
+  {0}
+};
 
 /**
  * @brief Default Cascaded decompression options
  */
-static const nvcompBatchedCascadedDecompressOpts_t nvcompBatchedCascadedDecompressDefaultOpts =
-  {NVCOMP_DECOMPRESS_BACKEND_DEFAULT, {0}};
+static const nvcompBatchedCascadedDecompressOpts_t nvcompBatchedCascadedDecompressDefaultOpts = {
+  NVCOMP_DECOMPRESS_BACKEND_DEFAULT,
+  {NVCOMP_TYPE_BITS,
+   NVCOMP_CASCADED_MODE_UNSPECIFIED,
+   NVCOMP_CASCADED_TERMINAL_CODEC_UNSPECIFIED,
+   NVCOMP_CASCADED_COARSE_GRAINED_ENCODING_NONE},
+  {0}
+};
 
 /**
  * @brief The maximum supported uncompressed chunk size in bytes for the Cascaded compressor.
@@ -125,10 +257,9 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for compression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for compression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks The number of chunks of memory in the batch.
  * @param[in] max_uncompressed_chunk_bytes The maximum size of a chunk in the
@@ -139,15 +270,18 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetRequiredAlignments(
  * @param[in] max_total_uncompressed_bytes Upper bound on the total uncompressed
  * size of all chunks
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedCascadedCompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedCascadedCompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedCascadedCompressOpts_t compress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -233,7 +367,8 @@ nvcompStatus_t nvcompBatchedCascadedCompressGetMaxOutputChunkSize(
  * sizes of the uncompressed chunks in bytes.
  * The sizes should reside in device-accessible memory.
  * Each chunk size must be a multiple of the size of the data type specified by
- * compress_opts.data_type, else this may crash or produce invalid output.
+ * compress_opts.common_opts.data_type, else this may crash or produce invalid
+ * output.
  * @param[in] max_uncompressed_chunk_bytes The size of the largest uncompressed chunk.
  * This parameter is currently unused. Set it to either the actual value
  * or zero.
@@ -305,10 +440,9 @@ nvcompStatus_t nvcompBatchedCascadedDecompressGetRequiredAlignments(
 );
 
 /**
- * @brief Get the amount of temporary memory required on the GPU for decompression
- * asynchronously.
+ * @brief Get the amount of temporary memory required on the GPU for decompression.
  *
- * @note This function does not interact with the device, its result can be used immediately.
+ * @note This function does not enqueue asynchronous work on the stream; its result can be used immediately.
  *
  * @param[in] num_chunks Number of chunks of data to be decompressed.
  * @param[in] max_uncompressed_chunk_bytes The size of the largest chunk in bytes
@@ -318,15 +452,18 @@ nvcompStatus_t nvcompBatchedCascadedDecompressGetRequiredAlignments(
  * during decompression. The value is returned on the host side.
  * @param[in] max_total_uncompressed_bytes The total decompressed size of all the chunks.
  *
+ * @param[in] stream The CUDA stream associated with the operation.
+ *
  * @return nvcompSuccess if successful, and an error code otherwise.
  */
 NVCOMP_EXPORT
-nvcompStatus_t nvcompBatchedCascadedDecompressGetTempSizeAsync(
+nvcompStatus_t nvcompBatchedCascadedDecompressGetTempSize(
   size_t num_chunks,
   size_t max_uncompressed_chunk_bytes,
   nvcompBatchedCascadedDecompressOpts_t decompress_opts,
   size_t *temp_bytes,
-  size_t max_total_uncompressed_bytes
+  size_t max_total_uncompressed_bytes,
+  cudaStream_t stream
 );
 
 /**
@@ -415,6 +552,9 @@ nvcompStatus_t nvcompBatchedCascadedGetDecompressSizeAsync(
  * This function is used to decompress compressed buffers produced by
  * \ref nvcompBatchedCascadedCompressAsync.
  *
+ * @note All compressed buffers in a batch must use data types with the same
+ * element width; mixed-width batches are not supported.
+ *
  * @warning Violating any of the conditions listed in the parameter descriptions
  * below may result in undefined behaviour.
  *
@@ -439,7 +579,7 @@ nvcompStatus_t nvcompBatchedCascadedGetDecompressSizeAsync(
  * overflow chunk to `nvcompErrorCannotDecompress`.
  * @param[out] device_uncompressed_chunk_bytes Array with size \p num_chunks to
  * be filled with the actual number of bytes decompressed for every chunk.
- * This argument needs to be preallocated.
+ * This argument needs to be preallocated in device-accessible memory.
  * @param[in] num_chunks Number of chunks of data to decompress.
  * @param[in] device_temp_ptr This argument is not used.
  * @param[in] temp_bytes This argument is not used.

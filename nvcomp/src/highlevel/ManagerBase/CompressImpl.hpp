@@ -28,10 +28,13 @@
 
 #pragma once
 
+#include <algorithm>
+
 // Out-of-line member-function definitions for the ManagerBase class template.
 // Included at the bottom of ManagerBase.hpp; included here as well so this file
 // is self-contained, but it cannot be used without the ManagerBase declaration.
 
+#include "common_utils.hpp"
 #include "highlevel/ManagerBase.hpp"
 
 namespace nvcomp
@@ -69,41 +72,16 @@ void HEAD::init_format_spec()
   // Make sure the size of FormatSpecHeader is always less than the CompressOpts_t,
   // otherwise the memcpy wont be correct and the compressed buffer header will be inaccurate
   static_assert(sizeof(FormatSpecHeader) <= sizeof(CompressOpts_t));
-  // We need to make sure the order of members in FormatSpecHeader and CompressOpts_t are the same,
-  // otherwise this wont work.
-  std::memcpy(&format_spec, &(this->format_opts), sizeof(format_spec));
 
-  // If format_spec is LZ4FormatSpecHeader, additionally store the bitshuffle information in byte[3]:
-  // MSB is LSB_FIRST, next MSB is MSB_FIRST bitshuffle mode
-  if constexpr (std::is_same_v<FormatSpecHeader, LZ4FormatSpecHeader>)
-  {
-    // The previous memcpy would have correctly copied the data_type to the header,
-    // so now we need to store the bitshuffle information in byte[3].
-    unsigned char bits = 0;
-    // If bitshuffle_mode == NVCOMP_BITSHUFFLE_LSB_FIRST (as defined in nvcompBitshuffleMode_t), set MSB of byte[3]
-    if (format_opts.bitshuffle_mode == NVCOMP_BITSHUFFLE_LSB_FIRST)
-    {
-      bits |= 0x80; // Set MSB
-    }
-    // If bitshuffle_mode == NVCOMP_BITSHUFFLE_MSB_FIRST, set the next MSB of byte[3]
-    if (format_opts.bitshuffle_mode == NVCOMP_BITSHUFFLE_MSB_FIRST)
-    {
-      bits |= 0x40; // Set bit index 6
-    }
-    // Store into the header
-    format_spec.bytes[3] |= bits;
-  }
+  // Zero the whole header first so the reserved bytes stay clear and are never
+  // accidentally filled from CompressOpts beyond the matching FormatSpec prefix.
+  std::memset(&format_spec, 0, sizeof(format_spec));
 
-  if constexpr (std::is_same_v<FormatSpecHeader, ANSFormatSpecHeader>)
-  {
-    // ANSFormatSpecHeader packs max_sub_chunk_count and data_type into one byte
-    // (not matching the front of the compress opts), so the front-memcpy above
-    // didn't capture them. Reset (clears the reserved bits the memcpy may have left)
-    // and set them explicitly
-    format_spec.reserved = 0;
-    format_spec.set_max_sub_chunk_count(format_opts.max_sub_chunk_count);
-    format_spec.set_data_type(format_opts.data_type);
-  }
+  // Copy only the active FormatSpec prefix; reserved bytes remain zero from memset.
+  // Member order of that prefix must match CompressOpts_t.
+  std::memcpy(&format_spec, &(this->format_opts), offsetof(FormatSpecHeader, reserved));
+
+  assert(reserved_bytes_all_zero(format_spec.reserved));
 }
 
 TEMPLATE
@@ -605,6 +583,19 @@ void HEAD::compress_raw_batched(
   // Get maximum scratch requirement for compression
   size_t compress_scratch_req = compute_lowlevel_compress_scratch_size(batch_size, max_uncomp_size);
 
+  // With ExecutionPolicy::Latency the pointer / size / status arrays that the codec kernel
+  // dereferences per chunk are staged in device memory.
+  const bool stage_metadata_on_device = execution_policy == ExecutionPolicy::Latency;
+  if (stage_metadata_on_device)
+  {
+    compress_scratch_req +=
+      batch_size * sizeof(size_t) + // Uncompressed sizes
+      batch_size * sizeof(const uint8_t *) + // Uncompressed buffer pointers
+      batch_size * sizeof(uint8_t *) + // Compressed buffer pointers
+      roundUpTo(batch_size * sizeof(nvcompStatus_t), sizeof(size_t)) + // Compression statuses (aligned)
+      min_alignment - 1; // Worst case alignment bytes
+  }
+
   // Worst case alignment bytes
   compress_scratch_req += min_alignment - 1;
 
@@ -612,14 +603,44 @@ void HEAD::compress_raw_batched(
   allocate_gpu_scratch(compress_scratch_req);
 
   // Scratch memory layout
+  // - for ExecutionPolicy::Latency:
+  //   [ Uncompressed sizes (batch_size, size_t) ]
+  //   [ Uncompressed buffer pointers (batch_size, const uint8_t*) ]
+  //   [ Compressed buffer pointers (batch_size, uint8_t*) ]
+  //   [ Compression statuses (batch_size, nvcompStatus_t) ]
+  //
   // [ Compression scratch for the entire batch (bytes) ]
   uint8_t *free_scratch_buffer =
     reinterpret_cast<uint8_t *>(roundUpTo(reinterpret_cast<uintptr_t>(scratch_buffer), min_alignment));
+
+  size_t *device_uncomp_sizes = nullptr;
+  const uint8_t **device_uncomp_buffers = nullptr;
+  uint8_t **device_comp_buffers = nullptr;
+  nvcompStatus_t *device_comp_statuses = nullptr;
+  if (stage_metadata_on_device)
+  {
+    device_uncomp_sizes = reinterpret_cast<size_t *>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(size_t);
+
+    device_uncomp_buffers = reinterpret_cast<const uint8_t **>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(const uint8_t *);
+
+    device_comp_buffers = reinterpret_cast<uint8_t **>(free_scratch_buffer);
+    free_scratch_buffer += batch_size * sizeof(uint8_t *);
+
+    device_comp_statuses = reinterpret_cast<nvcompStatus_t *>(free_scratch_buffer);
+    free_scratch_buffer += roundUpTo(batch_size * sizeof(nvcompStatus_t), sizeof(size_t));
+
+    // The staged arrays are only size_t-aligned, so realign before the codec scratch.
+    free_scratch_buffer =
+      reinterpret_cast<uint8_t *>(roundUpTo(reinterpret_cast<uintptr_t>(free_scratch_buffer), min_alignment));
+  }
 
   // Note:
   // free_scratch_buffer now is aligned to min_alignment
   // as the worst-case scratch buffer requirement for compression.
   assert(reinterpret_cast<uintptr_t>(free_scratch_buffer) % min_alignment == 0);
+  assert(free_scratch_buffer <= scratch_buffer + scratch_buffer_size);
 
   const size_t free_scratch_size = scratch_buffer_size - (uintptr_t(free_scratch_buffer) - uintptr_t(scratch_buffer));
   assert(free_scratch_size >= compute_lowlevel_compress_scratch_size(batch_size, max_uncomp_size));
@@ -674,19 +695,61 @@ void HEAD::compress_raw_batched(
     false /* force_sync*/
   ));
 
+  if (stage_metadata_on_device)
+  {
+    // Stream-ordered, so these run after the host lambda above has populated the pinned arrays.
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_uncomp_sizes,
+      pinned_uncomp_sizes,
+      batch_size * sizeof(size_t),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_uncomp_buffers,
+      pinned_uncomp_buffers,
+      batch_size * sizeof(const uint8_t *),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+      device_comp_buffers,
+      pinned_comp_buffers,
+      batch_size * sizeof(uint8_t *),
+      cudaMemcpyHostToDevice,
+      user_stream
+    ));
+  }
+
+  const uint8_t **kernel_uncomp_buffers = stage_metadata_on_device ? device_uncomp_buffers : pinned_uncomp_buffers;
+  size_t *kernel_uncomp_sizes = stage_metadata_on_device ? device_uncomp_sizes : pinned_uncomp_sizes;
+  uint8_t **kernel_comp_buffers = stage_metadata_on_device ? device_comp_buffers : pinned_comp_buffers;
+  nvcompStatus_t *kernel_comp_statuses = stage_metadata_on_device ? device_comp_statuses : pinned_comp_statuses;
+
   ManagerBase::check<FnType::Compress>(compress_fn(
-    reinterpret_cast<const void *const *>(pinned_uncomp_buffers),
-    pinned_uncomp_sizes,
+    reinterpret_cast<const void *const *>(kernel_uncomp_buffers),
+    kernel_uncomp_sizes,
     max_uncomp_size,
     batch_size,
     free_scratch_buffer,
     free_scratch_size,
-    reinterpret_cast<void *const *>(pinned_comp_buffers),
+    reinterpret_cast<void *const *>(kernel_comp_buffers),
     comp_sizes,
     format_opts,
-    pinned_comp_statuses,
+    kernel_comp_statuses,
     user_stream
   ));
+
+  if (stage_metadata_on_device)
+  {
+    CUDA_CHECK(cudaMemcpyAsync(
+      pinned_comp_statuses,
+      device_comp_statuses,
+      batch_size * sizeof(nvcompStatus_t),
+      cudaMemcpyDeviceToHost,
+      user_stream
+    ));
+  }
 
   if (bitstream_kind == BitstreamKind::WITH_UNCOMPRESSED_SIZE)
   {

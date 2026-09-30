@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions
@@ -92,8 +92,8 @@ inline __host__ __device__ uint32_t get_uncompressed_size(
 *  @param actual_input_size number of bytes decoded
 *  @param actual_output_size number of bytes written to output buffer
 *  @param expected_input_size size of compressed buffer that was given as parameter
-*  @param device_out_bytes pointer to store 
-*  @param nvcomp_status optional pointer to nvCOMP status, currently indicates failure
+*  @param device_out_bytes pointer to the expected output size, updated with the actual size on mismatch
+*  @param nvcomp_status pointer to nvCOMP status, currently indicates failure
 */
 inline __device__ void snappy_unsnap_err_check(
   uint32_t actual_input_size,
@@ -104,20 +104,8 @@ inline __device__ void snappy_unsnap_err_check(
   nvcompStatus_t *const nvcomp_status
 )
 {
-  // User does not have to provide pointer for status.
-  if (!nvcomp_status)
-  {
-    return;
-  }
-
   if (!thread_warp_ix())
   {
-    uint32_t expected_output_size = actual_output_size;
-    if (device_out_bytes)
-    {
-      expected_output_size = *device_out_bytes;
-    }
-
     // If we found a zero offset, we know for sure that the compressed stream is invalid, so we can already set success to false in that case.
     bool success = !invalid_stream;
 
@@ -128,12 +116,9 @@ inline __device__ void snappy_unsnap_err_check(
     }
 
     // Make sure the total uncompressed size matches what was expected
-    if (expected_output_size != actual_output_size)
+    if (*device_out_bytes != actual_output_size)
     {
-      if (device_out_bytes)
-      {
-        *device_out_bytes = actual_output_size;
-      }
+      *device_out_bytes = actual_output_size;
       success = false;
     }
 
@@ -143,7 +128,7 @@ inline __device__ void snappy_unsnap_err_check(
     }
     else
     {
-      // *nvcomp_status is already set to nvcompErrorCannotDecompress
+      // nvcomp_status is already set to nvcompErrorCannotDecompress
     }
   }
 }

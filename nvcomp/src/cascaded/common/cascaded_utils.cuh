@@ -34,26 +34,16 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "cascaded_warp_reductions.cuh"
 #include "CudaConstants.h"
 #include "nvcomp.h"
 
-namespace cascaded
+namespace nvcomp::cascaded
 {
 
 inline __device__ int thread_warp_ix() { return threadIdx.x % WARP_SIZE; }
 
 constexpr uint32_t log2_pow2(uint32_t x) { return (x <= 1) ? 0 : 1 + log2_pow2(x >> 1); }
-
-template <typename data_t>
-inline __device__ data_t warp_reduce_sum(data_t val)
-{
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-  {
-    val += __shfl_xor_sync(WARP_ALL, val, offset);
-  }
-  val = __shfl_sync(WARP_ALL, val, 0); // Broadcast result to all lanes
-  return val;
-}
 
 // Vectorized block copy assuming `src` and `dst` share the same alignment offset
 template <int num_bytes_aligned, typename uintN, uint32_t num_threads>
@@ -177,4 +167,4 @@ inline __device__ nvcompType_t d_TypeOf()
   // TODO - perform error checking and notify user if incorrect type is given
 }
 
-} // namespace cascaded
+} // namespace nvcomp::cascaded

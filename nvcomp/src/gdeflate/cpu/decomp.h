@@ -12,11 +12,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <fstream>
-#include <iostream>
-#include <vector>
-
-using namespace std;
 
 #include "deflate.h"
 #include "gdeflate/gdeflate_constants.h"

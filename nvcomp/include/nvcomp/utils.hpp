@@ -41,7 +41,7 @@ namespace nvcomp
 template <typename U, typename T>
 constexpr NVCOMP_HOST_DEVICE_FUNCTION U roundUpDiv(const U num, const T chunk) noexcept
 {
-  return (num + chunk - 1) / chunk;
+  return static_cast<U>((num + chunk - 1) / chunk);
 }
 
 /**
@@ -73,7 +73,7 @@ constexpr NVCOMP_HOST_DEVICE_FUNCTION U roundDownTo(const U num, const T chunk) 
 template <typename U, typename T>
 constexpr NVCOMP_HOST_DEVICE_FUNCTION U roundUpTo(const U num, const T chunk) noexcept
 {
-  return roundUpDiv(num, chunk) * chunk;
+  return static_cast<U>(roundUpDiv(num, chunk) * chunk);
 }
 
 /**

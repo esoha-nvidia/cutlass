@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -35,6 +35,8 @@ struct SnappyManager : detail::PimplManager
    * @param[in] user_stream The CUDA stream to operate on.
    * @param[in] checksum_policy The checksum policy to use during compression and decompression.
    * @param[in] bitstream_kind Setting to configure how the manager compresses the input.
+   * @param[in] execution_policy Setting to configure whether the manager favors kernel
+   * latency or concurrency with other device work.
    */
   NVCOMP_EXPORT
   SnappyManager(
@@ -42,7 +44,8 @@ struct SnappyManager : detail::PimplManager
     const nvcompBatchedSnappyCompressOpts_t &compress_opts = nvcompBatchedSnappyCompressDefaultOpts,
     const nvcompBatchedSnappyDecompressOpts_t &decompress_opts = nvcompBatchedSnappyDecompressDefaultOpts,
     cudaStream_t user_stream = 0,
-    ChecksumPolicy checksum_policy = NoComputeNoVerify,
+    ChecksumPolicy checksum_policy = ChecksumPolicy::NoComputeNoVerify,
+    ExecutionPolicy execution_policy = ExecutionPolicy::Concurrency,
     BitstreamKind bitstream_kind = BitstreamKind::NVCOMP_NATIVE
   );
 

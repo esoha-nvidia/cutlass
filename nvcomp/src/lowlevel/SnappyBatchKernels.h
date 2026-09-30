@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -87,11 +87,10 @@ void gpu_snap(
  * memory chunks referenced by device_out_ptr. Could be null-ptr indicating
  * all output buffers has enough size to stored uncompressed data.
  * @param[out] outputs Pointer to the statuses of decompression for each chunk.
- * Could be null-ptr.
  * @param[out] device_correctness_ptrs Pointer to the correctness error
  * information for each chunk. Only necessary if CORRECTNESS_CHECK is true.
  * @param[out] device_out_bytes Pointer to the list of actual sizes
- * of uncompressed data. Could be null-ptr.
+ * of uncompressed data.
  * @param[in] count The number of chunks to decompress.
  * @param[in] stream All the decompression will be enqueued into this CUDA
  * stream and run asynchronously.

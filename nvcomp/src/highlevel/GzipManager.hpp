@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -11,6 +11,8 @@
 */
 
 #pragma once
+
+#include <cstddef>
 
 #include "CRC32.hpp"
 #include "highlevel/ManagerBase.hpp"
@@ -28,10 +30,10 @@ struct GzipManagerImpl
     : ManagerBase<
         GzipFormatSpecHeader,
         decltype(nvcompBatchedGzipDecompressAsyncEx) *,
-        decltype(nvcompBatchedGzipDecompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedGzipDecompressGetTempSize) *,
         decltype(nvcompBatchedGzipGetDecompressSizeAsync) *,
         decltype(nvcompBatchedGzipCompressAsync) *,
-        decltype(nvcompBatchedGzipCompressGetTempSizeAsync) *,
+        decltype(nvcompBatchedGzipCompressGetTempSize) *,
         decltype(nvcompBatchedGzipCompressGetMaxOutputChunkSize) *,
         nvcompBatchedGzipCompressOpts_t,
         nvcompBatchedGzipDecompressOpts_t,
@@ -43,6 +45,7 @@ struct GzipManagerImpl
     nvcompBatchedGzipDecompressOpts_t decompress_opts,
     cudaStream_t user_stream,
     ChecksumPolicy checksum_policy,
+    ExecutionPolicy execution_policy,
     BitstreamKind bitstream_kind
   )
       : ManagerBase(
@@ -51,12 +54,13 @@ struct GzipManagerImpl
           decompress_opts,
           user_stream,
           checksum_policy,
+          execution_policy,
           bitstream_kind,
           nvcompBatchedGzipDecompressAsyncEx,
-          nvcompBatchedGzipDecompressGetTempSizeAsync,
+          nvcompBatchedGzipDecompressGetTempSize,
           nvcompBatchedGzipGetDecompressSizeAsync,
           nvcompBatchedGzipCompressAsync,
-          nvcompBatchedGzipCompressGetTempSizeAsync,
+          nvcompBatchedGzipCompressGetTempSize,
           nvcompBatchedGzipCompressGetMaxOutputChunkSize,
           query_alignment_requirements(nvcompBatchedGzipCompressGetRequiredAlignments, format_opts),
           query_alignment_requirements(nvcompBatchedGzipDecompressGetRequiredAlignments, decompress_opts)
@@ -68,13 +72,15 @@ struct GzipManagerImpl
   ~GzipManagerImpl() {}
 };
 
+// C++ does not allow extern-template declarations through a type alias, so the
+// specialization's argument list must be repeated here.
 extern template struct ManagerBase<
   GzipFormatSpecHeader,
   decltype(nvcompBatchedGzipDecompressAsyncEx) *,
-  decltype(nvcompBatchedGzipDecompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedGzipDecompressGetTempSize) *,
   decltype(nvcompBatchedGzipGetDecompressSizeAsync) *,
   decltype(nvcompBatchedGzipCompressAsync) *,
-  decltype(nvcompBatchedGzipCompressGetTempSizeAsync) *,
+  decltype(nvcompBatchedGzipCompressGetTempSize) *,
   decltype(nvcompBatchedGzipCompressGetMaxOutputChunkSize) *,
   nvcompBatchedGzipCompressOpts_t,
   nvcompBatchedGzipDecompressOpts_t,
@@ -86,6 +92,7 @@ GzipManager::GzipManager(
   const nvcompBatchedGzipDecompressOpts_t &decompress_opts,
   cudaStream_t user_stream,
   ChecksumPolicy checksum_policy,
+  ExecutionPolicy execution_policy,
   BitstreamKind bitstream_kind
 )
 {
@@ -95,6 +102,7 @@ GzipManager::GzipManager(
     decompress_opts,
     user_stream,
     checksum_policy,
+    execution_policy,
     bitstream_kind
   );
 }

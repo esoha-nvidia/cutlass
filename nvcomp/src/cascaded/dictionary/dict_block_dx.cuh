@@ -32,7 +32,7 @@
 #include "cascaded/common/cascaded_utils.cuh"
 #include "dict_warp_dx.cuh"
 
-namespace dictionary
+namespace nvcomp::cascaded::dictionary
 {
 
 /**
@@ -42,7 +42,7 @@ template <typename data_t, typename index_t>
 __host__ __device__ size_t block_dictionary_get_scratch_req(int est_num_unique_inputs)
 {
   // In the future, this block dictionary impl may require additional scratch
-  return cascaded::block_static_set_get_scratch_req<data_t, index_t>(est_num_unique_inputs);
+  return block_static_set_get_scratch_req<data_t, index_t>(est_num_unique_inputs);
 }
 
 /**
@@ -74,11 +74,11 @@ __device__ void block_dictionary_encode(
   assert(num_inputs > 0);
   assert(blockDim.x % WARP_SIZE == 0);
 
-  cascaded::static_set<data_t, index_t> my_set;
+  static_set<data_t, index_t> my_set;
   __shared__ uint32_t shared_counter;
 
   // Initialize the static set
-  cascaded::block_static_set_init(
+  block_static_set_init(
     my_set,
     scratch_ptr,
     scratch_size_bytes,
@@ -100,7 +100,7 @@ __device__ void block_dictionary_encode(
 
   for (int ix_base = warp_id * WARP_SIZE; ix_base < num_inputs; ix_base += blockDim.x)
   {
-    int ix_input = ix_base + cascaded::thread_warp_ix();
+    int ix_input = ix_base + thread_warp_ix();
 
     // Load value (use sentinel for out-of-bounds to avoid invalid reads)
     data_t my_value = (ix_input < num_inputs) ? input[ix_input] : input[0];
@@ -136,17 +136,17 @@ block_dictionary_decode(const data_t *dict_values, const index_t *dict_indices, 
   assert(blockDim.x == BLOCK_SIZE);
 
   const int warp_id = threadIdx.x / WARP_SIZE;
-  constexpr int num_warps = BLOCK_SIZE / WARP_SIZE;
-  constexpr int elts_per_batch = WARP_SIZE * UNROLL_COUNT;
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  constexpr int ELTS_PER_BATCH = WARP_SIZE * UNROLL_COUNT;
 
   // Each warp processes its own batches
   int batch_id = warp_id;
-  while (batch_id * elts_per_batch < num_indices)
+  while (batch_id * ELTS_PER_BATCH < num_indices)
   {
-    int batch_offset = batch_id * elts_per_batch;
-    int remaining = num_indices - batch_offset;
+    int batch_offset = batch_id * ELTS_PER_BATCH;
+    const int remaining = num_indices - batch_offset;
 
-    if (remaining >= elts_per_batch)
+    if (remaining >= ELTS_PER_BATCH)
     {
       // Full batch - all threads active
       warp_dictionary_decode<data_t, index_t, UNROLL_COUNT>(
@@ -161,7 +161,7 @@ block_dictionary_decode(const data_t *dict_values, const index_t *dict_indices, 
       // Partial batch - use UNROLL_COUNT=1 for tail elements
       for (int tail_offset = 0; tail_offset < remaining; tail_offset += WARP_SIZE)
       {
-        int elem_idx = batch_offset + tail_offset + cascaded::thread_warp_ix();
+        const int elem_idx = batch_offset + tail_offset + thread_warp_ix();
         bool active = (elem_idx < num_indices);
 
         warp_dictionary_decode<data_t, index_t, 1>(
@@ -173,8 +173,8 @@ block_dictionary_decode(const data_t *dict_values, const index_t *dict_indices, 
       }
     }
 
-    batch_id += num_warps;
+    batch_id += NUM_WARPS;
   }
 }
 
-} // namespace dictionary
+} // namespace nvcomp::cascaded::dictionary

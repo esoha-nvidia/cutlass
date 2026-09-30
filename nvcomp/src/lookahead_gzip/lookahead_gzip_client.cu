@@ -14,11 +14,13 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 #include "common.cuh"
 #include "constants.cuh"
 #include "CudaUtils.h"
 #include "device_guard.h"
+#include "exception.hpp"
 #include "include/lookahead_gzip_client.h"
 #include "include/types.h"
 #include "lookahead_gzip_kernels.cuh"
@@ -149,7 +151,10 @@ void LookaheadGzipBaseClient<T>::decompressGetTempSize(lookaheadGzipConfig_t *co
   CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, config->device_id));
   if (deviceProp.totalGlobalMem < required_scratch_space)
   {
-    throw std::runtime_error("Cannot allocate temp memory on your device. Please try bigger chunk size.");
+    throw nvcomp::NVCompException(
+      nvcompErrorInvalidValue,
+      "Cannot allocate temp memory on your device. Please try bigger chunk size."
+    );
   }
 
   *temp_bytes = required_scratch_space;
@@ -450,7 +455,8 @@ void LookaheadGzipStreamingClient::createConfig(lookaheadGzipConfig_t *config, c
     CUDA_CHECK(cudaDeviceGetAttribute(&concurrentManagedAccess, cudaDevAttrConcurrentManagedAccess, config->device_id));
     if (concurrentManagedAccess != 1)
     {
-      throw std::runtime_error(
+      throw nvcomp::NVCompException(
+        nvcompErrorNotSupported,
         "Concurrent managed buffer access is not supported on your platform and/or by your driver."
       );
     }

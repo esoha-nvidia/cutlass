@@ -15,6 +15,8 @@
 
 #include <cassert>
 
+#include "nvcomp/ans.h"
+#include "nvcomp/cascaded.h"
 #include "nvcomp/native/bitcomp_mode.h"
 #include "nvcomp/shared_types.h"
 
@@ -24,96 +26,61 @@ namespace nvcomp
 /**
  * @brief Format specification for ANS compression.
  *
- * A single packed byte (kept as 1 byte to enable compressed HLIF buffer compatibility
- * within 5.x); the 3 unused high bits are reserved and kept 0. Use the accessors below.
+ * Layout matches the prefix of nvcompBatchedANSCompressOpts_t. A zeroed spec
+ * is the 6.0 default (rANS, CHAR, auto states_per_lane, default sub-chunk
+ * count of 8, exact histogram). ANS 6.0 bitstreams are not compatible with
+ * earlier nvCOMP.
  */
 struct ANSFormatSpecHeader
 {
-  enum class Mode : uint8_t
-  {
-    Char = 0,
-    Fp16 = 1,
-    Fp8 = 2
-  };
-
-  // `mode` is a plain 2-bit integer field (not Mode): an enum bitfield trips
-  // bitfield-enum-conversion warnings under clang / nvcc 13.x's host pass, and a
-  // uint8_t field keeps all bitfields packed in 1 byte. The accessors convert
-  // to/from Mode.
-  uint8_t sub_chunk_log2 : 3; // max_sub_chunk_count as log2 (0 = auto; 2..6 for 4..64)
-  uint8_t mode : 2; // ANS decode mode (Mode)
-  uint8_t reserved : 3;
-
-  // max_sub_chunk_count must be 0 (auto) or a power-of-2 in the inclusive range
-  // [4, 64]; sub_chunk_log2 is only 3 bits, so any other value would silently
-  // truncate. Invalid input asserts in debug and falls back to auto (0) in release
-  // rather than writing a corrupt count.
-  void set_max_sub_chunk_count(uint8_t count)
-  {
-    if (count == 0)
-    {
-      sub_chunk_log2 = 0; // auto
-      return;
-    }
-
-    const bool is_pow2 = (count & static_cast<uint8_t>(count - 1)) == 0;
-    const bool in_range = count >= 4 && count <= 64;
-    if (!is_pow2 || !in_range)
-    {
-      assert(false && "max_sub_chunk_count must be 0 or a power-of-2 in [4, 64]");
-      sub_chunk_log2 = 0; // fall back to auto instead of truncating
-      return;
-    }
-
-    // count is a validated power-of-2 in [4, 64], so log2 is 2..6 (fits in 3 bits).
-    uint8_t log2 = 0;
-    while ((1u << log2) < count)
-    {
-      ++log2;
-    }
-    sub_chunk_log2 = log2;
-  }
-
-  uint8_t get_max_sub_chunk_count() const
-  {
-    return sub_chunk_log2 == 0 ? 0 : static_cast<uint8_t>(1u << sub_chunk_log2);
-  }
-
-  // Maps the (char/uchar/fp16/fp8) data type to the 3 ANS decode modes; char and
-  // uchar both map to Mode::Char (decompression treats them identically).
-  void set_data_type(nvcompType_t data_type)
-  {
-    Mode m = Mode::Char;
-    switch (data_type)
-    {
-      case NVCOMP_TYPE_FLOAT16:
-        m = Mode::Fp16;
-        break;
-      case NVCOMP_TYPE_FLOAT8_E4M3:
-        m = Mode::Fp8;
-        break;
-      default:
-        m = Mode::Char;
-        break;
-    }
-    mode = static_cast<uint8_t>(m);
-  }
-
-  nvcompType_t get_data_type() const
-  {
-    switch (static_cast<Mode>(mode))
-    {
-      case Mode::Fp16:
-        return NVCOMP_TYPE_FLOAT16;
-      case Mode::Fp8:
-        return NVCOMP_TYPE_FLOAT8_E4M3;
-      default:
-        return NVCOMP_TYPE_CHAR;
-    }
-  }
+  /**
+   * @brief ANS algorithm to use.
+   */
+  nvcompANSType_t type;
+  /**
+   * @brief ANS data type to use.
+   *
+   * - NVCOMP_TYPE_(U)CHAR: 1-byte, generic data type
+   * - NVCOMP_TYPE_FLOAT16: 2-byte floating-point data type. Applicable to all half-precision data formats.
+   * - NVCOMP_TYPE_FLOAT8_E4M3: 1-byte FP8 (E4M3) floating-point data type.
+   * - NVCOMP_TYPE_FLOAT32: 4-byte IEEE-754 single-precision floating-point data type.
+   */
+  nvcompType_t data_type;
+  /**
+   * @brief Maximum sub chunk count override for compression.
+   * 0: default of 8. Nonzero must be a power-of-2 between 4 and 64.
+   * Leave zero unless you can tune the performance of your e2e application based on this value.
+   */
+  uint8_t max_sub_chunk_count;
+  /**
+   * @brief Number of interleaved rANS states per lane.
+   * 0: auto (default): two interleaved streams for every data type.
+   * 1: single stream.
+   * 2: two interleaved streams.
+   * "2 states" improves performance but adds an overhead of 128B per sub chunk, impacting
+   * compression ratio; the relative cost grows as the sub chunk shrinks.
+   */
+  uint8_t states_per_lane;
+  /**
+   * @brief Reduces the amount of data used to build the histogram by this log2 factor.
+   * 0: exact model (default). N keeps 1/2^N of the slice (1 = 1/2, 2 = 1/4, 3 = 1/8,
+   * up to nvcompANSMaxHistogramReductionLog2). Useful to speed up compression when
+   * full chunks are known to be sampled from a common distribution.
+   * Applies to every data type. Chunks below 4096 ANS symbols are always histogrammed
+   * exactly, whatever the requested reduction.
+   */
+  uint8_t histogram_reduction_log2;
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   * 5 bytes to make the last padding byte explicit.
+   */
+  char reserved[5];
 };
 
-static_assert(sizeof(ANSFormatSpecHeader) == 1, "ANSFormatSpecHeader must serialize as a single byte");
+static_assert(
+  sizeof(ANSFormatSpecHeader) == 16,
+  "ANSFormatSpecHeader must serialize as nvcompANSType_t + nvcompType_t + 3 uint8_t + 5 reserved"
+);
 
 /**
  * @brief Format specification for Bitcomp compression
@@ -150,10 +117,15 @@ struct BitcompFormatSpecHeader
    */
   bitcompMode_t mode;
   /**
-   * @brief Reserved bytes that make the format header's tail padding explicit.
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
    */
   char reserved[4];
 };
+
+static_assert(
+  sizeof(BitcompFormatSpecHeader) == 24,
+  "BitcompFormatSpecHeader must serialize as int + nvcompType_t + double + bitcompMode_t + 4 reserved"
+);
 
 /**
  * @brief Format specification for Cascaded compression
@@ -161,34 +133,27 @@ struct BitcompFormatSpecHeader
 struct CascadedFormatSpecHeader
 {
   /**
-   * @brief The size of each internal chunk of data to decompress independently
-   * with
-   *
-   * Cascaded compression. The value should be in the range of [512, 16384]
-   * depending on the datatype of the input and the shared memory size of
-   * the GPU being used.  This is not the size of chunks passed into the API.
-   * Recommended size is 4096.
-   *
-   * @note Not currently used and a default of 4096 is just used.
+   * @brief Common options shared by compression and decompression.
    */
-  size_t internal_chunk_bytes;
+  nvcompCascadedCommonOpts_t common_opts;
   /**
-   * @brief The datatype used to define the bit-width for compression
+   * @brief Mask of fine-grained encodings considered during compression.
    */
-  nvcompType_t data_type;
+  uint64_t fine_grained_encoding_flags;
   /**
-   * @brief The number of Run Length Encodings to perform.
+   * @brief The requested compression level.
    */
-  int num_RLEs;
+  uint8_t compression_level;
   /**
-   * @brief The number of Delta Encodings to perform.
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
    */
-  int num_deltas;
-  /**
-   * @brief Whether or not to bitpack the final layers.
-   */
-  int use_bp;
+  char reserved[4];
 };
+
+static_assert(
+  sizeof(CascadedFormatSpecHeader) == 40,
+  "CascadedFormatSpecHeader must serialize as common options + uint64_t + uint8_t + 4 reserved bytes + padding"
+);
 
 /**
  * @brief Format specification for Deflate compression
@@ -210,7 +175,16 @@ struct DeflateFormatSpecHeader
    * - 5: lowest-throughput, highest compression ratio
    */
   int algorithm;
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(
+  sizeof(DeflateFormatSpecHeader) == 8,
+  "DeflateFormatSpecHeader must serialize as int algorithm + 4 reserved"
+);
 
 /**
  * @brief Format specification for GDeflate compression
@@ -232,7 +206,16 @@ struct GdeflateFormatSpecHeader
    * - 5: lowest-throughput, highest compression ratio
    */
   int algorithm;
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(
+  sizeof(GdeflateFormatSpecHeader) == 8,
+  "GdeflateFormatSpecHeader must serialize as int algorithm + 4 reserved"
+);
 
 /**
  * @brief Format specification for Gzip compression
@@ -253,8 +236,14 @@ struct GzipFormatSpecHeader
    * compression ratio
    * - 5: lowest-throughput, highest compression ratio
    */
-  uint8_t algorithm;
+  int algorithm;
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(sizeof(GzipFormatSpecHeader) == 8, "GzipFormatSpecHeader must serialize as int algorithm + 4 reserved");
 
 /**
  * @brief Format specification for LZ4 compression
@@ -264,27 +253,46 @@ struct LZ4FormatSpecHeader
   /**
    * @brief LZ4 data type to use.
    */
-  union
-  {
-    nvcompType_t data_type;
-    unsigned char bytes[4];
-  };
+  nvcompType_t data_type;
+  /**
+   * @brief Bitshuffle mode used during compression.
+   */
+  nvcompBitshuffleMode_t bitshuffle_mode;
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(
+  sizeof(LZ4FormatSpecHeader) == 12,
+  "LZ4FormatSpecHeader must serialize as nvcompType_t + nvcompBitshuffleMode_t + 4 reserved"
+);
 
 /**
  * @brief Format specification for Snappy compression
  */
 struct SnappyFormatSpecHeader
 {
-  // Empty for now
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(sizeof(SnappyFormatSpecHeader) == 4, "SnappyFormatSpecHeader must serialize as 4 reserved");
 
 /**
  * @brief Format specification for Zstd compression
  */
 struct ZstdFormatSpecHeader
 {
-  // Empty for now
+  /**
+   * @brief Unused; must be zero. Reserved for future FormatSpec extensions.
+   */
+  char reserved[4];
 };
+
+static_assert(sizeof(ZstdFormatSpecHeader) == 4, "ZstdFormatSpecHeader must serialize as 4 reserved");
 
 } // namespace nvcomp

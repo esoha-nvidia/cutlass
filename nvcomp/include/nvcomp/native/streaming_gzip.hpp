@@ -34,6 +34,9 @@ nvcompStatus_t nvcompGzipStreamingDecompressGetTempSize(size_t *temp_bytes);
 /**
  * @brief Perform synchronous decompression streaming from stream to stream.
  *
+ * @note Does not support multi-member gzip streams, i.e., streams
+ * containing more than one concatenated gzip member.
+ *
  *  @param[in] input_stream Input stream with the compressed buffer.
  *  @param[in] output_stream Output stream to write the uncompressed buffer.
  *  @param[in] temp_bytes Size of internal buffer for scratch space.
@@ -48,6 +51,32 @@ nvcompStatus_t nvcompGzipStreamingDecompress(
   std::ostream &output_stream,
   const size_t temp_bytes,
   void *const device_temp_ptr,
+  cudaStream_t stream
+);
+
+/**
+ * @brief Determine the total uncompressed size of a gzip stream.
+ *
+ * The stream is decompressed in full and the output is discarded, so this costs as much as
+ * nvcompGzipStreamingDecompress.
+ *
+ * @note Does not support multi-member gzip streams, i.e., streams
+ * containing more than one concatenated gzip member.
+ *
+ *  @param[in] input_stream Input stream with the compressed buffer.
+ *  @param[in] temp_bytes Size of internal buffer for scratch space.
+ *  @param[in] device_temp_ptr Pointer to device memory allocated to store scratch data.
+ *  @param[out] decomp_size Pointer to host-accessible memory allocated to store the total number of uncompressed bytes.
+ *  @param[in] stream The CUDA stream to operate on.
+ *
+ * @return nvcompSuccess if the size was determined, and an error code otherwise.
+ */
+NVCOMP_EXPORT
+nvcompStatus_t nvcompGzipStreamingGetDecompressSize(
+  std::istream &input_stream,
+  const size_t temp_bytes,
+  void *const device_temp_ptr,
+  size_t *decomp_size,
   cudaStream_t stream
 );
 

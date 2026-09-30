@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -152,10 +152,8 @@ inline void FillCuDEParamsOnHost(
         // TODO: Restore this when we bump up RMM version
         // device_out_bytes[ix_chunk] = 0;  // WAR for HW only setting 32 lsb for this value
         de_params[ix_chunk].dstActBytes = reinterpret_cast<cuuint32_t *>(&device_out_bytes[ix_chunk]);
-        if (pinned_statuses != nullptr)
-        {
-          pinned_statuses[ix_chunk] = nvcompSuccess;
-        }
+        assert(pinned_statuses != nullptr);
+        pinned_statuses[ix_chunk] = nvcompSuccess;
       }
     },
     force_sync

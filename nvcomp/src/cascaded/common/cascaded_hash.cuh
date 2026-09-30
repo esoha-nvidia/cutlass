@@ -33,7 +33,7 @@
 #include <cstring>
 #include <type_traits>
 
-namespace cascaded
+namespace nvcomp::cascaded
 {
 
 // TODO: this hash is used to calculate a set where my_set=my_hash%num_sets. Can we make this hash better with num_set awareness?
@@ -102,4 +102,4 @@ inline __device__ uint32_t hash32(const data_t &value)
   return hash;
 }
 
-} // namespace cascaded
+} // namespace nvcomp::cascaded

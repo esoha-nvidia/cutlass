@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -17,7 +17,7 @@
 
 #include <nvcomp_export.h>
 
-namespace gdeflate
+namespace nvcomp::gdeflate
 {
 
 /**
@@ -108,4 +108,4 @@ void decompressCPU(
   size_t *out_bytes
 );
 
-} // namespace gdeflate
+} // namespace nvcomp::gdeflate

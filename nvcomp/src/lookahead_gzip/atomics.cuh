@@ -14,6 +14,10 @@
 
 #include <cuda/atomic>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 template <typename atomic_t, typename T>
 __host__ T atomic_wait(atomic_t *atomic, T old_value, cuda::std::memory_order order, uint nanoseconds)
 {

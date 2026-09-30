@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2017-2024 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -13,6 +13,7 @@
 #include <cuda/atomic>
 
 #include <fstream>
+#include <ostream>
 
 #include "Check.h"
 #include "CudaUtils.h"
@@ -29,6 +30,16 @@ using namespace lookahead_gzip;
 
 namespace
 {
+// A streambuf that discards everything written to it, used to obtain a std::ostream
+// that only counts bytes without allocating/copying them anywhere.
+class NullStreambuf : public std::streambuf
+{
+protected:
+  // Bulk writes (e.g. ostream::write): pretend all `count` bytes were consumed.
+  std::streamsize xsputn(const char *, std::streamsize count) override { return count; }
+  // Single-char writes once the (empty) put buffer is exhausted: report success.
+  int overflow(int ch) override { return ch; }
+};
 // Builds a lookahead streaming-decompress config (CUDA streams + cached device props) and tears it down
 // when it leaves scope.
 struct LookaheadConfigGuard
@@ -87,14 +98,23 @@ nvcompStatus_t nvcompGzipStreamingDecompressGetTempSize(size_t *temp_bytes)
   return nvcompSuccess;
 }
 
-nvcompStatus_t nvcompGzipStreamingDecompress(
+namespace
+{
+
+nvcompStatus_t gzipStreamingDecompressImpl(
   std::istream &input_stream,
   std::ostream &output_stream,
   const size_t temp_bytes,
   void *const device_temp_ptr,
+  size_t *decomp_size,
   cudaStream_t stream
 )
 {
+  if (decomp_size != nullptr)
+  {
+    *decomp_size = 0;
+  }
+
   // error check inputs
   NVCOMP_CHECK_NOT_NULL(device_temp_ptr);
 
@@ -107,6 +127,15 @@ nvcompStatus_t nvcompGzipStreamingDecompress(
   try
   {
     LookaheadConfigGuard cfg(stream);
+
+    size_t required_temp_bytes = 0;
+    LookaheadGzipStreamingClient::decompressGetTempSize(&cfg.config, &required_temp_bytes);
+    if (temp_bytes < required_temp_bytes)
+    {
+      LOG_ERROR("Insufficient temp buffer: {} bytes provided, {} bytes required", temp_bytes, required_temp_bytes);
+      return nvcompErrorInvalidValue;
+    }
+
     LookaheadGzipStreamingClient client(&cfg.config, temp_bytes, reinterpret_cast<uint8_t *>(device_temp_ptr));
     client.reset(stream);
 
@@ -130,6 +159,10 @@ nvcompStatus_t nvcompGzipStreamingDecompress(
           throw std::runtime_error("Failed to decompress input stream");
         }
       }
+      if (decomp_size != nullptr)
+      {
+        *decomp_size += iter_bytes_decompressed;
+      }
       client.advance(iter_bytes_decompressed);
     }
   }
@@ -144,6 +177,50 @@ nvcompStatus_t nvcompGzipStreamingDecompress(
     return nvcompErrorInvalidValue;
   }
   return nvcompSuccess;
+}
+
+} // namespace
+
+nvcompStatus_t nvcompGzipStreamingDecompress(
+  std::istream &input_stream,
+  std::ostream &output_stream,
+  const size_t temp_bytes,
+  void *const device_temp_ptr,
+  cudaStream_t stream
+)
+{
+  return gzipStreamingDecompressImpl(
+    input_stream,
+    output_stream,
+    temp_bytes,
+    device_temp_ptr,
+    nullptr, /* decomp_size */
+    stream
+  );
+}
+
+nvcompStatus_t nvcompGzipStreamingGetDecompressSize(
+  std::istream &input_stream,
+  const size_t temp_bytes,
+  void *const device_temp_ptr,
+  size_t *decomp_size,
+  cudaStream_t stream
+)
+{
+  // The device temp buffer is validated by gzipStreamingDecompressImpl.
+  NVCOMP_CHECK_NOT_NULL(decomp_size);
+
+  // discarding stream -> only count the bytes
+  NullStreambuf null_streambuf;
+  std::ostream null_ostream(&null_streambuf);
+  return gzipStreamingDecompressImpl(
+    input_stream,
+    null_ostream,
+    temp_bytes,
+    device_temp_ptr,
+    decomp_size, /* decomp_size */
+    stream
+  );
 }
 
 nvcompStatus_t nvcompGzipStreamingCompressGetTempSize(nvcompBatchedGzipCompressOpts_t opts, size_t *temp_bytes)

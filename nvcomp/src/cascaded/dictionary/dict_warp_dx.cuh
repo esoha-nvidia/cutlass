@@ -49,7 +49,7 @@
  *                      e.g., before a delta-decode pass)
  */
 
-namespace dictionary
+namespace nvcomp::cascaded::dictionary
 {
 
 // Restrict data_t and index_t to the type set the dictionary is built and
@@ -84,7 +84,7 @@ inline constexpr bool is_supported_dict_dx_type = std::is_same<T, uint32_t>::val
  */
 template <typename data_t, typename index_t>
 __device__ void warp_dictionary_encode(
-  cascaded::static_set<data_t, index_t> &my_set,
+  static_set<data_t, index_t> &my_set,
   data_t *dict_values,
   index_t *dict_indices,
   data_t my_value,
@@ -101,7 +101,7 @@ __device__ void warp_dictionary_encode(
   );
 
   index_t my_index;
-  bool is_unique = cascaded::warp_static_set_try_insert(my_value, my_set, my_index, active);
+  const bool is_unique = warp_static_set_try_insert(my_value, my_set, my_index, active);
 
   if (active)
   {
@@ -110,7 +110,7 @@ __device__ void warp_dictionary_encode(
       dict_values[my_index] = my_value;
     }
 
-    dict_indices[cascaded::thread_warp_ix()] = my_index;
+    dict_indices[thread_warp_ix()] = my_index;
   }
 }
 
@@ -158,7 +158,7 @@ __device__ void warp_dictionary_decode(
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; i++)
     {
-      my_indices[i] = dict_indices[WARP_SIZE * i + cascaded::thread_warp_ix()];
+      my_indices[i] = dict_indices[WARP_SIZE * i + thread_warp_ix()];
     }
 
     data_t my_values[ELEMS_PER_THREAD];
@@ -172,9 +172,9 @@ __device__ void warp_dictionary_decode(
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; i++)
     {
-      recovered_input[WARP_SIZE * i + cascaded::thread_warp_ix()] = my_values[i];
+      recovered_input[WARP_SIZE * i + thread_warp_ix()] = my_values[i];
     }
   }
 }
 
-} // namespace dictionary
+} // namespace nvcomp::cascaded::dictionary

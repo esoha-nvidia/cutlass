@@ -97,6 +97,7 @@ set_target_properties(
   nvcomp
   PROPERTIES
     POSITION_INDEPENDENT_CODE ON
+    CUDA_SEPARABLE_COMPILATION OFF
     CUDA_ARCHITECTURES "${NVCOMP_GPU_ARCHS}")
 
 if(NOT EXISTS "${nvcomp_SOURCE_DIR}/external/fmt/include/fmt/format.h")

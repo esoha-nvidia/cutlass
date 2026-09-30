@@ -6,8 +6,9 @@
  * headers define non-inline __device__ tables that nvlink otherwise duplicates).
  */
 
-#include "ans/compress_kernels_llif.cuh"
+#include "nvcomp/ans.h"
 #include "nvcomp/ans_device.cuh"
+#include "ans/compress_kernels_llif.cuh"
 
 __device__ void nvcompDeviceANSCompressChunk(
   void *compressed,

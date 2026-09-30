@@ -16,6 +16,7 @@
 #include <ans/symbol_encoder.cuh>
 #include <cooperative_groups.h>
 #include <limits>
+#include <nvcomp/ans.h>
 
 namespace cg = cooperative_groups;
 

@@ -1,6 +1,8 @@
 # In-tree nvCOMP host library for CUTLASS examples. Compiles the copied
 # include/ + src/ as a static library (no prebuilt libnvcomp.so).
-# BUILD_NVCOMPDX stays off: device ANS still comes from MathDx.
+# Do not enable CUDA_SEPARABLE_COMPILATION on this archive: gdeflate headers
+# define non-inline __device__ tables, and nvlink then reports multiple
+# definition. The in-kernel ANS entry lives in nvcomp_ans_device (RDC).
 
 include(GenerateExportHeader)
 include(CheckCXXCompilerFlag)
@@ -36,6 +38,7 @@ file(
   ${nvcomp_SOURCE_DIR}/src/cascaded/*.cu
   ${nvcomp_SOURCE_DIR}/src/lookahead_gzip/*.cu
   ${nvcomp_SOURCE_DIR}/src/bitcomp/*.cu)
+list(FILTER NVCOMP_CUDA_SOURCES EXCLUDE REGEX "/ans_device\\.cu$")
 
 file(
   GLOB NVCOMP_CPP_SOURCES
@@ -120,5 +123,43 @@ if(_nvcomp_cccl_include)
 endif()
 
 target_link_libraries(nvcomp PUBLIC CUDA::cudart)
+
+# Relocatable device ANS entry used by 00_basic_gemm. Compiled separately so
+# nvlink does not see the rest of libnvcomp.a.
+add_library(nvcomp_ans_device OBJECT "${nvcomp_SOURCE_DIR}/src/ans/ans_device.cu")
+target_compile_definitions(
+  nvcomp_ans_device
+  PRIVATE
+    nvcomp_EXPORTS
+    NVCOMP_STATIC_DEFINE
+    ENABLE_GDEFLATE
+    IMPLICIT_BUFFER_ALIGNMENT
+    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
+    THRUST_CUB_WRAPPED_NAMESPACE=nvcomp
+    FMT_HEADER_ONLY)
+target_compile_options(
+  nvcomp_ans_device
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda --expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-pthread>)
+target_include_directories(
+  nvcomp_ans_device
+  PRIVATE
+    "${nvcomp_SOURCE_DIR}/include"
+    "${nvcomp_BINARY_DIR}/include"
+    "${nvcomp_SOURCE_DIR}/src"
+    "${nvcomp_SOURCE_DIR}/src/bitcomp"
+    "${nvcomp_SOURCE_DIR}/external/fmt/include"
+    "${nvcomp_SOURCE_DIR}/external/culiblogger/include")
+if(_nvcomp_cccl_include)
+  target_include_directories(nvcomp_ans_device PRIVATE "${_nvcomp_cccl_include}")
+endif()
+set_target_properties(
+  nvcomp_ans_device
+  PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "${NVCOMP_GPU_ARCHS}")
+add_dependencies(nvcomp_ans_device nvcomp)
 
 message(STATUS "nvCOMP: building in-tree static library for archs ${NVCOMP_GPU_ARCHS}")

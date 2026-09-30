@@ -44,6 +44,22 @@ void compressGetTempSize(
 void compressGetMaxOutputChunkSize(size_t max_chunk_size, size_t *max_compressed_size);
 
 /**
+ * @brief Launch parameters for the in-kernel (device) char-ANS compressor.
+ *        Block width is 256 threads so it can run in the CUTLASS 128x128 SIMT CTA.
+ */
+void compressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_size,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  cudaStream_t stream,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+);
+
+/**
  * @brief Perform compression.
  *
  * @param type The ANS compression algorithm type.

@@ -38,23 +38,7 @@ target_link_libraries(00_basic_gemm PRIVATE cublas)
 if(NOT TARGET nvcomp)
   add_subdirectory("${CUTLASS_DIR}/nvcomp" "${CMAKE_BINARY_DIR}/nvcomp")
 endif()
-target_link_libraries(00_basic_gemm PRIVATE nvcomp)
-
-set(MATHDX_ROOT "/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06"
-    CACHE PATH "MathDx prefix (contains include/nvcompdx.hpp)")
-set(mathdx_CUTLASS_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "CUTLASS root for MathDx find_package")
-
-find_package(mathdx REQUIRED COMPONENTS nvcompdx CONFIG
-  PATHS "${MATHDX_ROOT}"
-  NO_DEFAULT_PATH)
-
-# aarch64 (GB200): fatbin, not libnvcompdx.a (x86_64).
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  target_link_libraries(00_basic_gemm PRIVATE mathdx::nvcompdx_fatbin)
-else()
-  target_link_libraries(00_basic_gemm PRIVATE mathdx::nvcompdx)
-endif()
+target_link_libraries(00_basic_gemm PRIVATE nvcomp nvcomp_ans_device)
 
 set_target_properties(00_basic_gemm PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  INTERPROCEDURAL_OPTIMIZATION ON)
+  CUDA_SEPARABLE_COMPILATION ON)

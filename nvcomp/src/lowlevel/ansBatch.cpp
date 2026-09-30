@@ -537,7 +537,47 @@ nvcompStatus_t nvcompBatchedANSCompressGetMaxOutputChunkSize(
     LOG_ERROR("{}", e.what());
     return Check::exception_to_error(e, "nvcompBatchedANSCompressGetMaxOutputChunkSize()");
   }
+  return nvcompSuccess;
+}
 
+nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t compress_opts,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+)
+{
+  ANS_CHECK_COMPRESS_OPTS(compress_opts);
+  NVCOMP_CHECK_NOT_NULL(max_sub_chunk_size);
+  NVCOMP_CHECK_NOT_NULL(slot_words);
+  NVCOMP_CHECK_NOT_NULL(smem_bytes);
+  NVCOMP_CHECK_NOT_NULL(smem_alignment);
+  NVCOMP_CHECK_NOT_NULL(block_threads);
+  NVCOMP_CHECK_CHUNK_SIZE(max_uncompressed_chunk_bytes, nvcompANSCompressionMaxAllowedChunkSize);
+
+  try
+  {
+    ans::compressGetDeviceLaunchParams(
+      num_chunks,
+      max_uncompressed_chunk_bytes,
+      compress_opts,
+      static_cast<cudaStream_t>(0),
+      max_sub_chunk_size,
+      slot_words,
+      smem_bytes,
+      smem_alignment,
+      block_threads
+    );
+  }
+  catch (const std::exception &e)
+  {
+    LOG_ERROR("{}", e.what());
+    return Check::exception_to_error(e, "nvcompBatchedANSCompressGetDeviceLaunchParams()");
+  }
   return nvcompSuccess;
 }
 

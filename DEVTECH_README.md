@@ -1,5 +1,9 @@
 ```bash
-srun -A coreai_devtech_all -N1 -p gb200 -J coreai_devtech_all-esoha.nvcomp \
+ssh esoha-mfa@login-lyris
+```
+
+```bash
+srun -t 300 -A coreai_devtech_all -N1 -p gb200 -J coreai_devtech_all-esoha.nvcomp \
   --container-image="nvcr.io/nvidia/pytorch:26.08-py3" \
   --container-mounts="/home/esoha" --pty bash
 
@@ -34,24 +38,11 @@ python ./cutlass_test.py
 #   python ./cutlass_test.py
 ```
 
-## nvCOMP (in-tree) and nvCOMPDx (MathDx)
+## nvCOMP (in-tree LLIF)
 
-Host batched ANS (LLIF compress/decompress) is the copy of nvCOMP under `nvcomp/` (`include/` + `src/`). `00_basic_gemm` compiles that as a **static** library; it does not link a prebuilt `libnvcomp.so`. Do **not** pass `-DBUILD_NVCOMPDX=ON` — nvCOMPDx FetchContent-clones internal GitLab over SSH, which this cluster cannot reach.
+Host batched ANS and in-kernel fused ANS both come from the copy of nvCOMP under `nvcomp/`. `00_basic_gemm` compiles that as a **static** library (relocatable device code) and calls `nvcompDeviceANSCompressChunk` from the GEMM CTA. It does not use MathDx / nvCOMPDx.
 
-In-kernel nvCOMPDx is the MathDx tarball at
-`/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06`
-(nvCOMPDx 0.1.4, `include/nvcompdx.hpp`, `lib/libnvcompdx.fatbin`). On aarch64 (GB200) link **`mathdx::nvcompdx_fatbin`**, not `libnvcompdx.a` (that static lib is x86_64). Device code still needs separable compilation and `-dlto`.
-
-```cmake
-set(MATHDX_ROOT "/home/esoha/nvidia-mathdx-26.06.1-cuda13/nvidia/mathdx/26.06")
-find_package(mathdx REQUIRED COMPONENTS nvcompdx CONFIG PATHS "${MATHDX_ROOT}" NO_DEFAULT_PATH)
-target_link_libraries(00_basic_gemm PRIVATE mathdx::nvcompdx_fatbin)
-set_target_properties(00_basic_gemm PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  INTERPROCEDURAL_OPTIMIZATION ON)
-```
-
-Host batched ANS (`nvcompBatchedANSCompressAsync`) is the in-tree `nvcomp` static library, not MathDx.
+Do **not** pass `-DBUILD_NVCOMPDX=ON` — that FetchContent-clones internal GitLab over SSH, which this cluster cannot reach.
 
 For c++:
 ```bash

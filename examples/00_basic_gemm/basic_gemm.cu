@@ -65,7 +65,7 @@
 #include <cublas_v2.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvcomp/ans.h>
-#include <nvcompdx.hpp>
+#include <nvcomp/ans_device.cuh>
 
 // Helper methods to check for errors
 #include "helper.h"
@@ -80,13 +80,13 @@
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMPDx
+// Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMP LLIF
 //
 // LinearCombination is a per-thread functor and never holds a whole 128x128 tile. After it writes
 // D, the same CTA packs that strided column-major tile into a contiguous 64 KiB chunk and runs
-// block-level ANS. device::Gemm launches Kernel<GemmKernel> with no hook after the epilogue, so
-// this example launches Kernel<GemmFusedAns> itself (same grid, 256 threads, dynamic smem reused
-// after the epilogue).
+// device-level char rANS (`nvcompDeviceANSCompressChunk`). device::Gemm launches Kernel<GemmKernel>
+// with no hook after the epilogue, so this example launches Kernel<GemmFusedAns> itself (same grid,
+// 256 threads, dynamic smem reused after the epilogue).
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -97,17 +97,11 @@ enum {
   kAnsThreads = kAnsWarps * 32
 };
 
+static_assert(kAnsThreads == NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS,
+              "GEMM CTA width must match nvcompDeviceANSCompressChunk");
+
 static constexpr unsigned kAnsChunkBytes =
     static_cast<unsigned>(kAnsTileM) * kAnsTileN * sizeof(float);
-
-using AnsCompressor = decltype(
-    nvcompdx::Algorithm<nvcompdx::algorithm::ans>() +
-    nvcompdx::DataType<nvcompdx::datatype::uint8>() +
-    nvcompdx::Direction<nvcompdx::direction::compress>() +
-    nvcompdx::MaxUncompChunkSize<kAnsChunkBytes>() +
-    nvcompdx::Block() +
-    nvcompdx::BlockWarp<kAnsWarps, true>() +
-    nvcompdx::SM<1000>());
 
 static size_t align_up_bytes(size_t value, size_t alignment) {
   if (alignment == 0) {
@@ -116,40 +110,16 @@ static size_t align_up_bytes(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
-static cudaError_t CheckNvcompdxSm() {
-  int device = 0;
-  cudaError_t err = cudaGetDevice(&device);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  int major = 0;
-  int minor = 0;
-  err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  if (major != 10) {
-    std::cerr << "nvCOMPDx kernel in this example is compiled for SM100 (GB200), got SM"
-              << major << minor << std::endl;
-    return cudaErrorInvalidDevice;
-  }
-  return cudaSuccess;
-}
-
 static cudaError_t PrintAnsRatio(
-    unsigned long long const *d_comp_sizes,
+    size_t const *d_comp_sizes,
     size_t num_chunks,
     size_t chunk_bytes,
     char const *label) {
-  std::vector<unsigned long long> h_comp_sizes(num_chunks);
+  std::vector<size_t> h_comp_sizes(num_chunks);
   cudaError_t err = cudaMemcpy(
       h_comp_sizes.data(),
       d_comp_sizes,
-      num_chunks * sizeof(unsigned long long),
+      num_chunks * sizeof(size_t),
       cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) {
     return err;
@@ -157,7 +127,7 @@ static cudaError_t PrintAnsRatio(
 
   size_t compressed_bytes = 0;
   for (size_t i = 0; i < num_chunks; ++i) {
-    compressed_bytes += static_cast<size_t>(h_comp_sizes[i]);
+    compressed_bytes += h_comp_sizes[i];
   }
   size_t const uncompressed_bytes = num_chunks * chunk_bytes;
   std::cout << label << ": " << num_chunks
@@ -179,8 +149,10 @@ struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float
     size_t packed_stride_elems = 0;
     char *compressed = nullptr;
     size_t compressed_stride = 0;
-    unsigned long long *comp_sizes = nullptr;
-    unsigned char *tmp = nullptr;
+    size_t *comp_sizes = nullptr;
+    int max_sub_chunk_size = 0;
+    uint32_t slot_words = 0;
+    size_t smem_alignment = 16;
     int orig_M = 0;
     int orig_N = 0;
 
@@ -216,7 +188,7 @@ using CutlassGemm = cutlass::gemm::device::Gemm<
 
 using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
 static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
-              "nvCOMPDx BlockWarp<8> requires the 256-thread CUTLASS GEMM CTA");
+              "nvcompDeviceANSCompressChunk requires the 256-thread CUTLASS GEMM CTA");
 
 /// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile and ANS-compress it.
 struct GemmFusedAns {
@@ -226,8 +198,6 @@ struct GemmFusedAns {
 
   CUTLASS_DEVICE
   void compress_tile(Params const &params, unsigned char *shared_scratch) {
-    NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(AnsCompressor);
-
     typename CutlassGemmKernel::ThreadblockSwizzle threadblock_swizzle;
     cutlass::gemm::GemmCoord tb =
         threadblock_swizzle.get_tile_offset(params.swizzle_log_tile);
@@ -261,26 +231,20 @@ struct GemmFusedAns {
 
     __syncthreads();
 
-    uintptr_t const align = static_cast<uintptr_t>(AnsCompressor::shmem_alignment());
     uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(shared_scratch);
+    uintptr_t const align = static_cast<uintptr_t>(ans.smem_alignment);
     if (align > 1) {
       scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
     }
-    unsigned char *aligned_scratch = reinterpret_cast<unsigned char *>(scratch_addr);
 
-    auto compressor = AnsCompressor();
-    unsigned char *tmp = ans.tmp;
-    if (tmp != nullptr && compressor.tmp_size_group() > 0) {
-      tmp += compressor.tmp_size_group() * tile_id;
-    }
-
-    compressor.execute(
-        packed,
+    nvcompDeviceANSCompressChunk(
         ans.compressed + tile_id * ans.compressed_stride,
+        packed,
         kAnsChunkBytes,
         ans.comp_sizes + tile_id,
-        aligned_scratch,
-        tmp);
+        ans.max_sub_chunk_size,
+        ans.slot_words,
+        reinterpret_cast<void *>(scratch_addr));
   }
 
   CUTLASS_DEVICE
@@ -303,8 +267,7 @@ struct GemmFusedAns {
 };
 
 /// Pack one column-major 128x128 tile and ANS-compress it. No GEMM.
-template <typename Compressor>
-__global__ void compress_tiles_nvcompdx_kernel(
+__global__ void compress_tiles_llif_kernel(
     float const *C,
     int ldc,
     int M,
@@ -313,10 +276,10 @@ __global__ void compress_tiles_nvcompdx_kernel(
     size_t packed_stride_elems,
     char *compressed_tiles,
     size_t compressed_stride,
-    unsigned long long *comp_sizes,
-    unsigned char *tmp_global) {
-  NVCOMPDX_SKIP_IF_NOT_APPLICABLE_SM(Compressor);
-
+    size_t *comp_sizes,
+    int max_sub_chunk_size,
+    uint32_t slot_words,
+    size_t smem_alignment) {
   int const tile_m = static_cast<int>(blockIdx.x);
   int const tile_n = static_cast<int>(blockIdx.y);
   int const tiles_m = static_cast<int>(gridDim.x);
@@ -342,20 +305,20 @@ __global__ void compress_tiles_nvcompdx_kernel(
   }
   __syncthreads();
 
-  auto compressor = Compressor();
-  extern __shared__ __align__(Compressor::shmem_alignment()) unsigned char shared_scratch[];
-  unsigned char *tmp = tmp_global;
-  if (tmp != nullptr && compressor.tmp_size_group() > 0) {
-    tmp += compressor.tmp_size_group() * tile_id;
+  extern __shared__ unsigned char shared_scratch[];
+  uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(shared_scratch);
+  uintptr_t const align = static_cast<uintptr_t>(smem_alignment);
+  if (align > 1) {
+    scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
   }
-
-  compressor.execute(
-      packed,
+  nvcompDeviceANSCompressChunk(
       compressed_tiles + tile_id * compressed_stride,
+      packed,
       kAnsChunkBytes,
       comp_sizes + tile_id,
-      shared_scratch,
-      tmp);
+      max_sub_chunk_size,
+      slot_words,
+      reinterpret_cast<void *>(scratch_addr));
 }
 
 __global__ void count_ans_tile_mismatches_kernel(
@@ -394,7 +357,7 @@ __global__ void count_ans_tile_mismatches_kernel(
 __global__ void count_compressed_bitstream_mismatches_kernel(
     unsigned char const *dx_compressed,
     size_t dx_stride,
-    unsigned long long const *dx_sizes,
+    size_t const *dx_sizes,
     unsigned char const *llif_compressed,
     size_t llif_stride,
     size_t const *llif_sizes,
@@ -405,20 +368,18 @@ __global__ void count_compressed_bitstream_mismatches_kernel(
     return;
   }
 
-  unsigned long long const dx_bytes = dx_sizes[tile_id];
+  size_t const dx_bytes = dx_sizes[tile_id];
   size_t const llif_bytes = llif_sizes[tile_id];
   __shared__ int tile_mismatch;
   if (threadIdx.x == 0) {
-    tile_mismatch = (dx_bytes != static_cast<unsigned long long>(llif_bytes));
+    tile_mismatch = (dx_bytes != llif_bytes);
   }
   __syncthreads();
 
   unsigned char const *a = dx_compressed + tile_id * dx_stride;
   unsigned char const *b = llif_compressed + tile_id * llif_stride;
-  unsigned long long const n = dx_bytes < static_cast<unsigned long long>(llif_bytes)
-                                   ? dx_bytes
-                                   : static_cast<unsigned long long>(llif_bytes);
-  for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) {
+  size_t const n = dx_bytes < llif_bytes ? dx_bytes : llif_bytes;
+  for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
     if (a[i] != b[i]) {
       tile_mismatch = 1;
     }
@@ -435,7 +396,7 @@ cudaError_t ValidateAnsCompression(
     size_t packed_stride,
     void const *compressed,
     size_t compressed_stride,
-    unsigned long long const *comp_sizes,
+    size_t const *comp_sizes,
     size_t num_chunks,
     size_t chunk_bytes) {
   if (num_chunks == 0) {
@@ -532,23 +493,21 @@ cudaError_t ValidateAnsCompression(
     }
   }
 
-  std::vector<unsigned long long> h_comp_ull(num_chunks);
+  std::vector<size_t> h_comp_bytes(num_chunks);
   err = cudaMemcpy(
-      h_comp_ull.data(),
+      h_comp_bytes.data(),
       comp_sizes,
-      num_chunks * sizeof(unsigned long long),
+      num_chunks * sizeof(size_t),
       cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
-  std::vector<size_t> h_comp_bytes(num_chunks);
   std::vector<size_t> h_out_caps(num_chunks, chunk_bytes);
   std::vector<void *> h_in_ptrs(num_chunks);
   std::vector<void *> h_out_ptrs(num_chunks);
   char *comp_base = static_cast<char *>(const_cast<void *>(compressed));
   for (size_t i = 0; i < num_chunks; ++i) {
-    h_comp_bytes[i] = static_cast<size_t>(h_comp_ull[i]);
     h_in_ptrs[i] = comp_base + i * compressed_stride;
     h_out_ptrs[i] = d_decompressed + i * decompressed_stride;
   }
@@ -804,16 +763,16 @@ cudaError_t ValidateAnsCompression(
   }
 
   if (mismatches != 0) {
-    std::cerr << "ANS compress bitstream compare (nvCOMPDx vs LLIF) failed: " << mismatches
+    std::cerr << "ANS compress bitstream compare (device LLIF vs host LLIF) failed: " << mismatches
               << " / " << num_chunks << " tiles differed";
     if (num_chunks > 0) {
-      std::cerr << " (tile 0 nvCOMPDx " << h_comp_ull[0] << " B, LLIF " << h_llif_sizes[0]
+      std::cerr << " (tile 0 device " << h_comp_bytes[0] << " B, host LLIF " << h_llif_sizes[0]
                 << " B)";
     }
     std::cerr << std::endl;
     return cudaErrorUnknown;
   }
-  std::cout << "ANS compress bitstream compare (nvCOMPDx vs LLIF): passed (" << num_chunks
+  std::cout << "ANS compress bitstream compare (device LLIF vs host LLIF): passed (" << num_chunks
             << " tiles)" << std::endl;
   return cudaSuccess;
 }
@@ -824,37 +783,63 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t err = CheckNvcompdxSm();
-  if (err != cudaSuccess) {
-    return err;
-  }
-
   int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
   int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
   size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
 
   size_t const chunk_bytes = kAnsChunkBytes;
-  size_t const shmem_bytes = static_cast<size_t>(AnsCompressor::shmem_size_group());
-  size_t const tmp_bytes = static_cast<size_t>(AnsCompressor::tmp_size_total(num_chunks));
-  size_t const packed_stride = align_up_bytes(
-      chunk_bytes, std::max(static_cast<size_t>(AnsCompressor::input_alignment()), size_t(256)));
-  size_t const compressed_stride = align_up_bytes(
-      static_cast<size_t>(AnsCompressor::max_comp_chunk_size()),
-      std::max(static_cast<size_t>(AnsCompressor::output_alignment()), size_t(256)));
+  nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
+  int max_sub_chunk_size = 0;
+  uint32_t slot_words = 0;
+  size_t ans_smem = 0;
+  size_t ans_align = 16;
+  int block_threads = 0;
+  nvcompStatus_t nvst = nvcompBatchedANSCompressGetDeviceLaunchParams(
+      num_chunks,
+      chunk_bytes,
+      compress_opts,
+      &max_sub_chunk_size,
+      &slot_words,
+      &ans_smem,
+      &ans_align,
+      &block_threads);
+  if (nvst != nvcompSuccess) {
+    std::cerr << "nvcompBatchedANSCompressGetDeviceLaunchParams failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
+    return cudaErrorUnknown;
+  }
+  if (block_threads != kAnsThreads) {
+    std::cerr << "device ANS compressor requires " << block_threads
+              << " threads, GEMM CTA is " << kAnsThreads << std::endl;
+    return cudaErrorInvalidValue;
+  }
+
+  size_t max_comp_chunk = 0;
+  nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
+      chunk_bytes, compress_opts, &max_comp_chunk);
+  if (nvst != nvcompSuccess) {
+    std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
+    return cudaErrorUnknown;
+  }
+
+  size_t const packed_stride =
+      align_up_bytes(chunk_bytes, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
+  size_t const compressed_stride =
+      align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
+  size_t const dyn_smem = ans_smem + ans_align;
 
   float *d_packed = nullptr;
   char *d_compressed = nullptr;
-  unsigned long long *d_comp_sizes = nullptr;
-  unsigned char *d_temp = nullptr;
+  size_t *d_comp_sizes = nullptr;
 
   auto free_all = [&]() {
     cudaFree(d_packed);
     cudaFree(d_compressed);
     cudaFree(d_comp_sizes);
-    cudaFree(d_temp);
   };
 
-  err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
   if (err != cudaSuccess) {
     return err;
   }
@@ -863,48 +848,41 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     free_all();
     return err;
   }
-  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(unsigned long long));
+  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
-  if (tmp_bytes) {
-    err = cudaMalloc(&d_temp, tmp_bytes);
-    if (err != cudaSuccess) {
-      free_all();
-      return err;
-    }
-  }
-
-  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(unsigned long long));
+  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
 
   err = cudaFuncSetAttribute(
-      compress_tiles_nvcompdx_kernel<AnsCompressor>,
+      compress_tiles_llif_kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(shmem_bytes));
+      static_cast<int>(dyn_smem));
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
 
-  nvtxRangePushA("nvcompdx_ans_tiles");
+  nvtxRangePushA("nvcomp_llif_ans_tiles");
   for (int iter = 0; iter < iterations; ++iter) {
-    compress_tiles_nvcompdx_kernel<AnsCompressor>
-        <<<dim3(tiles_m, tiles_n), kAnsThreads, shmem_bytes>>>(
-            C,
-            ldc,
-            M,
-            N,
-            d_packed,
-            packed_stride / sizeof(float),
-            d_compressed,
-            compressed_stride,
-            d_comp_sizes,
-            d_temp);
+    compress_tiles_llif_kernel<<<dim3(tiles_m, tiles_n), kAnsThreads, dyn_smem>>>(
+        C,
+        ldc,
+        M,
+        N,
+        d_packed,
+        packed_stride / sizeof(float),
+        d_compressed,
+        compressed_stride,
+        d_comp_sizes,
+        max_sub_chunk_size,
+        slot_words,
+        ans_align);
   }
   err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -919,7 +897,7 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     return err;
   }
 
-  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMPDx ANS (only)");
+  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMP LLIF ANS (only)");
   if (err == cudaSuccess) {
     err = ValidateAnsCompression(
         d_packed,
@@ -989,11 +967,6 @@ cudaError_t CutlassSgemmNN(
   // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
   // and launches a RowMajor kernel on problem {N, M, K}.
 
-  cudaError_t err = CheckNvcompdxSm();
-  if (err != cudaSuccess) {
-    return err;
-  }
-
   using ThreadblockSwizzle = typename CutlassGemmKernel::ThreadblockSwizzle;
   ThreadblockSwizzle threadblock_swizzle;
 
@@ -1016,30 +989,59 @@ cudaError_t CutlassSgemmNN(
       static_cast<size_t>(grid_tiled_shape.m()) * static_cast<size_t>(grid_tiled_shape.n());
 
   size_t const chunk_bytes = kAnsChunkBytes;
-  size_t const nvcomp_shmem = static_cast<size_t>(AnsCompressor::shmem_size_group());
+  nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
+  int max_sub_chunk_size = 0;
+  uint32_t slot_words = 0;
+  size_t ans_smem = 0;
+  size_t ans_align = 16;
+  int block_threads = 0;
+  nvcompStatus_t nvst = nvcompBatchedANSCompressGetDeviceLaunchParams(
+      num_chunks,
+      chunk_bytes,
+      compress_opts,
+      &max_sub_chunk_size,
+      &slot_words,
+      &ans_smem,
+      &ans_align,
+      &block_threads);
+  if (nvst != nvcompSuccess) {
+    std::cerr << "nvcompBatchedANSCompressGetDeviceLaunchParams failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
+    return cudaErrorUnknown;
+  }
+  if (block_threads != kAnsThreads) {
+    std::cerr << "device ANS compressor requires " << block_threads
+              << " threads, GEMM CTA is " << kAnsThreads << std::endl;
+    return cudaErrorInvalidValue;
+  }
+
+  size_t max_comp_chunk = 0;
+  nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
+      chunk_bytes, compress_opts, &max_comp_chunk);
+  if (nvst != nvcompSuccess) {
+    std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
+    return cudaErrorUnknown;
+  }
+
   size_t const gemm_shmem = sizeof(typename CutlassGemmKernel::SharedStorage);
-  size_t const shmem_align = static_cast<size_t>(AnsCompressor::shmem_alignment());
-  size_t const dyn_smem = std::max(gemm_shmem, nvcomp_shmem + shmem_align);
-  size_t const tmp_bytes = static_cast<size_t>(AnsCompressor::tmp_size_total(num_chunks));
-  size_t const packed_stride = align_up_bytes(
-      chunk_bytes, std::max(static_cast<size_t>(AnsCompressor::input_alignment()), size_t(256)));
-  size_t const compressed_stride = align_up_bytes(
-      static_cast<size_t>(AnsCompressor::max_comp_chunk_size()),
-      std::max(static_cast<size_t>(AnsCompressor::output_alignment()), size_t(256)));
+  size_t const dyn_smem = std::max(gemm_shmem, ans_smem + ans_align);
+  size_t const packed_stride =
+      align_up_bytes(chunk_bytes, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
+  size_t const compressed_stride =
+      align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
 
   float *d_packed = nullptr;
   char *d_compressed = nullptr;
-  unsigned long long *d_comp_sizes = nullptr;
-  unsigned char *d_temp = nullptr;
+  size_t *d_comp_sizes = nullptr;
 
   auto free_all = [&]() {
     cudaFree(d_packed);
     cudaFree(d_compressed);
     cudaFree(d_comp_sizes);
-    cudaFree(d_temp);
   };
 
-  err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
   if (err != cudaSuccess) {
     return err;
   }
@@ -1048,20 +1050,12 @@ cudaError_t CutlassSgemmNN(
     free_all();
     return err;
   }
-  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(unsigned long long));
+  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
   }
-  if (tmp_bytes) {
-    err = cudaMalloc(&d_temp, tmp_bytes);
-    if (err != cudaSuccess) {
-      free_all();
-      return err;
-    }
-  }
-
-  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(unsigned long long));
+  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -1072,7 +1066,9 @@ cudaError_t CutlassSgemmNN(
   args.epilogue.compressed = d_compressed;
   args.epilogue.compressed_stride = compressed_stride;
   args.epilogue.comp_sizes = d_comp_sizes;
-  args.epilogue.tmp = d_temp;
+  args.epilogue.max_sub_chunk_size = max_sub_chunk_size;
+  args.epilogue.slot_words = slot_words;
+  args.epilogue.smem_alignment = ans_align;
   args.epilogue.orig_M = M;
   args.epilogue.orig_N = N;
   underlying_args = CutlassGemm::to_underlying_arguments(args);
@@ -1119,7 +1115,7 @@ cudaError_t CutlassSgemmNN(
     return err;
   }
 
-  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMPDx ANS (fused)");
+  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMP LLIF ANS (fused)");
   if (err == cudaSuccess) {
     err = ValidateAnsCompression(
         d_packed,
@@ -1563,7 +1559,7 @@ static bool is_opt(const char *arg, const char *hyphen, const char *underscore) 
 
 static void PrintUsage(std::ostream &os) {
   os << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [options]\n"
-     << "  --fuse-nvcomp   ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA\n"
+     << "  --fuse-nvcomp   ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
      << "  --nvcomp-only   Run only tile ANS (no GEMM); uses M x N as the matrix\n"
      << "  --iters N       Launch each kernel N times (default 10)\n";
 }

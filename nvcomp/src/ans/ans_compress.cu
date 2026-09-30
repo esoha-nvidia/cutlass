@@ -20,6 +20,7 @@
 #include "device_guard.h"
 #include "exception.hpp"
 #include "Logging.h"
+#include "nvcomp/ans_device.cuh"
 #include "nvcomp/shared_types.h"
 #include "nvcomp_common_deps/hlif_shared_types.hpp"
 
@@ -121,6 +122,35 @@ void get_sub_chunking_config(
     // get a terrible compression ratio anyway if the chunks were small enough for this to happen.
     max_sub_chunk_size = max(MIN_SUB_CHUNK_SIZE, max_sub_chunk_size);
   }
+}
+
+void compressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_size,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  cudaStream_t stream,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+)
+{
+  assert(max_sub_chunk_size != nullptr);
+  assert(slot_words != nullptr);
+  assert(smem_bytes != nullptr);
+  assert(smem_alignment != nullptr);
+  assert(block_threads != nullptr);
+
+  get_sub_chunking_config(
+    max_uncompressed_chunk_size, num_chunks, stream, *max_sub_chunk_size, format_opts.max_sub_chunk_count
+  );
+  *slot_words = static_cast<uint32_t>(get_max_comp_sub_chunk_size(*max_sub_chunk_size) / sizeof(uint32_t));
+
+  using Smem = CompressSmem<CharEncodePolicy, NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS / WARP_SIZE>;
+  *smem_bytes = sizeof(Smem);
+  *smem_alignment = alignof(Smem);
+  *block_threads = NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS;
 }
 
 void compressAsync(

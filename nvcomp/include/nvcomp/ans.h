@@ -232,6 +232,39 @@ nvcompStatus_t nvcompBatchedANSCompressGetMaxOutputChunkSize(
 );
 
 /**
+ * @brief Parameters for calling `nvcompDeviceANSCompressChunk` from another kernel.
+ *
+ * The device compressor is char/uint8 rANS and requires a CTA of
+ * `*block_threads` threads (256) with at least `*smem_bytes` of aligned shared
+ * memory. `*max_sub_chunk_size` and `*slot_words` must be forwarded unchanged
+ * into the device call. Use the same `compress_opts` and `num_chunks` as a
+ * later `nvcompBatchedANSCompressAsync` if the bitstreams need to match.
+ *
+ * @param[in] num_chunks Number of chunks that will be compressed (occupancy
+ *                       auto-config when `compress_opts.max_sub_chunk_count` is 0).
+ * @param[in] max_uncompressed_chunk_bytes Maximum uncompressed chunk size.
+ * @param[in] compress_opts Compression options (same as the host batched API).
+ * @param[out] max_sub_chunk_size Sub-chunk size in symbols.
+ * @param[out] slot_words Worst-case sub-chunk slot stride in uint32 words.
+ * @param[out] smem_bytes Shared memory required by the device compressor.
+ * @param[out] smem_alignment Alignment required for that shared memory.
+ * @param[out] block_threads Required CTA thread count.
+ *
+ * @return nvcompSuccess if successful, and an error code otherwise.
+ */
+NVCOMP_EXPORT
+nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t compress_opts,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+);
+
+/**
  * @brief Perform batched asynchronous compression.
  *
  * @warning Violating any of the conditions listed in the parameter descriptions

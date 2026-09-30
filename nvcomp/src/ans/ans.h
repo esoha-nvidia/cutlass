@@ -68,6 +68,23 @@ void compressGetMaxOutputChunkSize(
 );
 
 /**
+ * @brief CTA launch parameters for nvcompDeviceANSCompressChunk (char rANS,
+ * two states per lane, exact histogram). `slot_words` is the sub-chunk
+ * compressed slot size in bytes (same value compressAsync passes as
+ * subchunk_comp_buffer_size).
+ */
+void compressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_size,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+);
+
+/**
  * @brief Perform compression.
  *
  * @param type The ANS compression algorithm type.

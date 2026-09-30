@@ -20,17 +20,23 @@ __device__ void nvcompDeviceANSCompressChunk(
   void *smem
 )
 {
-  using Policy = ans_gpu_lib::detail::CharEncodePolicy;
-  constexpr int kThreads = NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS;
-  using Smem = ans_gpu_lib::detail::CompressSmem<Policy, kThreads / WARP_SIZE>;
-  auto &workspace = *reinterpret_cast<Smem *>(smem);
-  ans_gpu_lib::detail::compress_chunk<Policy, kThreads>(
+  using Policy = ans_gpu_lib::detail::CharEncodePolicy<ans_gpu_lib::detail::CharX2EncodeImpl>;
+  static_assert(
+    NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS == static_cast<int>(ans_gpu_lib::NUM_COMP_THREADS_PER_CTA),
+    "device ANS compress CTA width must match the LLIF compressor"
+  );
+  using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
+  auto &workspace = *reinterpret_cast<Workspace *>(smem);
+  ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
     compressed,
     uncompressed,
     static_cast<ans_gpu_lib::IndexT>(uncompressed_bytes),
-    *compressed_size,
+    compressed_size,
     max_sub_chunk_size,
+    nullptr,
     slot_words,
-    workspace
+    /*histogram_reduction_log2=*/0u,
+    workspace.workspace,
+    workspace.packed_chunk_size_bytes
   );
 }

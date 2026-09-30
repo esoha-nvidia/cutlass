@@ -405,14 +405,15 @@ cudaError_t ValidateAnsCompression(
 
   nvcompBatchedANSDecompressOpts_t const opts = nvcompBatchedANSDecompressDefaultOpts;
   size_t temp_bytes = 0;
-  nvcompStatus_t nvst = nvcompBatchedANSDecompressGetTempSizeAsync(
+  nvcompStatus_t nvst = nvcompBatchedANSDecompressGetTempSize(
       num_chunks,
       chunk_bytes,
       opts,
       &temp_bytes,
-      num_chunks * chunk_bytes);
+      num_chunks * chunk_bytes,
+      0);
   if (nvst != nvcompSuccess) {
-    std::cerr << "nvcompBatchedANSDecompressGetTempSizeAsync failed: "
+    std::cerr << "nvcompBatchedANSDecompressGetTempSize failed: "
               << nvcompGetStatusString(nvst) << std::endl;
     return cudaErrorUnknown;
   }
@@ -618,14 +619,15 @@ cudaError_t ValidateAnsCompression(
 
   nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
   size_t compress_temp_bytes = 0;
-  nvst = nvcompBatchedANSCompressGetTempSizeAsync(
+  nvst = nvcompBatchedANSCompressGetTempSize(
       num_chunks,
       chunk_bytes,
       compress_opts,
       &compress_temp_bytes,
-      num_chunks * chunk_bytes);
+      num_chunks * chunk_bytes,
+      0);
   if (nvst != nvcompSuccess) {
-    std::cerr << "nvcompBatchedANSCompressGetTempSizeAsync failed: "
+    std::cerr << "nvcompBatchedANSCompressGetTempSize failed: "
               << nvcompGetStatusString(nvst) << std::endl;
     free_all();
     return cudaErrorUnknown;

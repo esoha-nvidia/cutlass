@@ -61,9 +61,9 @@ static constexpr unsigned int gdeflate_total_symbols_smem = 320;
 // definitions are exposed as constexpr so the CPU code in cpu/ can reuse them
 // instead of carrying its own copies.
 #ifdef __CUDACC__
-#define CONSTANT_ARRAY __constant__
+#define CONSTANT_ARRAY static __constant__
 #else
-#define CONSTANT_ARRAY constexpr
+#define CONSTANT_ARRAY static constexpr
 #endif // __CUDACC__
 
 CONSTANT_ARRAY unsigned int map[] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}; // 5 bits

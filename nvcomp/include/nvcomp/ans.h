@@ -268,6 +268,34 @@ nvcompStatus_t nvcompBatchedANSCompressGetMaxOutputChunkSize(
 );
 
 /**
+ * @brief CTA parameters for in-kernel `nvcompDeviceANSCompressChunk`.
+ *
+ * The device compressor is char rANS with two states per lane and an exact
+ * histogram (`nvcompBatchedANSCompressDefaultOpts`). `slot_words` is the
+ * sub-chunk compressed slot size in bytes.
+ *
+ * @param[in]  num_chunks Number of chunks (unused; kept for API stability).
+ * @param[in]  max_uncompressed_chunk_bytes Maximum uncompressed chunk size.
+ * @param[in]  compress_opts Compression options (sub-chunk sizing).
+ * @param[out] max_sub_chunk_size Sub-chunk size in symbols.
+ * @param[out] slot_words Sub-chunk compressed slot size in bytes.
+ * @param[out] smem_bytes Shared-memory workspace size for the device entry.
+ * @param[out] smem_alignment Alignment of that workspace.
+ * @param[out] block_threads Required CTA width (`NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS`).
+ */
+NVCOMP_EXPORT
+nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t compress_opts,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+);
+
+/**
  * @brief Perform batched asynchronous compression.
  *
  * @warning Violating any of the conditions listed in the parameter descriptions

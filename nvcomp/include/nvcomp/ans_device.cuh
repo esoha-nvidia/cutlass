@@ -18,6 +18,17 @@
 /// Thread count required by nvcompDeviceANSCompressChunk (CUTLASS 128x128 SIMT CTA).
 static constexpr int NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS = 256;
 
+extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
+  size_t num_chunks,
+  size_t max_uncompressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t compress_opts,
+  int *max_sub_chunk_size,
+  uint32_t *slot_words,
+  size_t *smem_bytes,
+  size_t *smem_alignment,
+  int *block_threads
+);
+
 #ifdef __CUDACC__
 
 /**

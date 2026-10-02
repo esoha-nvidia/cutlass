@@ -8,15 +8,12 @@
  * license agreement from NVIDIA CORPORATION is strictly prohibited.
  */
 
-#include <limits>
-
 #include <ans/ans_arch_profile.cuh>
 #include <ans/compress_kernels.cuh>
 #include <ans/histogram.cuh>
 #include <ans/normalize_counts_common.cuh>
 #include <ans/simple_defrag.cuh>
 #include <ans/symbol_encoder.cuh>
-#include <nvcomp/ans.h>
 
 namespace ans_gpu_lib
 {
@@ -53,15 +50,6 @@ struct CompressSmem
   // Parked chunk bases and per-warp 32-bit offsets from comp_chunk. Encode rematerializes
   // pointers from these so 64-bit addresses do not stay live across the hot loop.
   EncodeChunkSmem enc;
-};
-
-// Workspace for nvcompDeviceANSCompressChunk: CompressSmem plus the uint32
-// packed size that compress_kernel otherwise keeps as a separate __shared__.
-template <typename EncodePolicy>
-struct DeviceCompressSmem
-{
-  CompressSmem<EncodePolicy> workspace;
-  uint32_t packed_chunk_size_bytes;
 };
 
 // Tail of a zero-ANS-symbol chunk: a header with one sub-chunk of size 0, then
@@ -416,118 +404,6 @@ __device__ __forceinline__ bool prepare_and_encode_chunk(CompressSmem<EncodePoli
   }
 }
 
-// One-chunk compress used by compress_kernel and nvcompDeviceANSCompressChunk.
-// Must be called by every thread of a NUM_COMP_THREADS_PER_CTA CTA.
-template <typename EncodePolicy, bool Sampled>
-__device__ __forceinline__ void compress_chunk(
-  void *comp_chunk,
-  const void *uncomp_chunk,
-  IndexT bytes,
-  size_t *comp_chunk_size_out,
-  int max_sub_chunk_size,
-  nvcompStatus_t *device_status,
-  uint32_t subchunk_comp_buffer_size,
-  uint32_t histogram_reduction_log2,
-  CompressSmem<EncodePolicy> &smem,
-  uint32_t &packed_chunk_size_bytes
-)
-{
-  static_assert(
-    nvcompANSCompressionMaxAllowedChunkSize <= std::numeric_limits<IndexT>::max(),
-    "ANS chunk size exceeds IndexT range"
-  );
-  constexpr IndexT INPUT_BYTES_PER_VALUE = EncodePolicy::STREAM_TYPE == AnsStreamType::Fp16   ? sizeof(uint16_t)
-                                           : EncodePolicy::STREAM_TYPE == AnsStreamType::Fp32 ? sizeof(uint32_t)
-                                                                                              : sizeof(uint8_t);
-  if (bytes % INPUT_BYTES_PER_VALUE != 0)
-  {
-    if (threadIdx.x == 0)
-    {
-      *comp_chunk_size_out = 0;
-      if (device_status != nullptr)
-      {
-        *device_status = nvcompErrorCannotCompress;
-      }
-    }
-    return;
-  }
-
-  const IndexT symbols = EncodePolicy::num_symbols(bytes);
-
-  // Zero-ANS-symbol chunk: header plus any fp8 trailing raw byte, then defrag.
-  // The tail hook persists the fp8 N == 1 raw byte; this skips the histogram.
-  if (symbols == 0)
-  {
-    if (threadIdx.x == 0)
-    {
-      EncodePolicy::write_chunk_tail(
-        static_cast<uint8_t *>(comp_chunk),
-        uncomp_chunk,
-        bytes,
-        /*num_sub_chunks=*/1
-      );
-    }
-    __syncthreads();
-    finish_zero_ans_symbol_chunk<EncodePolicy>(
-      comp_chunk,
-      bytes,
-      max_sub_chunk_size,
-      packed_chunk_size_bytes,
-      subchunk_comp_buffer_size
-    );
-    if (threadIdx.x == 0)
-    {
-      *comp_chunk_size_out = packed_chunk_size_bytes;
-    }
-    return;
-  }
-
-  const uint32_t max_sub_chunk_size_bytes = static_cast<uint32_t>(max_sub_chunk_size) *
-                                            EncodePolicy::INPUT_BYTES_PER_SYMBOL;
-  const int num_sub_chunks_per_chunk = static_cast<int>(ans_derived_num_sub_chunks(bytes, max_sub_chunk_size_bytes));
-
-  // Only a band floor can leave a symbol without a slot, so it alone instantiates detect /
-  // redo; WholeAlphabet and an exact histogram both cover the chunk by construction.
-  constexpr bool SAMPLED_HIST = Sampled && EncodePolicy::HIST_FLOOR != HistFloor::None;
-  constexpr bool DETECT = SAMPLED_HIST && EncodePolicy::HIST_FLOOR == HistFloor::ObservedBand;
-  const bool can_sample = Sampled && symbols >= MIN_SAMPLED_HIST_SYMBOLS;
-
-  if (threadIdx.x == 0)
-  {
-    smem.enc.uncomp_chunk = uncomp_chunk;
-    smem.enc.comp_chunk = comp_chunk;
-    smem.enc.bytes = bytes;
-    smem.enc.symbols = symbols;
-    smem.enc.num_sub_chunks = static_cast<uint32_t>(num_sub_chunks_per_chunk);
-    smem.enc.sample_shift = can_sample ? histogram_reduction_log2 : 0u;
-    smem.enc.max_sub_chunk_size = max_sub_chunk_size;
-  }
-  __syncthreads();
-
-  if constexpr (DETECT)
-  {
-    // Redo from an exact histogram. Rare (dilation covers
-    // near-miss symbols), and it overwrites the abandoned first attempt in place.
-    // Scalars come from EncodeChunkSmem, not live kernel registers.
-    if (prepare_and_encode_chunk<EncodePolicy, true, /*SampledHist=*/true>(smem))
-    {
-      prepare_and_encode_chunk<EncodePolicy, /*Detect=*/false, /*SampledHist=*/false>(smem);
-    }
-  }
-  else
-  {
-    prepare_and_encode_chunk<EncodePolicy, false, SAMPLED_HIST>(smem);
-  }
-
-  ANS_fixed_header *const defrag_header = static_cast<ANS_fixed_header *>(smem.enc.comp_chunk);
-
-  simple_defrag_chunk_cta<NUM_COMP_THREADS_PER_CTA>(defrag_header, subchunk_comp_buffer_size, packed_chunk_size_bytes);
-  if (threadIdx.x == 0)
-  {
-    *comp_chunk_size_out = packed_chunk_size_bytes;
-  }
-}
-
 // Unified fused compress kernel. One CTA per chunk; host dispatch selects the
 // EncodePolicy instantiation by data type, and Sampled by the option given to compress.
 // Batch pointer args are __grid_constant__: grid-uniform and immutable, so they
@@ -557,18 +433,103 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
   __syncthreads();
   const uint32_t bid = chunk_idx_handoff;
 
-  compress_chunk<EncodePolicy, Sampled>(
-    comp_chunks[bid],
-    uncomp_chunks[bid],
-    static_cast<IndexT>(uncomp_chunk_sizes[bid]),
-    &comp_chunk_sizes[bid],
-    max_sub_chunk_size,
-    device_statuses != nullptr ? &device_statuses[bid] : nullptr,
-    subchunk_comp_buffer_size,
-    histogram_reduction_log2,
-    smem,
-    packed_chunk_size_bytes
+  // Narrow once here: the API caps chunk size far below IndexT's range, so
+  // everything downstream indexes with IndexT.
+  static_assert(
+    nvcompANSCompressionMaxAllowedChunkSize <= std::numeric_limits<IndexT>::max(),
+    "ANS chunk size exceeds IndexT range"
   );
+  const IndexT bytes = static_cast<IndexT>(uncomp_chunk_sizes[bid]);
+  constexpr IndexT INPUT_BYTES_PER_VALUE = EncodePolicy::STREAM_TYPE == AnsStreamType::Fp16   ? sizeof(uint16_t)
+                                           : EncodePolicy::STREAM_TYPE == AnsStreamType::Fp32 ? sizeof(uint32_t)
+                                                                                              : sizeof(uint8_t);
+  if (bytes % INPUT_BYTES_PER_VALUE != 0)
+  {
+    if (threadIdx.x == 0)
+    {
+      comp_chunk_sizes[bid] = 0;
+      if (device_statuses != nullptr)
+      {
+        device_statuses[bid] = nvcompErrorCannotCompress;
+      }
+    }
+    return;
+  }
+
+  const IndexT symbols = EncodePolicy::num_symbols(bytes);
+
+  // Zero-ANS-symbol chunk: header plus any fp8 trailing raw byte, then defrag.
+  // The tail hook persists the fp8 N == 1 raw byte; this skips the histogram.
+  if (symbols == 0)
+  {
+    if (threadIdx.x == 0)
+    {
+      EncodePolicy::write_chunk_tail(
+        static_cast<uint8_t *>(comp_chunks[bid]),
+        uncomp_chunks[bid],
+        bytes,
+        /*num_sub_chunks=*/1
+      );
+    }
+    __syncthreads();
+    finish_zero_ans_symbol_chunk<EncodePolicy>(
+      comp_chunks[bid],
+      bytes,
+      max_sub_chunk_size,
+      packed_chunk_size_bytes,
+      subchunk_comp_buffer_size
+    );
+    if (threadIdx.x == 0)
+    {
+      comp_chunk_sizes[bid] = packed_chunk_size_bytes;
+    }
+    return;
+  }
+
+  const uint32_t max_sub_chunk_size_bytes = static_cast<uint32_t>(max_sub_chunk_size) *
+                                            EncodePolicy::INPUT_BYTES_PER_SYMBOL;
+  const int num_sub_chunks_per_chunk = static_cast<int>(ans_derived_num_sub_chunks(bytes, max_sub_chunk_size_bytes));
+
+  // Only a band floor can leave a symbol without a slot, so it alone instantiates detect /
+  // redo; WholeAlphabet and an exact histogram both cover the chunk by construction.
+  constexpr bool SAMPLED_HIST = Sampled && EncodePolicy::HIST_FLOOR != HistFloor::None;
+  constexpr bool DETECT = SAMPLED_HIST && EncodePolicy::HIST_FLOOR == HistFloor::ObservedBand;
+  const bool can_sample = Sampled && symbols >= MIN_SAMPLED_HIST_SYMBOLS;
+
+  if (threadIdx.x == 0)
+  {
+    smem.enc.uncomp_chunk = uncomp_chunks[bid];
+    smem.enc.comp_chunk = comp_chunks[bid];
+    smem.enc.bytes = bytes;
+    smem.enc.symbols = symbols;
+    smem.enc.num_sub_chunks = static_cast<uint32_t>(num_sub_chunks_per_chunk);
+    smem.enc.sample_shift = can_sample ? histogram_reduction_log2 : 0u;
+    smem.enc.max_sub_chunk_size = max_sub_chunk_size;
+  }
+  __syncthreads();
+
+  if constexpr (DETECT)
+  {
+    // Redo from an exact histogram. Rare (dilation covers
+    // near-miss symbols), and it overwrites the abandoned first attempt in place.
+    // Scalars come from EncodeChunkSmem, not live kernel registers.
+    if (prepare_and_encode_chunk<EncodePolicy, true, /*SampledHist=*/true>(smem))
+    {
+      prepare_and_encode_chunk<EncodePolicy, /*Detect=*/false, /*SampledHist=*/false>(smem);
+    }
+  }
+  else
+  {
+    prepare_and_encode_chunk<EncodePolicy, false, SAMPLED_HIST>(smem);
+  }
+
+  ANS_fixed_header *const defrag_header = static_cast<ANS_fixed_header *>(smem.enc.comp_chunk);
+
+  simple_defrag_chunk_cta<NUM_COMP_THREADS_PER_CTA>(defrag_header, subchunk_comp_buffer_size, packed_chunk_size_bytes);
+  if (threadIdx.x == 0)
+  {
+    comp_chunk_sizes[chunk_idx_handoff] = packed_chunk_size_bytes;
+  }
 }
 
 } // namespace detail

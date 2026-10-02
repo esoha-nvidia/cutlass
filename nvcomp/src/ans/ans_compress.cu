@@ -97,40 +97,6 @@ void compressGetMaxOutputChunkSize(
   );
 }
 
-void compressGetDeviceLaunchParams(
-  [[maybe_unused]] size_t num_chunks,
-  size_t max_uncompressed_chunk_size,
-  nvcompBatchedANSCompressOpts_t format_opts,
-  int *max_sub_chunk_size,
-  uint32_t *slot_words,
-  size_t *smem_bytes,
-  size_t *smem_alignment,
-  int *block_threads
-)
-{
-  const uint32_t bytes_per_symbol = encode_bytes_per_symbol(format_opts.data_type);
-  const uint32_t max_chunk_size_symbols = roundUpDiv(narrow_cast<uint32_t>(max_uncompressed_chunk_size), bytes_per_symbol);
-  const uint32_t max_sub = sub_chunk_size_symbols_from_requested_count(
-    max_chunk_size_symbols,
-    resolve_max_sub_chunk_count(format_opts.max_sub_chunk_count)
-  );
-  const uint32_t states_per_lane = compress_states_per_lane(format_opts.data_type, format_opts.states_per_lane);
-  const uint32_t subchunk_comp_buffer_size = get_max_comp_sub_chunk_size(
-    max_sub,
-    states_per_lane,
-    ans_tablelog(ans_stream_type_from_data_type(format_opts.data_type))
-  );
-
-  // Device entry is char two-state exact-histogram; workspace matches that policy.
-  using DeviceWorkspace = DeviceCompressSmem<CharEncodePolicy<CharX2EncodeImpl>>;
-
-  *max_sub_chunk_size = static_cast<int>(max_sub);
-  *slot_words = subchunk_comp_buffer_size;
-  *smem_bytes = sizeof(DeviceWorkspace);
-  *smem_alignment = alignof(DeviceWorkspace);
-  *block_threads = static_cast<int>(NUM_COMP_THREADS_PER_CTA);
-}
-
 void compressAsync(
   const void *const *uncomp_chunks,
   const size_t *uncomp_chunk_sizes,

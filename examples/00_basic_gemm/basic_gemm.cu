@@ -649,6 +649,11 @@ cudaError_t ValidateAnsCompression(
     free_all();
     return err;
   }
+  err = cudaMemset(d_llif_compressed, 0, llif_stride * num_chunks);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
   err = cudaMalloc(&d_llif_sizes, num_chunks * sizeof(size_t));
   if (err != cudaSuccess) {
     free_all();
@@ -841,11 +846,16 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     cudaFree(d_comp_sizes);
   };
 
-  cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  cudaError_t   err = cudaMalloc(&d_packed, packed_stride * num_chunks);
   if (err != cudaSuccess) {
     return err;
   }
   err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemset(d_compressed, 0, compressed_stride * num_chunks);
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -1048,6 +1058,11 @@ cudaError_t CutlassSgemmNN(
     return err;
   }
   err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemset(d_compressed, 0, compressed_stride * num_chunks);
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -1463,7 +1478,8 @@ cudaError_t TestCutlassGemm(
   result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, fuse_nvcomp, iterations);
 
   if (result != cudaSuccess) {
-    std::cerr << "CUTLASS GEMM kernel failed: "
+    std::cerr << (fuse_nvcomp ? "CUTLASS fused GEMM+ANS failed: "
+                              : "CUTLASS GEMM kernel failed: ")
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);

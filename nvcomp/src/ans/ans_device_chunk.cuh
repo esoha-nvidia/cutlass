@@ -95,6 +95,28 @@ __device__ __forceinline__ void compress_chunk(
                                             EncodePolicy::INPUT_BYTES_PER_SYMBOL;
   const int num_sub_chunks_per_chunk = static_cast<int>(ans_derived_num_sub_chunks(bytes, max_sub_chunk_size_bytes));
 
+  // Defrag copies whole uint4s from each sub-chunk slot, including tail bytes the
+  // encoder never wrote. Zero the chunk so those padding bytes are deterministic
+  // (otherwise device vs host LLIF bitstreams differ while still decompressing).
+  {
+    const uint32_t nsc = static_cast<uint32_t>(num_sub_chunks_per_chunk);
+    const uint32_t header_bytes = ans_sub_chunk_0_offset(
+      EncodePolicy::STREAM_TYPE,
+      bytes,
+      nsc,
+      /*min_symbol=*/0,
+      static_cast<uint8_t>(NV_MAX_SYMBOL_VALUE)
+    );
+    const uint32_t total_bytes = header_bytes + nsc * subchunk_comp_buffer_size;
+    uint32_t *words = static_cast<uint32_t *>(comp_chunk);
+    const uint32_t nwords = total_bytes / sizeof(uint32_t);
+    for (uint32_t i = threadIdx.x; i < nwords; i += static_cast<uint32_t>(blockDim.x))
+    {
+      words[i] = 0;
+    }
+    __syncthreads();
+  }
+
   constexpr bool SAMPLED_HIST = Sampled && EncodePolicy::HIST_FLOOR != HistFloor::None;
   constexpr bool DETECT = SAMPLED_HIST && EncodePolicy::HIST_FLOOR == HistFloor::ObservedBand;
   const bool can_sample = Sampled && symbols >= MIN_SAMPLED_HIST_SYMBOLS;

@@ -1348,7 +1348,7 @@ cudaError_t ReferenceGemm(
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Allocate several matrices in GPU device memory and call a single-precision
-/// CUTLASS GEMM kernel. --nvcomp-only skips GEMM and compresses an M x N matrix.
+/// CUTLASS GEMM kernel. --nvcomp-only runs that GEMM once, then compresses C.
 cudaError_t TestCutlassGemm(
     int M,
     int N,
@@ -1361,13 +1361,45 @@ cudaError_t TestCutlassGemm(
   cudaError_t result;
 
   if (nvcomp_only) {
+    int const lda = M;
+    int const ldb = K;
+    int const ldc = M;
+    float *A = nullptr;
+    float *B = nullptr;
     float *C = nullptr;
-    result = AllocateMatrix(&C, M, N, 101);
+    result = AllocateMatrix(&A, M, K, 0);
     if (result != cudaSuccess) {
       return result;
     }
-    result = CompressOutputTilesAns(M, N, C, M, iterations);
+    result = AllocateMatrix(&B, K, N, 17);
+    if (result != cudaSuccess) {
+      cudaFree(A);
+      return result;
+    }
+    result = AllocateMatrix(&C, M, N, 101);
+    if (result != cudaSuccess) {
+      cudaFree(B);
+      cudaFree(A);
+      return result;
+    }
+
+    // Same CUTLASS GEMM as --fuse-nvcomp, without in-CTA compress, so the tiles
+    // compressed below match fused GEMM output.
+    result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                            /*fuse_nvcomp=*/false, /*iterations=*/1);
+    if (result != cudaSuccess) {
+      std::cerr << "CUTLASS GEMM (nvcomp-only setup) failed: "
+                << cudaGetErrorString(result) << std::endl;
+      cudaFree(C);
+      cudaFree(B);
+      cudaFree(A);
+      return result;
+    }
+
+    result = CompressOutputTilesAns(M, N, C, ldc, iterations);
     cudaFree(C);
+    cudaFree(B);
+    cudaFree(A);
     return result;
   }
 
@@ -1578,7 +1610,7 @@ static bool is_opt(const char *arg, const char *hyphen, const char *underscore) 
 static void PrintUsage(std::ostream &os) {
   os << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [options]\n"
      << "  --fuse-nvcomp   ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
-     << "  --nvcomp-only   Run only tile ANS (no GEMM); uses M x N as the matrix\n"
+     << "  --nvcomp-only   CUTLASS GEMM once, then ANS-compress those 128x128 C tiles (no fused kernel)\n"
      << "  --iters N       Launch each kernel N times (default 10)\n";
 }
 
@@ -1660,7 +1692,8 @@ int main(int argc, const char *arg[]) {
   if (nvcomp_only) {
     std::cout << "Running nvCOMP only: M=" << problem[0]
               << " N=" << problem[1]
-              << " (tiles 128x128 => "
+              << " K=" << problem[2]
+              << " (CUTLASS GEMM once, then ANS on 128x128 C tiles => "
               << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
               << " CTAs, iters=" << iterations << ")" << std::endl;
   } else {

@@ -398,7 +398,12 @@ cudaError_t ValidateAnsCompression(
     size_t compressed_stride,
     size_t const *comp_sizes,
     size_t num_chunks,
-    size_t chunk_bytes) {
+    size_t chunk_bytes,
+    float const *C,
+    int ldc,
+    int M,
+    int N,
+    bool pack_mn_swapped) {
   if (num_chunks == 0) {
     return cudaSuccess;
   }
@@ -698,14 +703,22 @@ cudaError_t ValidateAnsCompression(
     return err;
   }
 
+  // Pack from column-major C inside compress_kernel (same gather as
+  // compress_tiles_llif_kernel). Overwrites packed tiles after decompress
+  // validation has already used them as the round-trip reference.
   nvtxRangePushA("nvcomp_ans_llif_compress");
-  nvst = nvcompBatchedANSCompressAsync(
+  nvst = nvcompBatchedANSCompressFromColMajorTilesAsync(
+      C,
+      ldc,
+      M,
+      N,
+      kAnsTileM,
+      kAnsTileN,
+      pack_mn_swapped ? 1 : 0,
       reinterpret_cast<const void *const *>(d_in_ptrs),
       d_out_caps,
       chunk_bytes,
       num_chunks,
-      d_temp,
-      temp_bytes,
       d_out_ptrs,
       d_llif_sizes,
       compress_opts,
@@ -713,7 +726,7 @@ cudaError_t ValidateAnsCompression(
       0);
   if (nvst != nvcompSuccess) {
     nvtxRangePop();
-    std::cerr << "nvcompBatchedANSCompressAsync failed: "
+    std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
               << nvcompGetStatusString(nvst) << std::endl;
     free_all();
     return cudaErrorUnknown;
@@ -918,7 +931,12 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
         compressed_stride,
         d_comp_sizes,
         num_chunks,
-        chunk_bytes);
+        chunk_bytes,
+        C,
+        ldc,
+        M,
+        N,
+        false);
   }
   free_all();
   return err;
@@ -1141,7 +1159,12 @@ cudaError_t CutlassSgemmNN(
         compressed_stride,
         d_comp_sizes,
         num_chunks,
-        chunk_bytes);
+        chunk_bytes,
+        C,
+        ldc,
+        M,
+        N,
+        true);
   }
   free_all();
   return err;

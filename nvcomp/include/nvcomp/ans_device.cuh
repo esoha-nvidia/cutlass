@@ -29,6 +29,30 @@ extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
   int *block_threads
 );
 
+/**
+ * @brief Host launch of compress_kernel that first packs a column-major float
+ * tile into each uncompressed chunk buffer, matching compress_tiles_llif_kernel
+ * when pack_mn_swapped is 0. Uncompressed chunk pointers are the pack destinations.
+ */
+extern "C" nvcompStatus_t nvcompBatchedANSCompressFromColMajorTilesAsync(
+  const float *device_C,
+  int ldc,
+  int M,
+  int N,
+  int tile_m,
+  int tile_n,
+  int pack_mn_swapped,
+  const void *const *device_uncompressed_chunk_ptrs,
+  const size_t *device_uncompressed_chunk_bytes,
+  size_t max_uncompressed_chunk_bytes,
+  size_t num_chunks,
+  void *const *device_compressed_chunk_ptrs,
+  size_t *device_compressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t compress_opts,
+  nvcompStatus_t *device_statuses,
+  cudaStream_t stream
+);
+
 #ifdef __CUDACC__
 
 /**

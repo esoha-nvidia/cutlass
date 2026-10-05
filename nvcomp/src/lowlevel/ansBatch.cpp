@@ -648,6 +648,75 @@ nvcompStatus_t nvcompBatchedANSCompressAsync(
   return nvcompSuccess;
 }
 
+extern "C" nvcompStatus_t nvcompBatchedANSCompressFromColMajorTilesAsync(
+  const float *device_C,
+  int ldc,
+  int M,
+  int N,
+  int tile_m,
+  int tile_n,
+  int pack_mn_swapped,
+  const void *const *device_uncompressed_chunk_ptrs,
+  const size_t *device_uncompressed_chunk_bytes,
+  size_t max_uncompressed_chunk_bytes,
+  size_t num_chunks,
+  void *const *device_compressed_chunk_ptrs,
+  size_t *device_compressed_chunk_bytes,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  nvcompStatus_t *device_statuses,
+  cudaStream_t stream
+)
+{
+  ANS_CHECK_COMPRESS_OPTS(format_opts);
+
+  NVCOMP_CHECK_NOT_NULL(device_C);
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_ptrs);
+  NVCOMP_CHECK_NOT_NULL(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_ptrs);
+  NVCOMP_CHECK_NOT_NULL(device_compressed_chunk_bytes);
+
+  nvcompAlignmentRequirements_t align_reqs{};
+  NVCOMP_WRAP_CHECK_FUNC(nvcompBatchedANSCompressGetRequiredAlignments, format_opts, &align_reqs);
+  cuLibLogger::Logger::Instance().SetMostRecentApi(__func__);
+
+  NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_ptrs);
+  NVCOMP_CHECK_ALIGNMENT(device_uncompressed_chunk_bytes);
+  NVCOMP_CHECK_ALIGNMENT(device_compressed_chunk_ptrs);
+  NVCOMP_CHECK_ALIGNMENT(device_compressed_chunk_bytes);
+  NVCOMP_CHECK_ALIGNMENT(device_statuses);
+
+  NVCOMP_CHECK_CHUNK_SIZE(max_uncompressed_chunk_bytes, nvcompANSCompressionMaxAllowedChunkSize);
+  NVCOMP_CHECK_BATCH_SIZE(num_chunks, std::numeric_limits<int>::max());
+
+  try
+  {
+    ans::compressFromColMajorTilesAsync(
+      device_C,
+      ldc,
+      M,
+      N,
+      tile_m,
+      tile_n,
+      pack_mn_swapped,
+      device_uncompressed_chunk_ptrs,
+      device_uncompressed_chunk_bytes,
+      max_uncompressed_chunk_bytes,
+      num_chunks,
+      device_compressed_chunk_ptrs,
+      device_compressed_chunk_bytes,
+      format_opts,
+      device_statuses,
+      stream
+    );
+  }
+  catch (const std::exception &e)
+  {
+    LOG_ERROR("{}", e.what());
+    return Check::exception_to_error(e, "nvcompBatchedANSCompressFromColMajorTilesAsync()");
+  }
+  return nvcompSuccess;
+}
+
 nvcompStatus_t nvcompBatchedANSGetDecompressSizeAsync(
   const void *const *device_compressed_chunk_ptrs,
   const size_t *device_compressed_chunk_bytes,

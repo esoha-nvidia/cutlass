@@ -97,25 +97,29 @@ void compressGetMaxOutputChunkSize(
   );
 }
 
-void compressAsync(
+namespace
+{
+
+void launchCompressKernel(
   const void *const *uncomp_chunks,
   const size_t *uncomp_chunk_sizes,
   const size_t max_chunk_size_bytes,
   size_t batch_size,
-  [[maybe_unused]] void *temp_ptr,
-  [[maybe_unused]] size_t temp_bytes,
   void *const *comp_chunks,
   size_t *comp_chunk_sizes,
   nvcompBatchedANSCompressOpts_t format_opts,
   nvcompStatus_t *device_statuses,
-  cudaStream_t stream
+  cudaStream_t stream,
+  dim3 fused_grid,
+  const float *pack_C,
+  int pack_ldc,
+  int pack_M,
+  int pack_N,
+  int pack_tile_m,
+  int pack_tile_n,
+  int pack_mn_swapped
 )
 {
-  if (batch_size == 0)
-  {
-    return;
-  }
-
   const uint32_t bytes_per_symbol = encode_bytes_per_symbol(format_opts.data_type);
   const uint32_t max_chunk_size_symbols = roundUpDiv(narrow_cast<uint32_t>(max_chunk_size_bytes), bytes_per_symbol);
   const uint32_t max_sub_chunk_size = sub_chunk_size_symbols_from_requested_count(
@@ -123,14 +127,10 @@ void compressAsync(
     resolve_max_sub_chunk_count(format_opts.max_sub_chunk_count)
   );
 
-  // mark compression successful
   nvcomp::try_clear_device_statuses(batch_size, device_statuses, stream);
 
-  // Resolve once. The slot sizing below and the kernel selection further down must agree on
-  // the count, or an encoder writes a two-state tail into a slot sized for one.
   const uint32_t states_per_lane = compress_states_per_lane(format_opts.data_type, format_opts.states_per_lane);
 
-  // Worst-case bytes for one sub-chunk's compressed output (the slot the encoders write into).
   const uint32_t subchunk_comp_buffer_size = get_max_comp_sub_chunk_size(
     max_sub_chunk_size,
     states_per_lane,
@@ -167,8 +167,6 @@ void compressAsync(
       }
       break;
     case NVCOMP_TYPE_FLOAT8_E4M3:
-      // The sampled fp8 instantiation floors every packed_exp probability instead of
-      // dilating a band, so it carries no detect/redo path.
       if (states_per_lane == 1)
       {
         kernel = sampled ? ans_gpu_lib::detail::compress_kernel<FP8EncodePolicy<FP8X1EncodeImpl>, true>
@@ -181,8 +179,6 @@ void compressAsync(
       }
       break;
     case NVCOMP_TYPE_FLOAT32:
-      // FP32 codes the same 8-bit exponent alphabet as BF16, so the sampled instantiation
-      // dilates a band around the observed sample and carries the same detect / redo path.
       if (states_per_lane == 1)
       {
         kernel = sampled ? ans_gpu_lib::detail::compress_kernel<FP32EncodePolicy<FP32X1EncodeImpl>, true>
@@ -214,7 +210,6 @@ void compressAsync(
       );
   }
 
-  dim3 fused_grid(cuda_dim_cast(batch_size), 1);
   dim3 fused_block(NUM_COMP_WARPS_PER_CTA * WARP_SIZE);
 #ifndef NDEBUG
   ans_assert_smem_within_estimate(kernel, [](int arch_id) { return ans_compress_smem_bytes(arch_id); });
@@ -227,9 +222,120 @@ void compressAsync(
     comp_chunk_sizes,
     device_statuses,
     subchunk_comp_buffer_size,
-    histogram_reduction_log2
+    histogram_reduction_log2,
+    pack_C,
+    pack_ldc,
+    pack_M,
+    pack_N,
+    pack_tile_m,
+    pack_tile_n,
+    pack_mn_swapped
   );
   CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void compressAsync(
+  const void *const *uncomp_chunks,
+  const size_t *uncomp_chunk_sizes,
+  const size_t max_chunk_size_bytes,
+  size_t batch_size,
+  [[maybe_unused]] void *temp_ptr,
+  [[maybe_unused]] size_t temp_bytes,
+  void *const *comp_chunks,
+  size_t *comp_chunk_sizes,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  nvcompStatus_t *device_statuses,
+  cudaStream_t stream
+)
+{
+  if (batch_size == 0)
+  {
+    return;
+  }
+  launchCompressKernel(
+    uncomp_chunks,
+    uncomp_chunk_sizes,
+    max_chunk_size_bytes,
+    batch_size,
+    comp_chunks,
+    comp_chunk_sizes,
+    format_opts,
+    device_statuses,
+    stream,
+    dim3(cuda_dim_cast(batch_size), 1),
+    nullptr,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  );
+}
+
+void compressFromColMajorTilesAsync(
+  const float *C,
+  int ldc,
+  int M,
+  int N,
+  int tile_m,
+  int tile_n,
+  int pack_mn_swapped,
+  const void *const *uncomp_chunks,
+  const size_t *uncomp_chunk_sizes,
+  const size_t max_chunk_size_bytes,
+  size_t batch_size,
+  void *const *comp_chunks,
+  size_t *comp_chunk_sizes,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  nvcompStatus_t *device_statuses,
+  cudaStream_t stream
+)
+{
+  if (batch_size == 0)
+  {
+    return;
+  }
+  if (C == nullptr || tile_m <= 0 || tile_n <= 0 || M <= 0 || N <= 0 || ldc < M)
+  {
+    throw nvcomp::NVCompException(
+      nvcompErrorInvalidValue,
+      "compressFromColMajorTilesAsync requires a column-major C with positive tile sizes"
+    );
+  }
+  const int tiles_m = (M + tile_m - 1) / tile_m;
+  const int tiles_n = (N + tile_n - 1) / tile_n;
+  if (static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n) != batch_size)
+  {
+    throw nvcomp::NVCompException(
+      nvcompErrorInvalidValue,
+      "batch_size must equal the number of tile_m x tile_n tiles covering M x N"
+    );
+  }
+  const dim3 fused_grid = pack_mn_swapped
+    ? dim3(cuda_dim_cast(static_cast<size_t>(tiles_n)), cuda_dim_cast(static_cast<size_t>(tiles_m)))
+    : dim3(cuda_dim_cast(static_cast<size_t>(tiles_m)), cuda_dim_cast(static_cast<size_t>(tiles_n)));
+  launchCompressKernel(
+    uncomp_chunks,
+    uncomp_chunk_sizes,
+    max_chunk_size_bytes,
+    batch_size,
+    comp_chunks,
+    comp_chunk_sizes,
+    format_opts,
+    device_statuses,
+    stream,
+    fused_grid,
+    C,
+    ldc,
+    M,
+    N,
+    tile_m,
+    tile_n,
+    pack_mn_swapped
+  );
 }
 
 } // namespace ans

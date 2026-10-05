@@ -418,20 +418,54 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
   __grid_constant__ size_t *const comp_chunk_sizes, // out: final per-chunk compressed size
   __grid_constant__ nvcompStatus_t *const device_statuses, // optional per-chunk status
   const __grid_constant__ uint32_t subchunk_comp_buffer_size,
-  const __grid_constant__ uint32_t histogram_reduction_log2 // 0 = exact; else keep 1/2^shift of each warp slice
+  const __grid_constant__ uint32_t histogram_reduction_log2, // 0 = exact; else keep 1/2^shift of each warp slice
+  // Optional col-major matrix pack (CUTLASS C). Null pack_C skips packing.
+  const __grid_constant__ float *const pack_C,
+  const __grid_constant__ int pack_ldc,
+  const __grid_constant__ int pack_M,
+  const __grid_constant__ int pack_N,
+  const __grid_constant__ int pack_tile_m,
+  const __grid_constant__ int pack_tile_n,
+  const __grid_constant__ int pack_mn_swapped
 )
 {
   __shared__ CompressSmem<EncodePolicy> smem;
   __shared__ uint32_t packed_chunk_size_bytes;
-  // One CTA handles one chunk (grid.x), so every warp shares the same index.
+  // One CTA handles one chunk. 2-D grid when packing from a matrix (tiles_m x tiles_n).
   volatile __shared__ uint32_t chunk_idx_handoff;
 
   if (threadIdx.x == 0)
   {
-    chunk_idx_handoff = blockIdx.x;
+    chunk_idx_handoff = pack_C != nullptr ? blockIdx.x + blockIdx.y * gridDim.x : blockIdx.x;
   }
   __syncthreads();
   const uint32_t bid = chunk_idx_handoff;
+
+  if (pack_C != nullptr)
+  {
+    const int tile_m = pack_mn_swapped ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+    const int tile_n = pack_mn_swapped ? static_cast<int>(blockIdx.x) : static_cast<int>(blockIdx.y);
+    const int m0 = tile_m * pack_tile_m;
+    const int n0 = tile_n * pack_tile_n;
+    const int remain_m = pack_M - m0;
+    const int remain_n = pack_N - n0;
+    const int rows = remain_m < pack_tile_m ? remain_m : pack_tile_m;
+    const int cols = remain_n < pack_tile_n ? remain_n : pack_tile_n;
+    const int tile_elems = pack_tile_m * pack_tile_n;
+    float *packed = const_cast<float *>(static_cast<const float *>(uncomp_chunks[bid]));
+    for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x))
+    {
+      const int row = i % pack_tile_m;
+      const int col = i / pack_tile_m;
+      float value = 0.f;
+      if (row < rows && col < cols)
+      {
+        value = pack_C[(m0 + row) + (n0 + col) * pack_ldc];
+      }
+      packed[row + col * pack_tile_m] = value;
+    }
+    __syncthreads();
+  }
 
   // Narrow once here: the API caps chunk size far below IndexT's range, so
   // everything downstream indexes with IndexT.

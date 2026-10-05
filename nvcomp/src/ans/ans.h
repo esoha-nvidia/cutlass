@@ -97,6 +97,31 @@ void compressAsync(
 );
 
 /**
+ * @brief Same as compressAsync, but each CTA first gathers a tile from column-major C
+ * into the corresponding uncompressed chunk buffer (same layout as
+ * compress_tiles_llif_kernel). pack_mn_swapped=0 uses grid (tiles_m, tiles_n);
+ * pack_mn_swapped!=0 uses CUTLASS ColumnMajor grid (tiles_n, tiles_m).
+ */
+void compressFromColMajorTilesAsync(
+  const float *C,
+  int ldc,
+  int M,
+  int N,
+  int tile_m,
+  int tile_n,
+  int pack_mn_swapped,
+  const void *const *device_in_ptr,
+  const size_t *device_in_bytes,
+  const size_t max_chunk_size,
+  size_t batch_size,
+  void *const *device_out_ptr,
+  size_t *device_out_bytes,
+  nvcompBatchedANSCompressOpts_t format_opts,
+  nvcompStatus_t *device_statuses,
+  cudaStream_t stream
+);
+
+/**
  * @brief Get the amount of temp space required on the GPU for decompression.
  *
  * @param num_chunks The number of items in the batch.

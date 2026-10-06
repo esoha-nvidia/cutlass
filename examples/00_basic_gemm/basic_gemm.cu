@@ -200,6 +200,22 @@ using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
 static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
               "inlined ANS compress requires the 256-thread CUTLASS GEMM CTA");
 
+/// Same 128x128x8 SIMT GEMM as CutlassGemm, default LinearCombination (no ANS).
+using CutlassGemmUnfused = cutlass::gemm::device::Gemm<
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::ColumnMajor,
+    float,
+    cutlass::arch::OpClassSimt,
+    cutlass::arch::Sm70,
+    cutlass::gemm::GemmShape<128, 128, 8>,
+    cutlass::gemm::GemmShape<32, 64, 8>,
+    cutlass::gemm::GemmShape<1, 1, 1>>;
+
+using CutlassGemmUnfusedKernel = typename CutlassGemmUnfused::GemmKernel;
+static_assert(CutlassGemmUnfusedKernel::kThreadCount == kAnsThreads,
+              "unfused GEMM CTA must match the fused 256-thread kernel");
+
 /// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile and ANS-compress it.
 struct GemmFusedAns {
   using Params = typename CutlassGemmKernel::Params;
@@ -291,6 +307,16 @@ void gemm_fused_ans_kernel(typename CutlassGemmKernel::Params params) {
   auto *shared_storage =
       reinterpret_cast<typename GemmFusedAns::SharedStorage *>(SharedStorageBase);
   GemmFusedAns op;
+  op(params, *shared_storage);
+}
+
+__global__
+__launch_bounds__(256, 4)
+void gemm_unfused_kernel(typename CutlassGemmUnfusedKernel::Params params) {
+  extern __shared__ int gemm_unfused_smem[];
+  auto *shared_storage =
+      reinterpret_cast<typename CutlassGemmUnfusedKernel::SharedStorage *>(gemm_unfused_smem);
+  CutlassGemmUnfusedKernel op;
   op(params, *shared_storage);
 }
 
@@ -991,29 +1017,57 @@ cudaError_t CutlassSgemmNN(
   int iterations) {
 
   if (!fuse_nvcomp) {
-    using ColumnMajor = cutlass::layout::ColumnMajor;
-    using GemmUnfused = cutlass::gemm::device::Gemm<float, ColumnMajor, float, ColumnMajor,
-                                                   float, ColumnMajor>;
-    GemmUnfused gemm_operator;
-    typename GemmUnfused::Arguments args({M, N, K},
-                                         {A, lda},
-                                         {B, ldb},
-                                         {C, ldc},
-                                         {C, ldc},
-                                         {alpha, beta});
+    using ThreadblockSwizzle = typename CutlassGemmUnfusedKernel::ThreadblockSwizzle;
+    ThreadblockSwizzle threadblock_swizzle;
+    CutlassGemmUnfused::Arguments args({M, N, K},
+                                       {A, lda},
+                                       {B, ldb},
+                                       {C, ldc},
+                                       {C, ldc},
+                                       {alpha, beta});
+    auto underlying_args = CutlassGemmUnfused::to_underlying_arguments(args);
+    cutlass::gemm::GemmCoord grid_tiled_shape = threadblock_swizzle.get_tiled_shape(
+        underlying_args.problem_size,
+        {CutlassGemmUnfused::ThreadblockShape::kM,
+         CutlassGemmUnfused::ThreadblockShape::kN,
+         CutlassGemmUnfused::ThreadblockShape::kK},
+        underlying_args.split_k_slices);
+    typename CutlassGemmUnfusedKernel::Params params{
+        underlying_args.problem_size,
+        grid_tiled_shape,
+        underlying_args.ref_A.non_const_ref(),
+        underlying_args.ref_B.non_const_ref(),
+        underlying_args.ref_C.non_const_ref(),
+        underlying_args.ref_D,
+        underlying_args.epilogue,
+        nullptr,
+        underlying_args.gather_A_indices,
+        underlying_args.gather_B_indices,
+        underlying_args.scatter_D_indices};
+    size_t const dyn_smem = sizeof(typename CutlassGemmUnfusedKernel::SharedStorage);
+    cudaError_t err = cudaFuncSetAttribute(
+        gemm_unfused_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(dyn_smem));
+    if (err != cudaSuccess) {
+      return err;
+    }
+    dim3 grid = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
+    dim3 block(CutlassGemmUnfusedKernel::kThreadCount, 1, 1);
+
     UnfusedAnsWorkspace workspace;
     if (compress_unfused) {
-      cudaError_t err = workspace.allocate(M, N);
+      err = workspace.allocate(M, N);
       if (err != cudaSuccess) {
         return err;
       }
     }
     nvtxRangePushA(compress_unfused ? "cutlass_gemm_nvcomp" : "cutlass_gemm");
-    cutlass::Status status = cutlass::Status::kSuccess;
     nvcompStatus_t nvst = nvcompSuccess;
     for (int iter = 0; iter < iterations; ++iter) {
-      status = gemm_operator(args);
-      if (status != cutlass::Status::kSuccess) {
+      gemm_unfused_kernel<<<grid, block, dyn_smem>>>(params);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) {
         break;
       }
       if (compress_unfused) {
@@ -1025,9 +1079,9 @@ cudaError_t CutlassSgemmNN(
     }
     cudaError_t sync_status = cudaDeviceSynchronize();
     nvtxRangePop();
-    if (status != cutlass::Status::kSuccess) {
+    if (err != cudaSuccess) {
       workspace.release();
-      return cudaErrorUnknown;
+      return err;
     }
     if (nvst != nvcompSuccess) {
       std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
@@ -1694,7 +1748,7 @@ static void PrintUsage(std::ostream &os) {
      << "  --fuse-nvcomp     ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
      << "  --nvcomp-only     CUTLASS GEMM once, then ANS-compress those 128x128 C tiles (no fused kernel)\n"
      << "  --nvcomp-unfused  CUTLASS GEMM then ANS-compress C on every iteration (separate kernels)\n"
-     << "  --iters N         Launch each kernel N times (default 4)\n";
+     << "  --iters N         Launch each kernel N times (default 1)\n";
 }
 
 int main(int argc, const char *arg[]) {
@@ -1711,7 +1765,7 @@ int main(int argc, const char *arg[]) {
   bool fuse_nvcomp = false;
   bool nvcomp_only = false;
   bool nvcomp_unfused = false;
-  int iterations = 4;
+  int iterations = 1;
   int positional = 0;
 
   for (int i = 1; i < argc; ++i) {

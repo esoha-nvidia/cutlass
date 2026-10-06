@@ -76,8 +76,7 @@ make 00_basic_gemm -j$(nproc)
   -o cutlass_nvcomp_unfused --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
 
 # --set full + --import-source needs -lineinfo (CMAKE_CUDA_FLAGS above).
-# NCU matches the function basename: fused GEMM+ANS is gemm_fused_ans_kernel
-# (not GemmFusedAns). Unfused CUTLASS 2 GEMM is Kernel.
+# NCU function basename: fused is gemm_fused_ans_kernel, unfused GEMM is gemm_unfused_kernel.
 NCU=../../nsight/ncu/nsight_compute/ncu
 
 $NCU --set full --import-source yes \
@@ -91,12 +90,12 @@ $NCU --set full --import-source yes \
   ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
 
 $NCU --set full --import-source yes \
-  -k regex:'^Kernel$|(de)?compress_kernel' \
+  -k regex:'gemm_unfused_kernel|(de)?compress_kernel' \
   -o cutlass_nvcomp_unfused_ncu --force-overwrite \
   ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
 
 $NCU --set full --import-source yes \
-  -k regex:'^Kernel$' \
+  -k regex:'gemm_unfused_kernel' \
   -o cutlass_gemm_ncu --force-overwrite \
   ./examples/00_basic_gemm/00_basic_gemm
 ```

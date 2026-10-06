@@ -1692,7 +1692,7 @@ static void PrintUsage(std::ostream &os) {
      << "  --fuse-nvcomp     ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
      << "  --nvcomp-only     CUTLASS GEMM once, then ANS-compress those 128x128 C tiles (no fused kernel)\n"
      << "  --nvcomp-unfused  CUTLASS GEMM then ANS-compress C on every iteration (separate kernels)\n"
-     << "  --iters N         Launch each kernel N times (default 10)\n";
+     << "  --iters N         Launch each kernel N times (default 4)\n";
 }
 
 int main(int argc, const char *arg[]) {
@@ -1703,8 +1703,8 @@ int main(int argc, const char *arg[]) {
 
   // GEMM problem dimensions.
   // CUTLASS threadblock tile is 128x128x8, so a 128^3 problem launches 1 CTA.
-  // 4096x4096 uses a 32x32 grid (1024 CTAs). K does not change CTA count.
-  int problem[3] = { 4096, 4096, 1024 };
+  // 8192x8192 uses a 64x64 grid (4096 CTAs). K does not change CTA count.
+  int problem[3] = { 8192, 8192, 2048 };
   float scalars[2] = { 1, 0 };
   bool fuse_nvcomp = false;
   bool nvcomp_only = false;

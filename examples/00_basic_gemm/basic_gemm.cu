@@ -63,6 +63,7 @@
 #include <vector>
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvcomp/ans.h>
 #include <nvcomp/ans_device.cuh>
@@ -90,8 +91,8 @@
 // Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMP LLIF
 //
 // LinearCombination is a per-thread functor and never holds a whole 128x128 tile. After it writes
-// D, the same CTA packs that strided column-major tile into a contiguous 64 KiB chunk and runs
-// char rANS (`compress_chunk`) in this translation unit. device::Gemm launches Kernel<GemmKernel>
+// D, the same CTA packs that strided column-major tile as fp16 and runs fp16 rANS
+// (`compress_chunk`) in this translation unit. device::Gemm launches Kernel<GemmKernel>
 // with no hook after the epilogue, so this example launches Kernel<GemmFusedAns> itself (same grid,
 // 256 threads, dynamic smem reused after the epilogue).
 //
@@ -111,7 +112,19 @@ static_assert(
     "GEMM CTA width must match LLIF NUM_COMP_THREADS_PER_CTA");
 
 static constexpr unsigned kAnsChunkBytes =
-    static_cast<unsigned>(kAnsTileM) * kAnsTileN * sizeof(float);
+    static_cast<unsigned>(kAnsTileM) * kAnsTileN * sizeof(__half);
+
+static nvcompBatchedANSCompressOpts_t AnsFp16CompressOpts() {
+  nvcompBatchedANSCompressOpts_t opts = nvcompBatchedANSCompressDefaultOpts;
+  opts.data_type = NVCOMP_TYPE_FLOAT16;
+  return opts;
+}
+
+static nvcompBatchedANSDecompressOpts_t AnsFp16DecompressOpts() {
+  nvcompBatchedANSDecompressOpts_t opts = nvcompBatchedANSDecompressDefaultOpts;
+  opts.data_type = NVCOMP_TYPE_FLOAT16;
+  return opts;
+}
 
 static size_t align_up_bytes(size_t value, size_t alignment) {
   if (alignment == 0) {
@@ -155,7 +168,7 @@ struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float
   using Base = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
 
   struct Params : public Base::Params {
-    float *packed = nullptr;
+    __half *packed = nullptr;
     size_t packed_stride_elems = 0;
     char *compressed = nullptr;
     size_t compressed_stride = 0;
@@ -216,7 +229,7 @@ using CutlassGemmUnfusedKernel = typename CutlassGemmUnfused::GemmKernel;
 static_assert(CutlassGemmUnfusedKernel::kThreadCount == kAnsThreads,
               "unfused GEMM CTA must match the fused 256-thread kernel");
 
-/// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile and ANS-compress it.
+/// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile as fp16 and ANS-compress it.
 struct GemmFusedAns {
   using Params = typename CutlassGemmKernel::Params;
   using SharedStorage = typename CutlassGemmKernel::SharedStorage;
@@ -236,7 +249,7 @@ struct GemmFusedAns {
         static_cast<size_t>(tb.n()) * static_cast<size_t>(params.grid_tiled_shape.m());
 
     AnsEpilogueOp::Params const &ans = params.output_op;
-    float *packed = ans.packed + tile_id * ans.packed_stride_elems;
+    __half *packed = ans.packed + tile_id * ans.packed_stride_elems;
     float const *C = params.ref_D.data();
     int const ldc = static_cast<int>(params.ref_D.stride(0));
     int const remain_m = ans.orig_M - m0;
@@ -252,7 +265,7 @@ struct GemmFusedAns {
       if (row < rows && col < cols) {
         value = C[(m0 + row) + (n0 + col) * ldc];
       }
-      packed[row + col * kAnsTileM] = value;
+      packed[row + col * kAnsTileM] = __float2half(value);
     }
 
     __syncthreads();
@@ -263,7 +276,7 @@ struct GemmFusedAns {
       scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
     }
 
-    using Policy = ans_gpu_lib::detail::CharEncodePolicy<ans_gpu_lib::detail::CharX2EncodeImpl>;
+    using Policy = ans_gpu_lib::detail::FP16EncodePolicy<ans_gpu_lib::detail::FP16X2EncodeImpl>;
     using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
     auto &workspace = *reinterpret_cast<Workspace *>(scratch_addr);
     ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
@@ -407,7 +420,7 @@ cudaError_t ValidateAnsCompression(
     return cudaSuccess;
   }
 
-  nvcompBatchedANSDecompressOpts_t const opts = nvcompBatchedANSDecompressDefaultOpts;
+  nvcompBatchedANSDecompressOpts_t const opts = AnsFp16DecompressOpts();
   size_t temp_bytes = 0;
   nvcompStatus_t nvst = nvcompBatchedANSDecompressGetTempSize(
       num_chunks,
@@ -621,7 +634,7 @@ cudaError_t ValidateAnsCompression(
   std::cout << "ANS decompress validation (nvCOMP LLIF): passed (" << num_chunks
             << " tiles)" << std::endl;
 
-  nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
+  nvcompBatchedANSCompressOpts_t const compress_opts = AnsFp16CompressOpts();
   size_t compress_temp_bytes = 0;
   nvst = nvcompBatchedANSCompressGetTempSize(
       num_chunks,
@@ -795,14 +808,14 @@ cudaError_t ValidateAnsCompression(
   return cudaSuccess;
 }
 
-/// Workspace for inlined compress_kernel (no RDC) over 128x128 tiles of C.
+/// Workspace for inlined compress_kernel (no RDC) over 128x128 fp16 tiles of C.
 struct UnfusedAnsWorkspace {
   size_t num_chunks = 0;
   size_t chunk_bytes = 0;
   size_t packed_stride = 0;
   size_t compressed_stride = 0;
   nvcompBatchedANSCompressOpts_t compress_opts{};
-  float *d_packed = nullptr;
+  __half *d_packed = nullptr;
   char *d_compressed = nullptr;
   size_t *d_comp_sizes = nullptr;
   size_t *d_uncomp_bytes = nullptr;
@@ -832,7 +845,7 @@ struct UnfusedAnsWorkspace {
     int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
     num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
     chunk_bytes = kAnsChunkBytes;
-    compress_opts = nvcompBatchedANSCompressDefaultOpts;
+    compress_opts = AnsFp16CompressOpts();
     size_t max_comp_chunk = 0;
     nvcompStatus_t nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
         chunk_bytes, compress_opts, &max_comp_chunk);
@@ -1127,7 +1140,7 @@ cudaError_t CutlassSgemmNN(
       static_cast<size_t>(grid_tiled_shape.m()) * static_cast<size_t>(grid_tiled_shape.n());
 
   size_t const chunk_bytes = kAnsChunkBytes;
-  nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
+  nvcompBatchedANSCompressOpts_t const compress_opts = AnsFp16CompressOpts();
   int max_sub_chunk_size = 0;
   uint32_t slot_words = 0;
   size_t ans_smem = 0;
@@ -1169,7 +1182,7 @@ cudaError_t CutlassSgemmNN(
   size_t const compressed_stride =
       align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
 
-  float *d_packed = nullptr;
+  __half *d_packed = nullptr;
   char *d_compressed = nullptr;
   size_t *d_comp_sizes = nullptr;
 
@@ -1205,7 +1218,7 @@ cudaError_t CutlassSgemmNN(
   }
 
   args.epilogue.packed = d_packed;
-  args.epilogue.packed_stride_elems = packed_stride / sizeof(float);
+  args.epilogue.packed_stride_elems = packed_stride / sizeof(__half);
   args.epilogue.compressed = d_compressed;
   args.epilogue.compressed_stride = compressed_stride;
   args.epilogue.comp_sizes = d_comp_sizes;

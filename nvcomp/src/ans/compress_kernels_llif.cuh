@@ -14,6 +14,7 @@
 #include <ans/normalize_counts_common.cuh>
 #include <ans/simple_defrag.cuh>
 #include <ans/symbol_encoder.cuh>
+#include <cuda_fp16.h>
 
 namespace ans_gpu_lib
 {
@@ -420,6 +421,7 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
   const __grid_constant__ uint32_t subchunk_comp_buffer_size,
   const __grid_constant__ uint32_t histogram_reduction_log2, // 0 = exact; else keep 1/2^shift of each warp slice
   // Optional col-major matrix pack (CUTLASS C). Null pack_C skips packing.
+  // FLOAT16 writes __half; other types keep the float tile.
   const __grid_constant__ float *const pack_C,
   const __grid_constant__ int pack_ldc,
   const __grid_constant__ int pack_M,
@@ -452,7 +454,6 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
     const int rows = remain_m < pack_tile_m ? remain_m : pack_tile_m;
     const int cols = remain_n < pack_tile_n ? remain_n : pack_tile_n;
     const int tile_elems = pack_tile_m * pack_tile_n;
-    float *packed = const_cast<float *>(static_cast<const float *>(uncomp_chunks[bid]));
     for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x))
     {
       const int row = i % pack_tile_m;
@@ -462,7 +463,16 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
       {
         value = pack_C[(m0 + row) + (n0 + col) * pack_ldc];
       }
-      packed[row + col * pack_tile_m] = value;
+      if constexpr (EncodePolicy::STREAM_TYPE == AnsStreamType::Fp16)
+      {
+        __half *packed = const_cast<__half *>(static_cast<const __half *>(uncomp_chunks[bid]));
+        packed[row + col * pack_tile_m] = __float2half(value);
+      }
+      else
+      {
+        float *packed = const_cast<float *>(static_cast<const float *>(uncomp_chunks[bid]));
+        packed[row + col * pack_tile_m] = value;
+      }
     }
     __syncthreads();
   }

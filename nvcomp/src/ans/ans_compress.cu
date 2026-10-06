@@ -340,6 +340,19 @@ void compressFromColMajorTilesAsync(
 
 } // namespace ans
 
+namespace
+{
+
+template <typename Policy>
+void fill_device_compress_smem(size_t *smem_bytes, size_t *smem_alignment)
+{
+  using DeviceWorkspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
+  *smem_bytes = sizeof(DeviceWorkspace);
+  *smem_alignment = alignof(DeviceWorkspace);
+}
+
+} // namespace
+
 extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
   size_t /*num_chunks*/,
   size_t max_uncompressed_chunk_bytes,
@@ -380,13 +393,68 @@ extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
     ans_tablelog(ans_stream_type_from_data_type(compress_opts.data_type))
   );
 
-  using DeviceWorkspace =
-    ans_gpu_lib::detail::DeviceCompressSmem<ans_gpu_lib::detail::CharEncodePolicy<ans_gpu_lib::detail::CharX2EncodeImpl>>;
+  using ans_gpu_lib::detail::CharEncodePolicy;
+  using ans_gpu_lib::detail::CharX1EncodeImpl;
+  using ans_gpu_lib::detail::CharX2EncodeImpl;
+  using ans_gpu_lib::detail::FP16EncodePolicy;
+  using ans_gpu_lib::detail::FP16X1EncodeImpl;
+  using ans_gpu_lib::detail::FP16X2EncodeImpl;
+  using ans_gpu_lib::detail::FP32EncodePolicy;
+  using ans_gpu_lib::detail::FP32X1EncodeImpl;
+  using ans_gpu_lib::detail::FP32X2EncodeImpl;
+  using ans_gpu_lib::detail::FP8EncodePolicy;
+  using ans_gpu_lib::detail::FP8X1EncodeImpl;
+  using ans_gpu_lib::detail::FP8X2EncodeImpl;
+
+  switch (compress_opts.data_type)
+  {
+    case NVCOMP_TYPE_FLOAT16:
+      if (states_per_lane == 1)
+      {
+        fill_device_compress_smem<FP16EncodePolicy<FP16X1EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      else
+      {
+        fill_device_compress_smem<FP16EncodePolicy<FP16X2EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      break;
+    case NVCOMP_TYPE_FLOAT8_E4M3:
+      if (states_per_lane == 1)
+      {
+        fill_device_compress_smem<FP8EncodePolicy<FP8X1EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      else
+      {
+        fill_device_compress_smem<FP8EncodePolicy<FP8X2EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      break;
+    case NVCOMP_TYPE_FLOAT32:
+      if (states_per_lane == 1)
+      {
+        fill_device_compress_smem<FP32EncodePolicy<FP32X1EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      else
+      {
+        fill_device_compress_smem<FP32EncodePolicy<FP32X2EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      break;
+    case NVCOMP_TYPE_CHAR:
+    case NVCOMP_TYPE_UCHAR:
+      if (states_per_lane == 1)
+      {
+        fill_device_compress_smem<CharEncodePolicy<CharX1EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      else
+      {
+        fill_device_compress_smem<CharEncodePolicy<CharX2EncodeImpl>>(smem_bytes, smem_alignment);
+      }
+      break;
+    default:
+      return nvcompErrorNotSupported;
+  }
 
   *max_sub_chunk_size = static_cast<int>(max_sub);
   *slot_words = subchunk_comp_buffer_size;
-  *smem_bytes = sizeof(DeviceWorkspace);
-  *smem_alignment = alignof(DeviceWorkspace);
   *block_threads = static_cast<int>(ans_gpu_lib::NUM_COMP_THREADS_PER_CTA);
   return nvcompSuccess;
 }

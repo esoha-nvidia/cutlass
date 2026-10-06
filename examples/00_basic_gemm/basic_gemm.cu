@@ -1709,7 +1709,7 @@ int main(int argc, const char *arg[]) {
   bool fuse_nvcomp = false;
   bool nvcomp_only = false;
   bool nvcomp_unfused = false;
-  int iterations = 10;
+  int iterations = 4;
   int positional = 0;
 
   for (int i = 1; i < argc; ++i) {

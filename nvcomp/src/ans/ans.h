@@ -102,7 +102,7 @@ void compressAsync(
  * (tiles_m, tiles_n); pack_mn_swapped!=0 uses CUTLASS ColumnMajor grid (tiles_n, tiles_m).
  */
 void compressFromColMajorTilesAsync(
-  const float *C,
+  const void *C,
   int ldc,
   int M,
   int N,

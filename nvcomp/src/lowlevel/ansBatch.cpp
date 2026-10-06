@@ -649,7 +649,7 @@ nvcompStatus_t nvcompBatchedANSCompressAsync(
 }
 
 extern "C" nvcompStatus_t nvcompBatchedANSCompressFromColMajorTilesAsync(
-  const float *device_C,
+  const void *device_C,
   int ldc,
   int M,
   int N,

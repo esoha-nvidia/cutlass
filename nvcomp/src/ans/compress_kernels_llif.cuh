@@ -14,7 +14,6 @@
 #include <ans/normalize_counts_common.cuh>
 #include <ans/simple_defrag.cuh>
 #include <ans/symbol_encoder.cuh>
-#include <cuda_fp16.h>
 
 namespace ans_gpu_lib
 {
@@ -421,8 +420,8 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
   const __grid_constant__ uint32_t subchunk_comp_buffer_size,
   const __grid_constant__ uint32_t histogram_reduction_log2, // 0 = exact; else keep 1/2^shift of each warp slice
   // Optional col-major matrix pack (CUTLASS C). Null pack_C skips packing.
-  // FLOAT16 writes __half; other types keep the float tile.
-  const __grid_constant__ float *const pack_C,
+  // FLOAT16 copies 16-bit elements (fp16/bf16); other types keep a float tile.
+  const __grid_constant__ void *const pack_C,
   const __grid_constant__ int pack_ldc,
   const __grid_constant__ int pack_M,
   const __grid_constant__ int pack_N,
@@ -458,19 +457,25 @@ __launch_bounds__(NUM_COMP_WARPS_PER_CTA *WARP_SIZE, EncodePolicy::COMP_MIN_BLOC
     {
       const int row = i % pack_tile_m;
       const int col = i / pack_tile_m;
-      float value = 0.f;
-      if (row < rows && col < cols)
-      {
-        value = pack_C[(m0 + row) + (n0 + col) * pack_ldc];
-      }
       if constexpr (EncodePolicy::STREAM_TYPE == AnsStreamType::Fp16)
       {
-        __half *packed = const_cast<__half *>(static_cast<const __half *>(uncomp_chunks[bid]));
-        packed[row + col * pack_tile_m] = __float2half(value);
+        uint16_t *packed = const_cast<uint16_t *>(static_cast<const uint16_t *>(uncomp_chunks[bid]));
+        uint16_t packed_value = 0;
+        if (row < rows && col < cols)
+        {
+          packed_value =
+            reinterpret_cast<uint16_t const *>(pack_C)[(m0 + row) + (n0 + col) * pack_ldc];
+        }
+        packed[row + col * pack_tile_m] = packed_value;
       }
       else
       {
         float *packed = const_cast<float *>(static_cast<const float *>(uncomp_chunks[bid]));
+        float value = 0.f;
+        if (row < rows && col < cols)
+        {
+          value = reinterpret_cast<float const *>(pack_C)[(m0 + row) + (n0 + col) * pack_ldc];
+        }
         packed[row + col * pack_tile_m] = value;
       }
     }

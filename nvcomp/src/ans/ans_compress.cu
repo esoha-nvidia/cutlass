@@ -111,7 +111,7 @@ void launchCompressKernel(
   nvcompStatus_t *device_statuses,
   cudaStream_t stream,
   dim3 fused_grid,
-  const float *pack_C,
+  const void *pack_C,
   int pack_ldc,
   int pack_M,
   int pack_N,
@@ -276,7 +276,7 @@ void compressAsync(
 }
 
 void compressFromColMajorTilesAsync(
-  const float *C,
+  const void *C,
   int ldc,
   int M,
   int N,

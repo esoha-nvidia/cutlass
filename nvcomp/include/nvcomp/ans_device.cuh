@@ -30,14 +30,13 @@ extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
 );
 
 /**
- * @brief Host launch of compress_kernel that first packs a column-major float
- * tile into each uncompressed chunk buffer (as fp16 when compress_opts.data_type
- * is NVCOMP_TYPE_FLOAT16). pack_mn_swapped=0 matches the 128x128 column-major
- * gather used by --nvcomp-only. Uncompressed chunk pointers are the pack
- * destinations.
+ * @brief Host launch of compress_kernel that first packs a column-major C tile
+ * into each uncompressed chunk buffer. FLOAT16 copies 16-bit elements (fp16 or
+ * bf16). pack_mn_swapped=0 matches the 128x128 column-major gather used by
+ * --nvcomp-only. Uncompressed chunk pointers are the pack destinations.
  */
 extern "C" nvcompStatus_t nvcompBatchedANSCompressFromColMajorTilesAsync(
-  const float *device_C,
+  const void *device_C,
   int ldc,
   int M,
   int N,

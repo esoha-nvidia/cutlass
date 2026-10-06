@@ -78,13 +78,20 @@
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 
+// Same TU as GemmFusedAns so compress_chunk can be inlined (no RDC). Set the
+// nvCOMP CUB wrap after CUTLASS headers so CUTLASS does not see it.
+#ifndef THRUST_CUB_WRAPPED_NAMESPACE
+#define THRUST_CUB_WRAPPED_NAMESPACE nvcomp
+#endif
+#include "ans/ans_device_chunk.cuh"
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMP LLIF
 //
 // LinearCombination is a per-thread functor and never holds a whole 128x128 tile. After it writes
 // D, the same CTA packs that strided column-major tile into a contiguous 64 KiB chunk and runs
-// device-level char rANS (`nvcompDeviceANSCompressChunk`). device::Gemm launches Kernel<GemmKernel>
+// char rANS (`compress_chunk`) in this translation unit. device::Gemm launches Kernel<GemmKernel>
 // with no hook after the epilogue, so this example launches Kernel<GemmFusedAns> itself (same grid,
 // 256 threads, dynamic smem reused after the epilogue).
 //
@@ -98,7 +105,10 @@ enum {
 };
 
 static_assert(kAnsThreads == NVCOMP_DEVICE_ANS_COMPRESS_BLOCK_THREADS,
-              "GEMM CTA width must match nvcompDeviceANSCompressChunk");
+              "GEMM CTA width must match the inlined ANS compressor");
+static_assert(
+    kAnsThreads == static_cast<int>(ans_gpu_lib::NUM_COMP_THREADS_PER_CTA),
+    "GEMM CTA width must match LLIF NUM_COMP_THREADS_PER_CTA");
 
 static constexpr unsigned kAnsChunkBytes =
     static_cast<unsigned>(kAnsTileM) * kAnsTileN * sizeof(float);
@@ -188,7 +198,7 @@ using CutlassGemm = cutlass::gemm::device::Gemm<
 
 using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
 static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
-              "nvcompDeviceANSCompressChunk requires the 256-thread CUTLASS GEMM CTA");
+              "inlined ANS compress requires the 256-thread CUTLASS GEMM CTA");
 
 /// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 tile and ANS-compress it.
 struct GemmFusedAns {
@@ -237,14 +247,20 @@ struct GemmFusedAns {
       scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
     }
 
-    nvcompDeviceANSCompressChunk(
+    using Policy = ans_gpu_lib::detail::CharEncodePolicy<ans_gpu_lib::detail::CharX2EncodeImpl>;
+    using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
+    auto &workspace = *reinterpret_cast<Workspace *>(scratch_addr);
+    ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
         ans.compressed + tile_id * ans.compressed_stride,
         packed,
-        kAnsChunkBytes,
+        static_cast<ans_gpu_lib::IndexT>(kAnsChunkBytes),
         ans.comp_sizes + tile_id,
         ans.max_sub_chunk_size,
+        nullptr,
         ans.slot_words,
-        reinterpret_cast<void *>(scratch_addr));
+        /*histogram_reduction_log2=*/0u,
+        workspace.workspace,
+        workspace.packed_chunk_size_bytes);
   }
 
   CUTLASS_DEVICE
@@ -265,6 +281,16 @@ struct GemmFusedAns {
     compress_tile(params, reinterpret_cast<unsigned char *>(&shared_storage));
   }
 };
+
+/// Distinct symbol for NCU (`-k regex:'gemm_fused_ans_kernel'`). cutlass::Kernel<>
+/// shows up as `Kernel` and does not match GemmFusedAns.
+__global__ void gemm_fused_ans_kernel(typename CutlassGemmKernel::Params params) {
+  extern __shared__ int SharedStorageBase[];
+  auto *shared_storage =
+      reinterpret_cast<typename GemmFusedAns::SharedStorage *>(SharedStorageBase);
+  GemmFusedAns op;
+  op(params, *shared_storage);
+}
 
 __global__ void count_ans_tile_mismatches_kernel(
     unsigned char const *packed,
@@ -1148,7 +1174,7 @@ cudaError_t CutlassSgemmNN(
       underlying_args.scatter_D_indices};
 
   err = cudaFuncSetAttribute(
-      cutlass::Kernel<GemmFusedAns>,
+      gemm_fused_ans_kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(dyn_smem));
   if (err != cudaSuccess) {
@@ -1161,7 +1187,7 @@ cudaError_t CutlassSgemmNN(
 
   nvtxRangePushA("cutlass_gemm");
   for (int iter = 0; iter < iterations; ++iter) {
-    cutlass::Kernel<GemmFusedAns><<<grid, block, dyn_smem>>>(params);
+    gemm_fused_ans_kernel<<<grid, block, dyn_smem>>>(params);
   }
   err = cudaGetLastError();
   if (err != cudaSuccess) {

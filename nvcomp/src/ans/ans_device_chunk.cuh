@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Device-side one-chunk compress used by nvcompDeviceANSCompressChunk.
+ * Device-side one-chunk compress used by fused GEMM (same TU as the caller).
  * Kept out of stock compress_kernels_llif.cuh so nvCOMP source drops do not
  * wipe the CUTLASS in-kernel entry.
  */
@@ -18,7 +18,7 @@ namespace ans_gpu_lib
 namespace detail
 {
 
-// Workspace for nvcompDeviceANSCompressChunk: CompressSmem plus the uint32
+// Workspace for inlined compress_chunk: CompressSmem plus the uint32
 // packed size that compress_kernel otherwise keeps as a separate __shared__.
 template <typename EncodePolicy>
 struct DeviceCompressSmem
@@ -27,7 +27,7 @@ struct DeviceCompressSmem
   uint32_t packed_chunk_size_bytes;
 };
 
-// One-chunk compress used by nvcompDeviceANSCompressChunk.
+// One-chunk compress used after the GEMM epilogue in the same CTA.
 // Must be called by every thread of a NUM_COMP_THREADS_PER_CTA CTA.
 template <typename EncodePolicy, bool Sampled>
 __device__ __forceinline__ void compress_chunk(

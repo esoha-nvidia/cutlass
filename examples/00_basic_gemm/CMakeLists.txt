@@ -38,7 +38,15 @@ target_link_libraries(00_basic_gemm PRIVATE cublas)
 if(NOT TARGET nvcomp)
   add_subdirectory("${CUTLASS_DIR}/nvcomp" "${CMAKE_BINARY_DIR}/nvcomp")
 endif()
-target_link_libraries(00_basic_gemm PRIVATE nvcomp nvcomp_ans_device)
+target_link_libraries(00_basic_gemm PRIVATE nvcomp)
 
+target_include_directories(00_basic_gemm PRIVATE
+  "${CUTLASS_DIR}/nvcomp/src"
+  "${CUTLASS_DIR}/nvcomp/src/bitcomp")
+if(CUTLASS_CUDA_CCCL_INCLUDE_DIR)
+  target_include_directories(00_basic_gemm PRIVATE "${CUTLASS_CUDA_CCCL_INCLUDE_DIR}")
+endif()
+target_compile_options(00_basic_gemm PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda --expt-relaxed-constexpr>)
 set_target_properties(00_basic_gemm PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON)
+  CUDA_SEPARABLE_COMPILATION OFF)

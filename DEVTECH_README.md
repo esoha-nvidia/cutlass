@@ -40,7 +40,7 @@ python ./cutlass_test.py
 
 ## nvCOMP (in-tree LLIF)
 
-Host batched ANS and in-kernel fused ANS both come from the copy of nvCOMP under `nvcomp/`. `00_basic_gemm` compiles that as a **static** library (relocatable device code) and calls `nvcompDeviceANSCompressChunk` from the GEMM CTA. It does not use MathDx / nvCOMPDx.
+Host batched ANS and in-kernel fused ANS both come from the copy of nvCOMP under `nvcomp/`. `00_basic_gemm` compiles that as a **static** library (no relocatable device code) and inlines `compress_chunk` in the GEMM CTA. It does not use MathDx / nvCOMPDx.
 
 Do **not** pass `-DBUILD_NVCOMPDX=ON` — that FetchContent-clones internal GitLab over SSH, which this cluster cannot reach.
 
@@ -53,7 +53,8 @@ export CUDACXX=$(which nvcc)   # usually /usr/local/cuda/bin/nvcc
 
 cmake .. \
   -DCUTLASS_NVCC_ARCHS=100a \
-  -DCUTLASS_ENABLE_TESTS=OFF
+  -DCUTLASS_ENABLE_TESTS=OFF \
+  -DCMAKE_CUDA_FLAGS="-lineinfo"
 
 make 00_basic_gemm -j$(nproc)
 
@@ -74,9 +75,29 @@ make 00_basic_gemm -j$(nproc)
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
   -o cutlass_nvcomp_unfused --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
 
-../../nsight/ncu/nsight_compute/ncu -f -o cutlass_gemm_nvcomp_ncu ./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
-../../nsight/ncu/nsight_compute/ncu -f -o cutlass_nvcomp_only_ncu ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
-../../nsight/ncu/nsight_compute/ncu -f -o cutlass_nvcomp_unfused_ncu ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
-../../nsight/ncu/nsight_compute/ncu -f -o cutlass_gemm_ncu ./examples/00_basic_gemm/00_basic_gemm
+# --set full + --import-source needs -lineinfo (CMAKE_CUDA_FLAGS above).
+# NCU matches the function basename: fused GEMM+ANS is gemm_fused_ans_kernel
+# (not GemmFusedAns). Unfused CUTLASS 2 GEMM is Kernel.
+NCU=../../nsight/ncu/nsight_compute/ncu
+
+$NCU --set full --import-source yes \
+  -k regex:'gemm_fused_ans_kernel' \
+  -o cutlass_gemm_nvcomp_ncu --force-overwrite \
+  ./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
+
+$NCU --set full --import-source yes \
+  -k regex:'(de)?compress_kernel' \
+  -o cutlass_nvcomp_only_ncu --force-overwrite \
+  ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
+
+$NCU --set full --import-source yes \
+  -k regex:'^Kernel$|(de)?compress_kernel' \
+  -o cutlass_nvcomp_unfused_ncu --force-overwrite \
+  ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
+
+$NCU --set full --import-source yes \
+  -k regex:'^Kernel$' \
+  -o cutlass_gemm_ncu --force-overwrite \
+  ./examples/00_basic_gemm/00_basic_gemm
 ```
 

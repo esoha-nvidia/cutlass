@@ -60,6 +60,7 @@ make 00_basic_gemm -j$(nproc)
 ./examples/00_basic_gemm/00_basic_gemm
 ./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
 ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
+./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
   -o cutlass_gemm --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm
@@ -70,8 +71,12 @@ make 00_basic_gemm -j$(nproc)
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
   -o cutlass_nvcomp_only --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
 
+../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx,cublas \
+  -o cutlass_nvcomp_unfused --force-overwrite true ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
+
 ../../nsight/ncu/nsight_compute/ncu -f -o cutlass_gemm_nvcomp_ncu ./examples/00_basic_gemm/00_basic_gemm --fuse-nvcomp
 ../../nsight/ncu/nsight_compute/ncu -f -o cutlass_nvcomp_only_ncu ./examples/00_basic_gemm/00_basic_gemm --nvcomp-only
+../../nsight/ncu/nsight_compute/ncu -f -o cutlass_nvcomp_unfused_ncu ./examples/00_basic_gemm/00_basic_gemm --nvcomp-unfused
 ../../nsight/ncu/nsight_compute/ncu -f -o cutlass_gemm_ncu ./examples/00_basic_gemm/00_basic_gemm
 ```
 

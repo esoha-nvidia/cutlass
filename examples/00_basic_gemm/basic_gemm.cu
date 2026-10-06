@@ -741,33 +741,13 @@ cudaError_t ValidateAnsCompression(
   return cudaSuccess;
 }
 
-/// ANS-compress every 128x128 tile of C via inlined compress_kernel (no RDC).
-/// C is not modified.
-cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int iterations) {
-  if (M <= 0 || N <= 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
-  int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
-  size_t const num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
-
-  size_t const chunk_bytes = kAnsChunkBytes;
-  nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
-  size_t max_comp_chunk = 0;
-  nvcompStatus_t nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
-      chunk_bytes, compress_opts, &max_comp_chunk);
-  if (nvst != nvcompSuccess) {
-    std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
-              << nvcompGetStatusString(nvst) << std::endl;
-    return cudaErrorUnknown;
-  }
-
-  size_t const packed_stride =
-      align_up_bytes(chunk_bytes, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
-  size_t const compressed_stride =
-      align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
-
+/// Workspace for inlined compress_kernel (no RDC) over 128x128 tiles of C.
+struct UnfusedAnsWorkspace {
+  size_t num_chunks = 0;
+  size_t chunk_bytes = 0;
+  size_t packed_stride = 0;
+  size_t compressed_stride = 0;
+  nvcompBatchedANSCompressOpts_t compress_opts{};
   float *d_packed = nullptr;
   char *d_compressed = nullptr;
   size_t *d_comp_sizes = nullptr;
@@ -775,82 +755,111 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
   void **d_in_ptrs = nullptr;
   void **d_out_ptrs = nullptr;
 
-  auto free_all = [&]() {
+  void release() {
     cudaFree(d_out_ptrs);
     cudaFree(d_in_ptrs);
     cudaFree(d_uncomp_bytes);
     cudaFree(d_packed);
     cudaFree(d_compressed);
     cudaFree(d_comp_sizes);
-  };
-
-  cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
-  if (err != cudaSuccess) {
-    return err;
-  }
-  err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMemset(d_compressed, 0, compressed_stride * num_chunks);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(size_t));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(size_t));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMalloc(&d_uncomp_bytes, num_chunks * sizeof(size_t));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMalloc(&d_in_ptrs, num_chunks * sizeof(void *));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMalloc(&d_out_ptrs, num_chunks * sizeof(void *));
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
+    d_out_ptrs = nullptr;
+    d_in_ptrs = nullptr;
+    d_uncomp_bytes = nullptr;
+    d_packed = nullptr;
+    d_compressed = nullptr;
+    d_comp_sizes = nullptr;
   }
 
-  std::vector<size_t> h_uncomp_bytes(num_chunks, chunk_bytes);
-  std::vector<void *> h_in_ptrs(num_chunks);
-  std::vector<void *> h_out_ptrs(num_chunks);
-  for (size_t i = 0; i < num_chunks; ++i) {
-    h_in_ptrs[i] = reinterpret_cast<char *>(d_packed) + i * packed_stride;
-    h_out_ptrs[i] = d_compressed + i * compressed_stride;
-  }
-  err = cudaMemcpy(d_uncomp_bytes, h_uncomp_bytes.data(), num_chunks * sizeof(size_t),
-                   cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMemcpy(d_in_ptrs, h_in_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
-  }
-  err = cudaMemcpy(d_out_ptrs, h_out_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) {
-    free_all();
-    return err;
+  cudaError_t allocate(int M, int N) {
+    if (M <= 0 || N <= 0) {
+      return cudaErrorInvalidValue;
+    }
+    int const tiles_m = (M + kAnsTileM - 1) / kAnsTileM;
+    int const tiles_n = (N + kAnsTileN - 1) / kAnsTileN;
+    num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
+    chunk_bytes = kAnsChunkBytes;
+    compress_opts = nvcompBatchedANSCompressDefaultOpts;
+    size_t max_comp_chunk = 0;
+    nvcompStatus_t nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
+        chunk_bytes, compress_opts, &max_comp_chunk);
+    if (nvst != nvcompSuccess) {
+      std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
+                << nvcompGetStatusString(nvst) << std::endl;
+      return cudaErrorUnknown;
+    }
+    packed_stride =
+        align_up_bytes(chunk_bytes, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
+    compressed_stride =
+        align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
+
+    cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+    if (err != cudaSuccess) {
+      return err;
+    }
+    err = cudaMalloc(&d_compressed, compressed_stride * num_chunks);
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMemset(d_compressed, 0, compressed_stride * num_chunks);
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMalloc(&d_comp_sizes, num_chunks * sizeof(size_t));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(size_t));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMalloc(&d_uncomp_bytes, num_chunks * sizeof(size_t));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMalloc(&d_in_ptrs, num_chunks * sizeof(void *));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMalloc(&d_out_ptrs, num_chunks * sizeof(void *));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+
+    std::vector<size_t> h_uncomp_bytes(num_chunks, chunk_bytes);
+    std::vector<void *> h_in_ptrs(num_chunks);
+    std::vector<void *> h_out_ptrs(num_chunks);
+    for (size_t i = 0; i < num_chunks; ++i) {
+      h_in_ptrs[i] = reinterpret_cast<char *>(d_packed) + i * packed_stride;
+      h_out_ptrs[i] = d_compressed + i * compressed_stride;
+    }
+    err = cudaMemcpy(d_uncomp_bytes, h_uncomp_bytes.data(), num_chunks * sizeof(size_t),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMemcpy(d_in_ptrs, h_in_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    err = cudaMemcpy(d_out_ptrs, h_out_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
+    return cudaSuccess;
   }
 
-  nvtxRangePushA("nvcomp_llif_ans_tiles");
-  for (int iter = 0; iter < iterations; ++iter) {
-    nvst = nvcompBatchedANSCompressFromColMajorTilesAsync(
+  nvcompStatus_t launch(float const *C, int ldc, int M, int N) {
+    return nvcompBatchedANSCompressFromColMajorTilesAsync(
         C,
         ldc,
         M,
@@ -867,6 +876,43 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
         compress_opts,
         nullptr,
         0);
+  }
+
+  cudaError_t print_and_validate(
+      float const *C, int ldc, int M, int N, char const *ratio_label) {
+    cudaError_t err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, ratio_label);
+    if (err == cudaSuccess) {
+      err = ValidateAnsCompression(
+          d_packed,
+          packed_stride,
+          d_compressed,
+          compressed_stride,
+          d_comp_sizes,
+          num_chunks,
+          chunk_bytes,
+          C,
+          ldc,
+          M,
+          N,
+          false);
+    }
+    return err;
+  }
+};
+
+/// ANS-compress every 128x128 tile of C via inlined compress_kernel (no RDC).
+/// C is not modified.
+cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int iterations) {
+  UnfusedAnsWorkspace workspace;
+  cudaError_t err = workspace.allocate(M, N);
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  nvtxRangePushA("nvcomp_llif_ans_tiles");
+  nvcompStatus_t nvst = nvcompSuccess;
+  for (int iter = 0; iter < iterations; ++iter) {
+    nvst = workspace.launch(C, ldc, M, N);
     if (nvst != nvcompSuccess) {
       break;
     }
@@ -875,33 +921,18 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     nvtxRangePop();
     std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
               << nvcompGetStatusString(nvst) << std::endl;
-    free_all();
+    workspace.release();
     return cudaErrorUnknown;
   }
   err = cudaDeviceSynchronize();
   nvtxRangePop();
   if (err != cudaSuccess) {
-    free_all();
+    workspace.release();
     return err;
   }
 
-  err = PrintAnsRatio(d_comp_sizes, num_chunks, chunk_bytes, "nvCOMP LLIF ANS (only)");
-  if (err == cudaSuccess) {
-    err = ValidateAnsCompression(
-        d_packed,
-        packed_stride,
-        d_compressed,
-        compressed_stride,
-        d_comp_sizes,
-        num_chunks,
-        chunk_bytes,
-        C,
-        ldc,
-        M,
-        N,
-        false);
-  }
-  free_all();
+  err = workspace.print_and_validate(C, ldc, M, N, "nvCOMP LLIF ANS (only)");
+  workspace.release();
   return err;
 }
 
@@ -913,7 +944,8 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Define a CUTLASS GEMM template and launch a GEMM kernel.
-/// With fuse_nvcomp, the same CTA also ANS-compresses its 128x128 output tile.
+/// fuse_nvcomp: same CTA ANS-compresses its 128x128 output tile.
+/// compress_unfused: after each GEMM launch, ANS-compress C with a separate kernel.
 cudaError_t CutlassSgemmNN(
   int M,
   int N,
@@ -927,6 +959,7 @@ cudaError_t CutlassSgemmNN(
   float *C,
   int ldc,
   bool fuse_nvcomp,
+  bool compress_unfused,
   int iterations) {
 
   if (!fuse_nvcomp) {
@@ -940,18 +973,48 @@ cudaError_t CutlassSgemmNN(
                                          {C, ldc},
                                          {C, ldc},
                                          {alpha, beta});
-    nvtxRangePushA("cutlass_gemm");
+    UnfusedAnsWorkspace workspace;
+    if (compress_unfused) {
+      cudaError_t err = workspace.allocate(M, N);
+      if (err != cudaSuccess) {
+        return err;
+      }
+    }
+    nvtxRangePushA(compress_unfused ? "cutlass_gemm_nvcomp" : "cutlass_gemm");
     cutlass::Status status = cutlass::Status::kSuccess;
+    nvcompStatus_t nvst = nvcompSuccess;
     for (int iter = 0; iter < iterations; ++iter) {
       status = gemm_operator(args);
       if (status != cutlass::Status::kSuccess) {
         break;
       }
+      if (compress_unfused) {
+        nvst = workspace.launch(C, ldc, M, N);
+        if (nvst != nvcompSuccess) {
+          break;
+        }
+      }
     }
     cudaError_t sync_status = cudaDeviceSynchronize();
     nvtxRangePop();
     if (status != cutlass::Status::kSuccess) {
+      workspace.release();
       return cudaErrorUnknown;
+    }
+    if (nvst != nvcompSuccess) {
+      std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
+                << nvcompGetStatusString(nvst) << std::endl;
+      workspace.release();
+      return cudaErrorUnknown;
+    }
+    if (sync_status != cudaSuccess) {
+      workspace.release();
+      return sync_status;
+    }
+    if (compress_unfused) {
+      sync_status = workspace.print_and_validate(
+          C, ldc, M, N, "nvCOMP LLIF ANS (unfused)");
+      workspace.release();
     }
     return sync_status;
   }
@@ -1335,6 +1398,7 @@ cudaError_t ReferenceGemm(
 
 /// Allocate several matrices in GPU device memory and call a single-precision
 /// CUTLASS GEMM kernel. --nvcomp-only runs that GEMM once, then compresses C.
+/// --nvcomp-unfused runs GEMM then compresses C on every iteration.
 cudaError_t TestCutlassGemm(
     int M,
     int N,
@@ -1343,6 +1407,7 @@ cudaError_t TestCutlassGemm(
     float beta,
     bool fuse_nvcomp,
     bool nvcomp_only,
+    bool nvcomp_unfused,
     int iterations) {
   cudaError_t result;
 
@@ -1372,7 +1437,8 @@ cudaError_t TestCutlassGemm(
     // Same CUTLASS GEMM as --fuse-nvcomp, without in-CTA compress, so the tiles
     // compressed below match fused GEMM output.
     result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
-                            /*fuse_nvcomp=*/false, /*iterations=*/1);
+                            /*fuse_nvcomp=*/false, /*compress_unfused=*/false,
+                            /*iterations=*/1);
     if (result != cudaSuccess) {
       std::cerr << "CUTLASS GEMM (nvcomp-only setup) failed: "
                 << cudaGetErrorString(result) << std::endl;
@@ -1493,11 +1559,13 @@ cudaError_t TestCutlassGemm(
   // Launch CUTLASS GEMM.
   //
 
-  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, fuse_nvcomp, iterations);
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc,
+                          fuse_nvcomp, nvcomp_unfused, iterations);
 
   if (result != cudaSuccess) {
     std::cerr << (fuse_nvcomp ? "CUTLASS fused GEMM+ANS failed: "
-                              : "CUTLASS GEMM kernel failed: ")
+                              : nvcomp_unfused ? "CUTLASS GEMM+ANS (unfused) failed: "
+                                               : "CUTLASS GEMM kernel failed: ")
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);
@@ -1587,7 +1655,7 @@ cudaError_t TestCutlassGemm(
 //
 // usage:
 //
-//   00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp] [--nvcomp-only] [--iters N]
+//   00_basic_gemm [M] [N] [K] [alpha] [beta] [--fuse-nvcomp] [--nvcomp-only] [--nvcomp-unfused] [--iters N]
 //
 static bool is_opt(const char *arg, const char *hyphen, const char *underscore) {
   return std::strcmp(arg, hyphen) == 0 || std::strcmp(arg, underscore) == 0;
@@ -1595,9 +1663,10 @@ static bool is_opt(const char *arg, const char *hyphen, const char *underscore) 
 
 static void PrintUsage(std::ostream &os) {
   os << "Usage: 00_basic_gemm [M] [N] [K] [alpha] [beta] [options]\n"
-     << "  --fuse-nvcomp   ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
-     << "  --nvcomp-only   CUTLASS GEMM once, then ANS-compress those 128x128 C tiles (no fused kernel)\n"
-     << "  --iters N       Launch each kernel N times (default 10)\n";
+     << "  --fuse-nvcomp     ANS-compress each CUTLASS 128x128 output tile in the GEMM CTA (LLIF)\n"
+     << "  --nvcomp-only     CUTLASS GEMM once, then ANS-compress those 128x128 C tiles (no fused kernel)\n"
+     << "  --nvcomp-unfused  CUTLASS GEMM then ANS-compress C on every iteration (separate kernels)\n"
+     << "  --iters N         Launch each kernel N times (default 10)\n";
 }
 
 int main(int argc, const char *arg[]) {
@@ -1613,6 +1682,7 @@ int main(int argc, const char *arg[]) {
   float scalars[2] = { 1, 0 };
   bool fuse_nvcomp = false;
   bool nvcomp_only = false;
+  bool nvcomp_unfused = false;
   int iterations = 10;
   int positional = 0;
 
@@ -1623,6 +1693,10 @@ int main(int argc, const char *arg[]) {
     }
     if (is_opt(arg[i], "--nvcomp-only", "--nvcomp_only")) {
       nvcomp_only = true;
+      continue;
+    }
+    if (is_opt(arg[i], "--nvcomp-unfused", "--nvcomp_unfused")) {
+      nvcomp_unfused = true;
       continue;
     }
     if (is_opt(arg[i], "--iters", "--iterations")) {
@@ -1666,8 +1740,9 @@ int main(int argc, const char *arg[]) {
     ++positional;
   }
 
-  if (fuse_nvcomp && nvcomp_only) {
-    std::cerr << "--fuse-nvcomp and --nvcomp-only are mutually exclusive\n";
+  if ((fuse_nvcomp && nvcomp_only) || (fuse_nvcomp && nvcomp_unfused) ||
+      (nvcomp_only && nvcomp_unfused)) {
+    std::cerr << "--fuse-nvcomp, --nvcomp-only, and --nvcomp-unfused are mutually exclusive\n";
     return -1;
   }
 
@@ -1682,6 +1757,13 @@ int main(int argc, const char *arg[]) {
               << " (CUTLASS GEMM once, then ANS on 128x128 C tiles => "
               << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
               << " CTAs, iters=" << iterations << ")" << std::endl;
+  } else if (nvcomp_unfused) {
+    std::cout << "Running GEMM then nvCOMP (unfused): M=" << problem[0]
+              << " N=" << problem[1]
+              << " K=" << problem[2]
+              << " (CUTLASS tile 128x128 => "
+              << ((problem[0] + 127) / 128) * ((problem[1] + 127) / 128)
+              << " CTAs, GEMM+ANS each iter, iters=" << iterations << ")" << std::endl;
   } else {
     std::cout << "Running GEMM: M=" << problem[0]
               << " N=" << problem[1]
@@ -1701,6 +1783,7 @@ int main(int argc, const char *arg[]) {
     scalars[1],     // beta
     fuse_nvcomp,
     nvcomp_only,
+    nvcomp_unfused,
     iterations
   );
 

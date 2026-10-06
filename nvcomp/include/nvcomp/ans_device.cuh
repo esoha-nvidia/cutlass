@@ -31,8 +31,9 @@ extern "C" nvcompStatus_t nvcompBatchedANSCompressGetDeviceLaunchParams(
 
 /**
  * @brief Host launch of compress_kernel that first packs a column-major float
- * tile into each uncompressed chunk buffer, matching compress_tiles_llif_kernel
- * when pack_mn_swapped is 0. Uncompressed chunk pointers are the pack destinations.
+ * tile into each uncompressed chunk buffer. pack_mn_swapped=0 matches the
+ * 128x128 column-major gather used by --nvcomp-only. Uncompressed chunk pointers
+ * are the pack destinations.
  */
 extern "C" nvcompStatus_t nvcompBatchedANSCompressFromColMajorTilesAsync(
   const float *device_C,

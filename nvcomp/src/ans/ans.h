@@ -98,9 +98,8 @@ void compressAsync(
 
 /**
  * @brief Same as compressAsync, but each CTA first gathers a tile from column-major C
- * into the corresponding uncompressed chunk buffer (same layout as
- * compress_tiles_llif_kernel). pack_mn_swapped=0 uses grid (tiles_m, tiles_n);
- * pack_mn_swapped!=0 uses CUTLASS ColumnMajor grid (tiles_n, tiles_m).
+ * into the corresponding uncompressed chunk buffer. pack_mn_swapped=0 uses grid
+ * (tiles_m, tiles_n); pack_mn_swapped!=0 uses CUTLASS ColumnMajor grid (tiles_n, tiles_m).
  */
 void compressFromColMajorTilesAsync(
   const float *C,

@@ -266,61 +266,6 @@ struct GemmFusedAns {
   }
 };
 
-/// Pack one column-major 128x128 tile and ANS-compress it. No GEMM.
-__global__ void compress_tiles_llif_kernel(
-    float const *C,
-    int ldc,
-    int M,
-    int N,
-    float *packed_tiles,
-    size_t packed_stride_elems,
-    char *compressed_tiles,
-    size_t compressed_stride,
-    size_t *comp_sizes,
-    int max_sub_chunk_size,
-    uint32_t slot_words,
-    size_t smem_alignment) {
-  int const tile_m = static_cast<int>(blockIdx.x);
-  int const tile_n = static_cast<int>(blockIdx.y);
-  int const tiles_m = static_cast<int>(gridDim.x);
-  int const m0 = tile_m * kAnsTileM;
-  int const n0 = tile_n * kAnsTileN;
-  int const remain_m = M - m0;
-  int const remain_n = N - n0;
-  int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
-  int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
-  size_t const tile_id =
-      static_cast<size_t>(tile_m) + static_cast<size_t>(tile_n) * static_cast<size_t>(tiles_m);
-
-  float *packed = packed_tiles + tile_id * packed_stride_elems;
-  int const tile_elems = kAnsTileM * kAnsTileN;
-  for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
-    int const row = i % kAnsTileM;
-    int const col = i / kAnsTileM;
-    float value = 0.f;
-    if (row < rows && col < cols) {
-      value = C[(m0 + row) + (n0 + col) * ldc];
-    }
-    packed[row + col * kAnsTileM] = value;
-  }
-  __syncthreads();
-
-  extern __shared__ unsigned char shared_scratch[];
-  uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(shared_scratch);
-  uintptr_t const align = static_cast<uintptr_t>(smem_alignment);
-  if (align > 1) {
-    scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
-  }
-  nvcompDeviceANSCompressChunk(
-      compressed_tiles + tile_id * compressed_stride,
-      packed,
-      kAnsChunkBytes,
-      comp_sizes + tile_id,
-      max_sub_chunk_size,
-      slot_words,
-      reinterpret_cast<void *>(scratch_addr));
-}
-
 __global__ void count_ans_tile_mismatches_kernel(
     unsigned char const *packed,
     size_t packed_stride,
@@ -703,9 +648,8 @@ cudaError_t ValidateAnsCompression(
     return err;
   }
 
-  // Pack from column-major C inside compress_kernel (same gather as
-  // compress_tiles_llif_kernel). Overwrites packed tiles after decompress
-  // validation has already used them as the round-trip reference.
+  // Pack from column-major C inside compress_kernel. Overwrites packed tiles
+  // after decompress validation has already used them as the round-trip reference.
   nvtxRangePushA("nvcomp_ans_llif_compress");
   nvst = nvcompBatchedANSCompressFromColMajorTilesAsync(
       C,
@@ -797,7 +741,8 @@ cudaError_t ValidateAnsCompression(
   return cudaSuccess;
 }
 
-/// ANS-compress every 128x128 tile of C. C is not modified.
+/// ANS-compress every 128x128 tile of C via inlined compress_kernel (no RDC).
+/// C is not modified.
 cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int iterations) {
   if (M <= 0 || N <= 0) {
     return cudaErrorInvalidValue;
@@ -809,33 +754,8 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
 
   size_t const chunk_bytes = kAnsChunkBytes;
   nvcompBatchedANSCompressOpts_t const compress_opts = nvcompBatchedANSCompressDefaultOpts;
-  int max_sub_chunk_size = 0;
-  uint32_t slot_words = 0;
-  size_t ans_smem = 0;
-  size_t ans_align = 16;
-  int block_threads = 0;
-  nvcompStatus_t nvst = nvcompBatchedANSCompressGetDeviceLaunchParams(
-      num_chunks,
-      chunk_bytes,
-      compress_opts,
-      &max_sub_chunk_size,
-      &slot_words,
-      &ans_smem,
-      &ans_align,
-      &block_threads);
-  if (nvst != nvcompSuccess) {
-    std::cerr << "nvcompBatchedANSCompressGetDeviceLaunchParams failed: "
-              << nvcompGetStatusString(nvst) << std::endl;
-    return cudaErrorUnknown;
-  }
-  if (block_threads != kAnsThreads) {
-    std::cerr << "device ANS compressor requires " << block_threads
-              << " threads, GEMM CTA is " << kAnsThreads << std::endl;
-    return cudaErrorInvalidValue;
-  }
-
   size_t max_comp_chunk = 0;
-  nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
+  nvcompStatus_t nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
       chunk_bytes, compress_opts, &max_comp_chunk);
   if (nvst != nvcompSuccess) {
     std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
@@ -847,19 +767,24 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
       align_up_bytes(chunk_bytes, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
   size_t const compressed_stride =
       align_up_bytes(max_comp_chunk, std::max(nvcompANSRequiredCompressionAlignment, size_t(256)));
-  size_t const dyn_smem = ans_smem + ans_align;
 
   float *d_packed = nullptr;
   char *d_compressed = nullptr;
   size_t *d_comp_sizes = nullptr;
+  size_t *d_uncomp_bytes = nullptr;
+  void **d_in_ptrs = nullptr;
+  void **d_out_ptrs = nullptr;
 
   auto free_all = [&]() {
+    cudaFree(d_out_ptrs);
+    cudaFree(d_in_ptrs);
+    cudaFree(d_uncomp_bytes);
     cudaFree(d_packed);
     cudaFree(d_compressed);
     cudaFree(d_comp_sizes);
   };
 
-  cudaError_t   err = cudaMalloc(&d_packed, packed_stride * num_chunks);
+  cudaError_t err = cudaMalloc(&d_packed, packed_stride * num_chunks);
   if (err != cudaSuccess) {
     return err;
   }
@@ -883,11 +808,41 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
     free_all();
     return err;
   }
+  err = cudaMalloc(&d_uncomp_bytes, num_chunks * sizeof(size_t));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_in_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMalloc(&d_out_ptrs, num_chunks * sizeof(void *));
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
 
-  err = cudaFuncSetAttribute(
-      compress_tiles_llif_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(dyn_smem));
+  std::vector<size_t> h_uncomp_bytes(num_chunks, chunk_bytes);
+  std::vector<void *> h_in_ptrs(num_chunks);
+  std::vector<void *> h_out_ptrs(num_chunks);
+  for (size_t i = 0; i < num_chunks; ++i) {
+    h_in_ptrs[i] = reinterpret_cast<char *>(d_packed) + i * packed_stride;
+    h_out_ptrs[i] = d_compressed + i * compressed_stride;
+  }
+  err = cudaMemcpy(d_uncomp_bytes, h_uncomp_bytes.data(), num_chunks * sizeof(size_t),
+                   cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemcpy(d_in_ptrs, h_in_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    free_all();
+    return err;
+  }
+  err = cudaMemcpy(d_out_ptrs, h_out_ptrs.data(), num_chunks * sizeof(void *), cudaMemcpyHostToDevice);
   if (err != cudaSuccess) {
     free_all();
     return err;
@@ -895,25 +850,33 @@ cudaError_t CompressOutputTilesAns(int M, int N, float const *C, int ldc, int it
 
   nvtxRangePushA("nvcomp_llif_ans_tiles");
   for (int iter = 0; iter < iterations; ++iter) {
-    compress_tiles_llif_kernel<<<dim3(tiles_m, tiles_n), kAnsThreads, dyn_smem>>>(
+    nvst = nvcompBatchedANSCompressFromColMajorTilesAsync(
         C,
         ldc,
         M,
         N,
-        d_packed,
-        packed_stride / sizeof(float),
-        d_compressed,
-        compressed_stride,
+        kAnsTileM,
+        kAnsTileN,
+        /*pack_mn_swapped=*/0,
+        reinterpret_cast<const void *const *>(d_in_ptrs),
+        d_uncomp_bytes,
+        chunk_bytes,
+        num_chunks,
+        d_out_ptrs,
         d_comp_sizes,
-        max_sub_chunk_size,
-        slot_words,
-        ans_align);
+        compress_opts,
+        nullptr,
+        0);
+    if (nvst != nvcompSuccess) {
+      break;
+    }
   }
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
+  if (nvst != nvcompSuccess) {
     nvtxRangePop();
+    std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
+              << nvcompGetStatusString(nvst) << std::endl;
     free_all();
-    return err;
+    return cudaErrorUnknown;
   }
   err = cudaDeviceSynchronize();
   nvtxRangePop();

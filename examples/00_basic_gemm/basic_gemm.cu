@@ -34,10 +34,10 @@
   matrix multiply kernel to verify its correctness.
 
   The CUTLASS Gemm template is instantiated in the function CutlassSgemmNN. This kernel computes
-  the general matrix product (GEMM) using bfloat16 tensor cores (FP32 accumulate) and assumes
+  the general matrix product (GEMM) using fp16 tensor cores (FP32 accumulate) and assumes
   all matrices have column-major layout.
 
-  The threadblock tile size is 128x128x64 bf16 TensorOp (8 warps / 256 threads) so fused ANS
+  The threadblock tile size is 128x128x64 fp16 TensorOp (8 warps / 256 threads) so fused ANS
   can run in the same CTA. See the CUTLASS Parallel for All blog post for more exposition
   on the tunable parameters available in CUTLASS.
 
@@ -91,14 +91,14 @@
 // Tile-level ANS fused into the CUTLASS GEMM kernel via nvCOMP LLIF
 //
 // LinearCombination is a per-thread functor and never holds a whole 128x128 tile. After it writes
-// D, the same CTA packs that strided column-major tile as bf16 and runs 16-bit rANS
+// D, the same CTA packs that strided column-major tile as fp16 and runs 16-bit rANS
 // (`compress_chunk`) in this translation unit. device::Gemm launches Kernel<GemmKernel>
 // with no hook after the epilogue, so this example launches Kernel<GemmFusedAns> itself (same grid,
 // 256 threads, dynamic smem reused after the epilogue).
 //
-// GEMM is Ampere bf16 tensor cores (mma.sync 16x8x16) with warp 32x64 so the CTA stays 256
+// GEMM is Ampere fp16 tensor cores (mma.sync 16x8x16) with warp 32x64 so the CTA stays 256
 // threads and can run ANS. A 64x64 warp tile would be 128 threads and could not host compress_chunk.
-// nvCOMP ANS uses NVCOMP_TYPE_FLOAT16 on the 16-bit C tiles (bf16 bit patterns).
+// nvCOMP ANS uses NVCOMP_TYPE_FLOAT16 on the 16-bit C tiles.
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -109,7 +109,7 @@ enum {
   kAnsThreads = kAnsWarps * 32
 };
 
-using Element = cutlass::bfloat16_t;
+using Element = cutlass::half_t;
 using ElementAccumulator = float;
 static constexpr int kEpilogueElements =
     128 / cutlass::sizeof_bits<Element>::value;
@@ -208,7 +208,7 @@ struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<
 };
 
 // Column-major device::Gemm swaps A/B and treats C/D as RowMajor with problem {N, M, K}.
-// TensorOp bf16: 128x128x64 tile, 8 warps (256 threads) so fused ANS still fits.
+// TensorOp fp16: 128x128x64 tile, 8 warps (256 threads) so fused ANS still fits.
 using CutlassGemm = cutlass::gemm::device::Gemm<
     Element, cutlass::layout::ColumnMajor,
     Element, cutlass::layout::ColumnMajor,
@@ -227,7 +227,7 @@ using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
 static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
               "inlined ANS compress requires the 256-thread CUTLASS GEMM CTA");
 
-/// Same 128x128x64 bf16 TensorOp GEMM as CutlassGemm, default LinearCombination (no ANS).
+/// Same 128x128x64 fp16 TensorOp GEMM as CutlassGemm, default LinearCombination (no ANS).
 using CutlassGemmUnfused = cutlass::gemm::device::Gemm<
     Element, cutlass::layout::ColumnMajor,
     Element, cutlass::layout::ColumnMajor,
@@ -247,7 +247,7 @@ using CutlassGemmUnfusedKernel = typename CutlassGemmUnfused::GemmKernel;
 static_assert(CutlassGemmUnfusedKernel::kThreadCount == kAnsThreads,
               "unfused GEMM CTA must match the fused 256-thread kernel");
 
-/// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 bf16 tile and ANS-compress it.
+/// GEMM mainloop + LinearCombination, then pack this CTA's 128x128 fp16 tile and ANS-compress it.
 struct GemmFusedAns {
   using Params = typename CutlassGemmKernel::Params;
   using SharedStorage = typename CutlassGemmKernel::SharedStorage;
@@ -826,7 +826,7 @@ cudaError_t ValidateAnsCompression(
   return cudaSuccess;
 }
 
-/// Workspace for inlined compress_kernel (no RDC) over 128x128 bf16 tiles of C.
+/// Workspace for inlined compress_kernel (no RDC) over 128x128 fp16 tiles of C.
 struct UnfusedAnsWorkspace {
   size_t num_chunks = 0;
   size_t chunk_bytes = 0;
@@ -1132,7 +1132,7 @@ cudaError_t CutlassSgemmNN(
     return sync_status;
   }
 
-  // Same 128x128x64 bf16 TensorOp GEMM as the unfused kernel, plus AnsEpilogueOp so
+  // Same 128x128x64 fp16 TensorOp GEMM as the unfused kernel, plus AnsEpilogueOp so
   // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
   // and launches a RowMajor kernel on problem {N, M, K}.
 
@@ -1309,7 +1309,7 @@ cudaError_t CutlassSgemmNN(
   return err;
 }
 
-/// Column-major bf16 GEMM via cuBLAS (FP32 accumulate). NVTX covers only the GEMM launch.
+/// Column-major fp16 GEMM via cuBLAS (FP32 accumulate). NVTX covers only the GEMM launch.
 cudaError_t CublasSgemmNN(
   int M,
   int N,
@@ -1341,14 +1341,14 @@ cudaError_t CublasSgemmNN(
       K,
       &alpha,
       A,
-      CUDA_R_16BF,
+      CUDA_R_16F,
       lda,
       B,
-      CUDA_R_16BF,
+      CUDA_R_16F,
       ldb,
       &beta,
       C,
-      CUDA_R_16BF,
+      CUDA_R_16F,
       ldc,
       CUBLAS_COMPUTE_32F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1514,7 +1514,7 @@ cudaError_t ReferenceGemm(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Allocate several matrices in GPU device memory and call a bf16
+/// Allocate several matrices in GPU device memory and call an fp16
 /// CUTLASS GEMM kernel. --nvcomp-only runs that GEMM once, then compresses C.
 /// --nvcomp-unfused runs GEMM then compresses C on every iteration.
 cudaError_t TestCutlassGemm(

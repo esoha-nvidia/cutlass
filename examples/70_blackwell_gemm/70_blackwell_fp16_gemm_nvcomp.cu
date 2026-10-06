@@ -12,7 +12,7 @@
     path: GEMM CTA and ANS CTA are separate. In-CTA fusion needs a custom Blackwell epilogue.
 
     Usage:
-      $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=8192
+      $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
 */
 
 #include <algorithm>
@@ -538,7 +538,6 @@ StrideA stride_A;
 StrideB stride_B;
 StrideC stride_C;
 StrideD stride_D;
-uint64_t seed;
 
 cutlass::DeviceAllocation<typename Gemm::ElementA> block_A;
 cutlass::DeviceAllocation<typename Gemm::ElementB> block_B;
@@ -557,7 +556,7 @@ struct Options {
 
   Options():
     help(false),
-    m(8192), n(8192), k(8192),
+    m(8192), n(8192), k(2048),
     alpha(1.f), beta(0.f),
     iterations(10),
     swizzle(0)
@@ -620,27 +619,28 @@ struct Result {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 template <class Element>
+__global__ void initialize_small_ints_kernel(Element *ptr, size_t n, int seed) {
+  size_t const idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  int const k = 16807;
+  int const m = 16;
+  float value = float(((static_cast<int>(idx) + seed) * k % m) - m / 2);
+  ptr[idx] = Element(value);
+}
+
+// Same small-integer fill as 00_basic_gemm so ANS FLOAT16 sees a similar C histogram.
+template <class Element>
 bool initialize_block(
   cutlass::DeviceAllocation<Element>& block,
-  uint64_t seed=2023) {
+  int seed=0) {
 
-  Element scope_max, scope_min;
-  int bits_input = cutlass::sizeof_bits<Element>::value;
-
-  if (bits_input == 1) {
-    scope_max = Element(2);
-    scope_min = Element(0);
-  } else if (bits_input <= 8) {
-    scope_max = Element(2);
-    scope_min = Element(-2);
-  } else {
-    scope_max = Element(8);
-    scope_min = Element(-8);
-  }
-
-  cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
-
+  size_t const n = block.size();
+  int const threads = 256;
+  int const blocks = static_cast<int>((n + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  initialize_small_ints_kernel<<<blocks, threads>>>(block.get(), n, seed);
+  CUDA_CHECK(cudaGetLastError());
   return true;
 }
 
@@ -656,9 +656,9 @@ void initialize(const Options &options) {
   block_D.reset(options.m * options.n);
   block_ref_D.reset(options.m * options.n);
 
-  initialize_block(block_A, seed + 2023);
-  initialize_block(block_B, seed + 2022);
-  initialize_block(block_C, seed + 2021);
+  initialize_block(block_A, 0);
+  initialize_block(block_B, 17);
+  initialize_block(block_C, 101);
 }
 
 typename Gemm::Arguments args_from_options(const Options &options) {

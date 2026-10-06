@@ -37,9 +37,9 @@
   the general matrix product (GEMM) using single-precision floating-point arithmetic and assumes
   all matrices have column-major layout.
 
-  The threadblock tile size is chosen as 128x128x8 which offers good performance for large matrices.
-  See the CUTLASS Parallel for All blog post for more exposition on the tunable parameters available
-  in CUTLASS.
+  The threadblock tile size is 128x128x32 TF32 TensorOp (8 warps / 256 threads) so fused ANS
+  can run in the same CTA. See the CUTLASS Parallel for All blog post for more exposition
+  on the tunable parameters available in CUTLASS.
 
   https://devblogs.nvidia.com/cutlass-linear-algebra-cuda/
 
@@ -95,6 +95,9 @@
 // (`compress_chunk`) in this translation unit. device::Gemm launches Kernel<GemmKernel>
 // with no hook after the epilogue, so this example launches Kernel<GemmFusedAns> itself (same grid,
 // 256 threads, dynamic smem reused after the epilogue).
+//
+// GEMM is Ampere TF32 tensor cores (mma.sync 16x8x8) with warp 32x64 so the CTA stays 256
+// threads and can run ANS. A 64x64 warp tile would be 128 threads and could not host compress_chunk.
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -164,8 +167,8 @@ static cudaError_t PrintAnsRatio(
 
 /// LinearCombination plus device pointers so the fused kernel can ANS-compress
 /// the CTA's output tile after the GEMM epilogue.
-struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float, 1, float, float> {
-  using Base = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
+struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float, 4, float, float> {
+  using Base = cutlass::epilogue::thread::LinearCombination<float, 4, float, float>;
 
   struct Params : public Base::Params {
     __half *packed = nullptr;
@@ -197,33 +200,39 @@ struct AnsEpilogueOp : public cutlass::epilogue::thread::LinearCombination<float
 };
 
 // Column-major device::Gemm swaps A/B and treats C/D as RowMajor with problem {N, M, K}.
+// TensorOp TF32: 128x128x32 tile, 8 warps (256 threads) so fused ANS still fits.
 using CutlassGemm = cutlass::gemm::device::Gemm<
     float, cutlass::layout::ColumnMajor,
     float, cutlass::layout::ColumnMajor,
     float, cutlass::layout::ColumnMajor,
     float,
-    cutlass::arch::OpClassSimt,
-    cutlass::arch::Sm70,
-    cutlass::gemm::GemmShape<128, 128, 8>,
-    cutlass::gemm::GemmShape<32, 64, 8>,
-    cutlass::gemm::GemmShape<1, 1, 1>,
-    AnsEpilogueOp>;
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    AnsEpilogueOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3>;
 
 using CutlassGemmKernel = typename CutlassGemm::GemmKernel;
 static_assert(CutlassGemmKernel::kThreadCount == kAnsThreads,
               "inlined ANS compress requires the 256-thread CUTLASS GEMM CTA");
 
-/// Same 128x128x8 SIMT GEMM as CutlassGemm, default LinearCombination (no ANS).
+/// Same 128x128x32 TF32 TensorOp GEMM as CutlassGemm, default LinearCombination (no ANS).
 using CutlassGemmUnfused = cutlass::gemm::device::Gemm<
     float, cutlass::layout::ColumnMajor,
     float, cutlass::layout::ColumnMajor,
     float, cutlass::layout::ColumnMajor,
     float,
-    cutlass::arch::OpClassSimt,
-    cutlass::arch::Sm70,
-    cutlass::gemm::GemmShape<128, 128, 8>,
-    cutlass::gemm::GemmShape<32, 64, 8>,
-    cutlass::gemm::GemmShape<1, 1, 1>>;
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3>;
 
 using CutlassGemmUnfusedKernel = typename CutlassGemmUnfused::GemmKernel;
 static_assert(CutlassGemmUnfusedKernel::kThreadCount == kAnsThreads,
@@ -1114,7 +1123,7 @@ cudaError_t CutlassSgemmNN(
     return sync_status;
   }
 
-  // Same 128x128x8 SIMT SGEMM as the 6-arg ColumnMajor device::Gemm, plus AnsEpilogueOp so
+  // Same 128x128x32 TF32 TensorOp GEMM as the unfused kernel, plus AnsEpilogueOp so
   // compression pointers travel in kernel Params. The ColumnMajor specialization swaps A/B
   // and launches a RowMajor kernel on problem {N, M, K}.
 
@@ -1771,7 +1780,7 @@ int main(int argc, const char *arg[]) {
   //
 
   // GEMM problem dimensions.
-  // CUTLASS threadblock tile is 128x128x8, so a 128^3 problem launches 1 CTA.
+  // CUTLASS threadblock tile is 128x128x32, so a 128^3 problem launches 1 CTA.
   // 8192x8192 uses a 64x64 grid (4096 CTAs). K does not change CTA count.
   int problem[3] = { 8192, 8192, 2048 };
   float scalars[2] = { 1, 0 };

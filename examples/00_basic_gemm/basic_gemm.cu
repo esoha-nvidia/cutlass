@@ -284,7 +284,9 @@ struct GemmFusedAns {
 
 /// Distinct symbol for NCU (`-k regex:'gemm_fused_ans_kernel'`). cutlass::Kernel<>
 /// shows up as `Kernel` and does not match GemmFusedAns.
-__global__ void gemm_fused_ans_kernel(typename CutlassGemmKernel::Params params) {
+__global__
+__launch_bounds__(256, 4)
+void gemm_fused_ans_kernel(typename CutlassGemmKernel::Params params) {
   extern __shared__ int SharedStorageBase[];
   auto *shared_storage =
       reinterpret_cast<typename GemmFusedAns::SharedStorage *>(SharedStorageBase);

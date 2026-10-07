@@ -99,19 +99,29 @@ $NCU --set full --import-source yes \
   -o cutlass_gemm_ncu --force-overwrite \
   ./examples/00_basic_gemm/00_basic_gemm
 
-# Blackwell tcgen05 GEMM then unfused ANS (1SM 128x128 tiles, FP16 C).
-# GEMM kernel basename is typically device_kernel; ANS is compress_kernel.
+# Blackwell tcgen05 GEMM then ANS (1SM 128x128 tiles, FP16 C).
+# Unfused GEMM basename is typically device_kernel; fused is gemm_fused_ans_kernel.
 make 70_blackwell_fp16_gemm_nvcomp -j$(nproc)
 
 ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
+./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx \
   -o blackwell_gemm_nvcomp_unfused --force-overwrite true \
   ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
 
+../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx \
+  -o blackwell_gemm_nvcomp --force-overwrite true \
+  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp
+
 $NCU --set full --import-source yes \
   -k regex:'device_kernel|compress_kernel' \
   -o blackwell_gemm_nvcomp_unfused_ncu --force-overwrite \
   ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048 --iterations=1
+
+$NCU --set full --import-source yes \
+  -k regex:'gemm_fused_ans_kernel' \
+  -o blackwell_gemm_nvcomp_ncu --force-overwrite \
+  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1
 ```
 

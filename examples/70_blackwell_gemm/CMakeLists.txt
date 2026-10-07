@@ -54,7 +54,7 @@ cutlass_example_add_executable(
   TEST_SWIZZLE_5_UNEVEN
 )
 
-# Unfused nvCOMP ANS after the Blackwell GEMM (stock compress_kernel, no RDC).
+# Blackwell GEMM + nvCOMP ANS (unfused compress_kernel or --fuse-nvcomp, no RDC).
 cutlass_example_add_executable(
   70_blackwell_fp16_gemm_nvcomp
   70_blackwell_fp16_gemm_nvcomp.cu
@@ -65,6 +65,15 @@ if(NOT TARGET nvcomp)
   add_subdirectory("${CUTLASS_DIR}/nvcomp" "${CMAKE_BINARY_DIR}/nvcomp")
 endif()
 target_link_libraries(70_blackwell_fp16_gemm_nvcomp PRIVATE nvcomp)
+target_include_directories(70_blackwell_fp16_gemm_nvcomp PRIVATE
+  "${CUTLASS_DIR}/nvcomp/src"
+  "${CUTLASS_DIR}/nvcomp/src/bitcomp")
+if(CUTLASS_CUDA_CCCL_INCLUDE_DIR)
+  target_include_directories(70_blackwell_fp16_gemm_nvcomp PRIVATE
+    "${CUTLASS_CUDA_CCCL_INCLUDE_DIR}")
+endif()
+target_compile_options(70_blackwell_fp16_gemm_nvcomp PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda --expt-relaxed-constexpr>)
 set_target_properties(70_blackwell_fp16_gemm_nvcomp PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF)
 endif()

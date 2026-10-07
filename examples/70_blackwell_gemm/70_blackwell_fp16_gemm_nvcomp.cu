@@ -4,19 +4,22 @@
  **************************************************************************************************/
 
 /*! \file
-    \brief Blackwell SM100 FP16 GEMM (tcgen05) followed by unfused nvCOMP LLIF ANS.
+    \brief Blackwell SM100 FP16 GEMM (tcgen05) with unfused or fused nvCOMP LLIF ANS.
 
     Same CUTLASS 3.x Blackwell kernel family as 70_blackwell_fp16_gemm, with a 1SM 128x128
-    MMA tile so C is a grid of 128x128 tiles. After the GEMM, each tile is packed and
-    ANS-compressed by stock compress_kernel (NVCOMP_TYPE_FLOAT16). This is the unfused
-    path: GEMM CTA and ANS CTA are separate. In-CTA fusion needs a custom Blackwell epilogue.
+    MMA tile so C is a grid of 128x128 tiles. Default: GEMM then stock compress_kernel
+    (NVCOMP_TYPE_FLOAT16). --fuse-nvcomp: the same 256-thread persistent CTAs run
+    compress_chunk after the GEMM drains (one launch, no RDC). CLC warps do not
+    reconverge per tile, so this is not Ampere-style compress-in-epilogue.
 
     Usage:
       $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
+      $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp
 */
 
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
 #include <iostream>
 #include <vector>
 
@@ -35,6 +38,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/device_kernel.h"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
@@ -46,6 +50,11 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 
 #include "helper.h"
+
+#ifndef THRUST_CUB_WRAPPED_NAMESPACE
+#define THRUST_CUB_WRAPPED_NAMESPACE nvcomp
+#endif
+#include "ans/ans_device_chunk.cuh"
 
 using namespace cute;
 
@@ -138,6 +147,10 @@ struct UnfusedAnsWorkspace {
   size_t packed_stride = 0;
   size_t compressed_stride = 0;
   nvcompBatchedANSCompressOpts_t compress_opts{};
+  int max_sub_chunk_size = 0;
+  uint32_t slot_words = 0;
+  size_t ans_smem_bytes = 0;
+  size_t ans_smem_alignment = 16;
   cutlass::half_t *d_packed = nullptr;
   char *d_compressed = nullptr;
   size_t *d_comp_sizes = nullptr;
@@ -169,8 +182,28 @@ struct UnfusedAnsWorkspace {
     num_chunks = static_cast<size_t>(tiles_m) * static_cast<size_t>(tiles_n);
     chunk_bytes = kAnsChunkBytes;
     compress_opts = AnsFp16CompressOpts();
+    int block_threads = 0;
+    nvcompStatus_t nvst = nvcompBatchedANSCompressGetDeviceLaunchParams(
+        num_chunks,
+        chunk_bytes,
+        compress_opts,
+        &max_sub_chunk_size,
+        &slot_words,
+        &ans_smem_bytes,
+        &ans_smem_alignment,
+        &block_threads);
+    if (nvst != nvcompSuccess) {
+      std::cerr << "nvcompBatchedANSCompressGetDeviceLaunchParams failed: "
+                << nvcompGetStatusString(nvst) << std::endl;
+      return cudaErrorUnknown;
+    }
+    if (block_threads != kAnsThreads) {
+      std::cerr << "device ANS compressor requires " << block_threads
+                << " threads, fused GEMM CTA is " << kAnsThreads << std::endl;
+      return cudaErrorInvalidValue;
+    }
     size_t max_comp_chunk = 0;
-    nvcompStatus_t nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
+    nvst = nvcompBatchedANSCompressGetMaxOutputChunkSize(
         chunk_bytes, compress_opts, &max_comp_chunk);
     if (nvst != nvcompSuccess) {
       std::cerr << "nvcompBatchedANSCompressGetMaxOutputChunkSize failed: "
@@ -519,6 +552,120 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
+static_assert(GemmKernel::MaxThreadsPerBlock == kAnsThreads,
+              "fused compress_chunk requires the 256-thread SM100 CTA");
+
+struct FusedAnsArgs {
+  cutlass::half_t *D = nullptr;
+  int ldc = 0;
+  int M = 0;
+  int N = 0;
+  cutlass::half_t *packed = nullptr;
+  size_t packed_stride_elems = 0;
+  char *compressed = nullptr;
+  size_t compressed_stride = 0;
+  size_t *comp_sizes = nullptr;
+  size_t num_chunks = 0;
+  int max_sub_chunk_size = 0;
+  uint32_t slot_words = 0;
+  size_t smem_alignment = 16;
+};
+
+CUTLASS_DEVICE
+void fused_ans_compress_tiles(FusedAnsArgs const &ans, char *smem) {
+  if (ans.num_chunks == 0) {
+    return;
+  }
+  int const tiles_m = (ans.M + kAnsTileM - 1) / kAnsTileM;
+  size_t const cta_stride = static_cast<size_t>(gridDim.x);
+  for (size_t tile_id = static_cast<size_t>(blockIdx.x); tile_id < ans.num_chunks;
+       tile_id += cta_stride) {
+    int const tile_m = static_cast<int>(tile_id % static_cast<size_t>(tiles_m));
+    int const tile_n = static_cast<int>(tile_id / static_cast<size_t>(tiles_m));
+    int const m0 = tile_m * kAnsTileM;
+    int const n0 = tile_n * kAnsTileN;
+    int const remain_m = ans.M - m0;
+    int const remain_n = ans.N - n0;
+    int const rows = remain_m < kAnsTileM ? remain_m : kAnsTileM;
+    int const cols = remain_n < kAnsTileN ? remain_n : kAnsTileN;
+    int const tile_elems = kAnsTileM * kAnsTileN;
+    cutlass::half_t *packed = ans.packed + tile_id * ans.packed_stride_elems;
+    for (int i = static_cast<int>(threadIdx.x); i < tile_elems; i += static_cast<int>(blockDim.x)) {
+      int const row = i % kAnsTileM;
+      int const col = i / kAnsTileM;
+      cutlass::half_t value = cutlass::half_t(0);
+      if (row < rows && col < cols) {
+        value = ans.D[(m0 + row) + (n0 + col) * ans.ldc];
+      }
+      packed[row + col * kAnsTileM] = value;
+    }
+    __syncthreads();
+
+    uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(smem);
+    uintptr_t const align = static_cast<uintptr_t>(ans.smem_alignment);
+    if (align > 1) {
+      scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
+    }
+    using Policy = ans_gpu_lib::detail::FP16EncodePolicy<ans_gpu_lib::detail::FP16X2EncodeImpl>;
+    using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
+    auto &workspace = *reinterpret_cast<Workspace *>(scratch_addr);
+    ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
+        ans.compressed + tile_id * ans.compressed_stride,
+        packed,
+        static_cast<ans_gpu_lib::IndexT>(kAnsChunkBytes),
+        ans.comp_sizes + tile_id,
+        ans.max_sub_chunk_size,
+        nullptr,
+        ans.slot_words,
+        /*histogram_reduction_log2=*/0u,
+        workspace.workspace,
+        workspace.packed_chunk_size_bytes);
+    __syncthreads();
+  }
+}
+
+__global__
+__launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
+void gemm_fused_ans_kernel(
+    CUTLASS_GRID_CONSTANT typename GemmKernel::Params const gemm_params,
+    FusedAnsArgs ans) {
+  extern __shared__ char fused_smem[];
+  GemmKernel gemm;
+  gemm(gemm_params, fused_smem);
+  __syncthreads();
+  fused_ans_compress_tiles(ans, fused_smem);
+}
+
+cudaError_t launch_fused_gemm_ans(
+    typename Gemm::Arguments const &arguments,
+    void *workspace,
+    UnfusedAnsWorkspace const &ans,
+    cutlass::half_t *D,
+    int ldc,
+    int M,
+    int N,
+    size_t dyn_smem) {
+  auto gemm_params = GemmKernel::to_underlying_arguments(arguments, workspace);
+  dim3 const grid = Gemm::get_grid_shape(arguments, workspace);
+  dim3 const block = GemmKernel::get_block_shape();
+  FusedAnsArgs fused{};
+  fused.D = D;
+  fused.ldc = ldc;
+  fused.M = M;
+  fused.N = N;
+  fused.packed = ans.d_packed;
+  fused.packed_stride_elems = ans.packed_stride / sizeof(cutlass::half_t);
+  fused.compressed = ans.d_compressed;
+  fused.compressed_stride = ans.compressed_stride;
+  fused.comp_sizes = ans.d_comp_sizes;
+  fused.num_chunks = ans.num_chunks;
+  fused.max_sub_chunk_size = ans.max_sub_chunk_size;
+  fused.slot_words = ans.slot_words;
+  fused.smem_alignment = ans.ans_smem_alignment;
+  gemm_fused_ans_kernel<<<grid, block, dyn_smem>>>(gemm_params, fused);
+  return cudaGetLastError();
+}
+
 using DeviceGemmReference = cutlass::reference::device::Gemm<
   ElementA,
   LayoutA,
@@ -549,6 +696,7 @@ cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput> block_
 
 struct Options {
   bool help;
+  bool fuse_nvcomp;
   float alpha, beta;
   int iterations;
   int m, n, k;
@@ -556,6 +704,7 @@ struct Options {
 
   Options():
     help(false),
+    fuse_nvcomp(false),
     m(8192), n(8192), k(2048),
     alpha(1.f), beta(0.f),
     iterations(10),
@@ -568,6 +717,8 @@ struct Options {
       help = true;
       return;
     }
+    fuse_nvcomp = cmd.check_cmd_line_flag("fuse-nvcomp") ||
+                  cmd.check_cmd_line_flag("fuse_nvcomp");
     cmd.get_cmd_line_argument("m", m);
     cmd.get_cmd_line_argument("n", n);
     cmd.get_cmd_line_argument("k", k);
@@ -579,7 +730,7 @@ struct Options {
 
   std::ostream & print_usage(std::ostream &out) const {
     out << "70_blackwell_fp16_gemm_nvcomp\n\n"
-      << "  Blackwell FP16 tcgen05 GEMM, then unfused nvCOMP ANS on 128x128 C tiles.\n\n"
+      << "  Blackwell FP16 tcgen05 GEMM with unfused or fused nvCOMP ANS on 128x128 C tiles.\n\n"
       << "Options:\n\n"
       << "  --help                      If specified, displays this usage statement\n\n"
       << "  --m=<int>                   Sets the M extent of the GEMM\n"
@@ -588,7 +739,8 @@ struct Options {
       << "  --alpha=<f32>               Epilogue scalar alpha\n"
       << "  --beta=<f32>                Epilogue scalar beta\n\n"
       << "  --swizzle=<int>             Cluster rasterization swizzle\n\n"
-      << "  --iterations=<int>          Number of profiling iterations (GEMM+ANS each).\n\n";
+      << "  --iterations=<int>          Number of profiling iterations (GEMM+ANS each).\n"
+      << "  --fuse-nvcomp               Same CTA compress_chunk after the persistent GEMM.\n\n";
     return out;
   }
 
@@ -703,18 +855,6 @@ int run(Options &options) {
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
-  nvtxRangePushA("cutlass_gemm");
-  CUTLASS_CHECK(gemm.run());
-  CUDA_CHECK(cudaDeviceSynchronize());
-  nvtxRangePop();
-
-  Result result;
-  result.passed = verify(options);
-  std::cout << "  GEMM disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
-  if (!result.passed) {
-    return -1;
-  }
-
   UnfusedAnsWorkspace ans;
   cudaError_t ans_err = ans.allocate(options.m, options.n);
   if (ans_err != cudaSuccess) {
@@ -723,17 +863,63 @@ int run(Options &options) {
   }
 
   int const ldc = options.m;
-  nvtxRangePushA("nvcomp_ans");
-  nvcompStatus_t nvst = ans.launch(block_D.get(), ldc, options.m, options.n);
-  CUDA_CHECK(cudaDeviceSynchronize());
-  nvtxRangePop();
-  if (nvst != nvcompSuccess) {
-    std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
-              << nvcompGetStatusString(nvst) << std::endl;
+  size_t const gemm_smem = static_cast<size_t>(GemmKernel::SharedStorageSize);
+  size_t const dyn_smem = std::max(gemm_smem, ans.ans_smem_bytes + ans.ans_smem_alignment);
+  if (options.fuse_nvcomp) {
+    cudaError_t attr_err = cudaFuncSetAttribute(
+        gemm_fused_ans_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(dyn_smem));
+    if (attr_err != cudaSuccess) {
+      std::cerr << "cudaFuncSetAttribute(fused kernel smem) failed: "
+                << cudaGetErrorString(attr_err) << std::endl;
+      ans.release();
+      return -1;
+    }
+  }
+
+  nvcompStatus_t nvst = nvcompSuccess;
+  if (options.fuse_nvcomp) {
+    nvtxRangePushA("cutlass_gemm");
+    ans_err = launch_fused_gemm_ans(
+        arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, dyn_smem);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    nvtxRangePop();
+    if (ans_err != cudaSuccess) {
+      std::cerr << "fused GEMM+ANS launch failed: " << cudaGetErrorString(ans_err) << std::endl;
+      ans.release();
+      return -1;
+    }
+  } else {
+    nvtxRangePushA("cutlass_gemm");
+    CUTLASS_CHECK(gemm.run());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    nvtxRangePop();
+  }
+
+  Result result;
+  result.passed = verify(options);
+  std::cout << "  GEMM disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+  if (!result.passed) {
     ans.release();
     return -1;
   }
-  ans_err = ans.validate_roundtrip("nvCOMP LLIF ANS (unfused, Blackwell GEMM)");
+
+  if (!options.fuse_nvcomp) {
+    nvtxRangePushA("nvcomp_ans");
+    nvst = ans.launch(block_D.get(), ldc, options.m, options.n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    nvtxRangePop();
+    if (nvst != nvcompSuccess) {
+      std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
+                << nvcompGetStatusString(nvst) << std::endl;
+      ans.release();
+      return -1;
+    }
+  }
+  ans_err = ans.validate_roundtrip(
+      options.fuse_nvcomp ? "nvCOMP LLIF ANS (fused, Blackwell GEMM)"
+                          : "nvCOMP LLIF ANS (unfused, Blackwell GEMM)");
   if (ans_err != cudaSuccess) {
     ans.release();
     return -1;
@@ -744,18 +930,33 @@ int run(Options &options) {
     timer.start();
     for (int iter = 0; iter < options.iterations; ++iter) {
       CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      nvtxRangePushA("cutlass_gemm");
-      CUTLASS_CHECK(gemm.run());
-      nvtxRangePop();
-      nvtxRangePushA("nvcomp_ans");
-      nvst = ans.launch(block_D.get(), ldc, options.m, options.n);
-      nvtxRangePop();
-      if (nvst != nvcompSuccess) {
-        break;
+      if (options.fuse_nvcomp) {
+        nvtxRangePushA("cutlass_gemm");
+        ans_err = launch_fused_gemm_ans(
+            arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, dyn_smem);
+        nvtxRangePop();
+        if (ans_err != cudaSuccess) {
+          break;
+        }
+      } else {
+        nvtxRangePushA("cutlass_gemm");
+        CUTLASS_CHECK(gemm.run());
+        nvtxRangePop();
+        nvtxRangePushA("nvcomp_ans");
+        nvst = ans.launch(block_D.get(), ldc, options.m, options.n);
+        nvtxRangePop();
+        if (nvst != nvcompSuccess) {
+          break;
+        }
       }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     timer.stop();
+    if (ans_err != cudaSuccess) {
+      std::cerr << "fused GEMM+ANS launch failed: " << cudaGetErrorString(ans_err) << std::endl;
+      ans.release();
+      return -1;
+    }
     if (nvst != nvcompSuccess) {
       std::cerr << "nvcompBatchedANSCompressFromColMajorTilesAsync failed: "
                 << nvcompGetStatusString(nvst) << std::endl;

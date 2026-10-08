@@ -1,11 +1,9 @@
 ```bash
-ssh esoha-mfa@login-lyris
+ssh oci-hsg-cs-001-login-02
 ```
 
 ```bash
-srun -t 300 -A coreai_devtech_all -N1 -p gb200 -J coreai_devtech_all-esoha.nvcomp \
-  --container-image="nvcr.io/nvidia/pytorch:26.08-py3" \
-  --container-mounts="/home/esoha" --pty bash
+srun --partition=batch -A coreai_devtech_all --job-name devtech-benchmarking:shell --qos=interactive --gpus-per-node=4 --time=4:00:00 --container-image=nvcr.io/nvidia/pytorch:26.08-py3   --container-mounts=/lustre/fsw/portfolios/coreai/users/esoha --pty /bin/bash -
 
 # 26.08-py3 is CUDA 13.4. Default nvidia-cutlass-dsl is CUDA 12 and will
 # fail on import (OpOperands / mixed _cutlass_ir.so). Install the cu13 extra.
@@ -18,7 +16,7 @@ pip install nvidia-cutlass-operators[torch]
 
 python -c "import cutlass; import torch; print(cutlass.__version__, torch.cuda.is_available(), torch.version.cuda)"
 
-cd /home/esoha/cutlass
+cd /lustre/fsw/portfolios/coreai/users/esoha/cutlass
 python ./cutlass_test.py
 
 # Capture only the CUTLASS GEMM (JIT/setup happen before cudaProfilerStart).
@@ -46,7 +44,7 @@ Do **not** pass `-DBUILD_NVCOMPDX=ON` — that FetchContent-clones internal GitL
 
 For c++:
 ```bash
-cd /home/esoha/cutlass
+cd /lustre/fsw/portfolios/coreai/users/esoha/cutlass
 mkdir -p build && cd build
 
 export CUDACXX=$(which nvcc)   # usually /usr/local/cuda/bin/nvcc

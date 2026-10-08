@@ -8,9 +8,9 @@
 
     Same CUTLASS 3.x Blackwell kernel family as 70_blackwell_fp16_gemm, with a 1SM 128x128
     MMA tile so C is a grid of 128x128 tiles. Default: GEMM then stock compress_kernel
-    (NVCOMP_TYPE_FLOAT16). --fuse-nvcomp: the same 256-thread persistent CTAs run
-    compress_chunk after the GEMM drains (one launch, no RDC). CLC warps do not
-    reconverge per tile, so this is not Ampere-style compress-in-epilogue.
+    (NVCOMP_TYPE_FLOAT16). --fuse-nvcomp: GEMM then an inlined compress_chunk kernel
+    (no RDC). CLC warps do not reconverge per tile, so this is not Ampere-style
+    compress-in-epilogue; ANS cannot reuse the warp-specialized GEMM CTA.
 
     Usage:
       $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
@@ -539,26 +539,13 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
 
-// compress_chunk is inlined into gemm_fused_ans_kernel. Its CUB/defrag helpers
-// declare static __shared__ (~5 KiB; ANS_COMP_SCRATCH_SMEM_BYTES). That static
-// allocation reduces the dynamic-smem opt-in and, unless the extern buffer is
-// 128 B aligned, shifts the GEMM TMA tensors off alignment (misaligned address).
-// StageCountAutoCarveout already packs the GEMM to 227 KiB, so requesting
-// GemmKernel::SharedStorageSize on the fused kernel then fails with
-// cudaFuncSetAttribute(...): invalid argument. Extra 128 B covers static→dynamic
-// padding.
-static constexpr int kGemmSmemAlign = 128;
-static constexpr int kFusedAnsStaticSmemCarveout = 16384 + kGemmSmemAlign;
-
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     ElementA, LayoutA, AlignmentA,
     ElementB, LayoutB, AlignmentB,
     ElementAccumulator,
     MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage)) +
-        kFusedAnsStaticSmemCarveout>,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto
   >::CollectiveOp;
 
@@ -638,6 +625,14 @@ void fused_ans_compress_tiles(FusedAnsArgs const &ans, char *smem) {
       scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
     }
     auto &workspace = *reinterpret_cast<Workspace *>(scratch_addr);
+    {
+      unsigned char *bytes = reinterpret_cast<unsigned char *>(scratch_addr);
+      for (int i = static_cast<int>(threadIdx.x); i < static_cast<int>(sizeof(Workspace));
+           i += static_cast<int>(blockDim.x)) {
+        bytes[i] = 0;
+      }
+    }
+    __syncthreads();
     ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
         ans.compressed + tile_id * ans.compressed_stride,
         packed,
@@ -656,15 +651,20 @@ void fused_ans_compress_tiles(FusedAnsArgs const &ans, char *smem) {
 __global__
 __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultiprocessor)
 void gemm_fused_ans_kernel(
-    CUTLASS_GRID_CONSTANT typename GemmKernel::Params const gemm_params,
-    FusedAnsArgs ans) {
-  // Dynamic SMEM follows the inlined ANS static __shared__. TMA tensors in
-  // SharedStorage are alignas(128); without this, the GEMM base is misaligned.
+    CUTLASS_GRID_CONSTANT typename GemmKernel::Params const gemm_params) {
   extern __shared__ __align__(128) char fused_smem[];
   GemmKernel gemm;
   gemm(gemm_params, fused_smem);
-  __syncthreads();
-  fused_ans_compress_tiles(ans, fused_smem);
+}
+
+// One CTA per 128x128 C tile. Must not share a CTA with the SM100 GEMM: CLC
+// warps never reconverge, and overlaying compress_chunk on GEMM SMEM after
+// named barriers produced invalid ANS bitstreams (tile 152 on 8192^2).
+__global__
+__launch_bounds__(kAnsThreads)
+void fused_ans_compress_kernel(FusedAnsArgs ans) {
+  extern __shared__ __align__(16) char ans_smem[];
+  fused_ans_compress_tiles(ans, ans_smem);
 }
 
 cudaError_t launch_fused_gemm_ans(
@@ -675,10 +675,16 @@ cudaError_t launch_fused_gemm_ans(
     int ldc,
     int M,
     int N,
-    size_t dyn_smem) {
+    size_t gemm_smem,
+    size_t ans_smem) {
   auto gemm_params = GemmKernel::to_underlying_arguments(arguments, workspace);
   dim3 const grid = Gemm::get_grid_shape(arguments, workspace);
   dim3 const block = GemmKernel::get_block_shape();
+  gemm_fused_ans_kernel<<<grid, block, gemm_smem>>>(gemm_params);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return err;
+  }
   FusedAnsArgs fused{};
   fused.D = D;
   fused.ldc = ldc;
@@ -693,7 +699,8 @@ cudaError_t launch_fused_gemm_ans(
   fused.max_sub_chunk_size = ans.max_sub_chunk_size;
   fused.slot_words = ans.slot_words;
   fused.smem_alignment = ans.ans_smem_alignment;
-  gemm_fused_ans_kernel<<<grid, block, dyn_smem>>>(gemm_params, fused);
+  unsigned const ans_blocks = static_cast<unsigned>(ans.num_chunks);
+  fused_ans_compress_kernel<<<ans_blocks, kAnsThreads, ans_smem>>>(fused);
   return cudaGetLastError();
 }
 
@@ -771,7 +778,7 @@ struct Options {
       << "  --beta=<f32>                Epilogue scalar beta\n\n"
       << "  --swizzle=<int>             Cluster rasterization swizzle\n\n"
       << "  --iterations=<int>          Number of profiling iterations (GEMM+ANS each).\n"
-      << "  --fuse-nvcomp               Same CTA compress_chunk after the persistent GEMM.\n\n";
+      << "  --fuse-nvcomp               GEMM then inlined compress_chunk (separate CTA).\n\n";
     return out;
   }
 
@@ -895,25 +902,24 @@ int run(Options &options) {
 
   int const ldc = options.m;
   size_t const gemm_smem = static_cast<size_t>(GemmKernel::SharedStorageSize);
-  size_t const dyn_smem = std::max(gemm_smem, ans.ans_smem_bytes + ans.ans_smem_alignment);
+  size_t const ans_smem = ans.ans_smem_bytes + ans.ans_smem_alignment;
   if (options.fuse_nvcomp) {
-    cudaFuncAttributes fused_attr{};
-    int optin_smem = 0;
-    (void)cudaFuncGetAttributes(&fused_attr, gemm_fused_ans_kernel);
-    (void)cudaDeviceGetAttribute(
-        &optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-    cudaError_t attr_err = cudaFuncSetAttribute(
-        gemm_fused_ans_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(dyn_smem));
-    if (attr_err != cudaSuccess) {
-      std::cerr << "cudaFuncSetAttribute(fused kernel smem) failed: "
-                << cudaGetErrorString(attr_err)
-                << " (requested " << dyn_smem << " B dynamic, kernel static "
-                << fused_attr.sharedSizeBytes << " B, device opt-in max "
-                << optin_smem << " B; GEMM " << gemm_smem << " B, ANS "
-                << ans.ans_smem_bytes << " B + align "
-                << ans.ans_smem_alignment << " B)\n";
+    auto set_dyn_smem = [](auto kernel, int bytes, char const *name) -> cudaError_t {
+      if (bytes < (48 << 10)) {
+        return cudaSuccess;
+      }
+      cudaError_t attr_err = cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+      if (attr_err != cudaSuccess) {
+        std::cerr << "cudaFuncSetAttribute(" << name << " smem) failed: "
+                  << cudaGetErrorString(attr_err) << " (requested " << bytes << " B)\n";
+      }
+      return attr_err;
+    };
+    if (set_dyn_smem(gemm_fused_ans_kernel, static_cast<int>(gemm_smem), "fused GEMM") !=
+            cudaSuccess ||
+        set_dyn_smem(fused_ans_compress_kernel, static_cast<int>(ans_smem), "fused ANS") !=
+            cudaSuccess) {
       ans.release();
       return -1;
     }
@@ -923,7 +929,8 @@ int run(Options &options) {
   if (options.fuse_nvcomp) {
     nvtxRangePushA("cutlass_gemm");
     ans_err = launch_fused_gemm_ans(
-        arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, dyn_smem);
+        arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, gemm_smem,
+        ans_smem);
     CUDA_CHECK(cudaDeviceSynchronize());
     nvtxRangePop();
     if (ans_err != cudaSuccess) {
@@ -974,7 +981,8 @@ int run(Options &options) {
       if (options.fuse_nvcomp) {
         nvtxRangePushA("cutlass_gemm");
         ans_err = launch_fused_gemm_ans(
-            arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, dyn_smem);
+            arguments, workspace.get(), ans, block_D.get(), ldc, options.m, options.n, gemm_smem,
+        ans_smem);
         nvtxRangePop();
         if (ans_err != cudaSuccess) {
           break;

@@ -98,7 +98,8 @@ $NCU --set full --import-source yes \
   ./examples/00_basic_gemm/00_basic_gemm
 
 # Blackwell tcgen05 GEMM then ANS (1SM 128x128 tiles, FP16 C).
-# Unfused GEMM basename is typically device_kernel; fused is gemm_fused_ans_kernel.
+# Unfused GEMM basename is typically device_kernel; fused GEMM is
+# gemm_fused_ans_kernel, fused ANS is fused_ans_compress_kernel.
 make 70_blackwell_fp16_gemm_nvcomp -j$(nproc)
 
 ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
@@ -118,7 +119,7 @@ $NCU --set full --import-source yes \
   ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048 --iterations=1
 
 $NCU --set full --import-source yes \
-  -k regex:'gemm_fused_ans_kernel' \
+  -k regex:'gemm_fused_ans_kernel|fused_ans_compress_kernel' \
   -o blackwell_gemm_nvcomp_ncu --force-overwrite \
   ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1 --m=8192 --n=8192 --k=2048
 ```

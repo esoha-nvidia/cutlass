@@ -102,7 +102,7 @@ $NCU --set full --import-source yes \
 # gemm_fused_ans_kernel, fused ANS is fused_ans_compress_kernel.
 make 70_blackwell_fp16_gemm_nvcomp -j$(nproc)
 
-./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
+./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048 --iterations=1
 ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1 --m=8192 --n=8192 --k=2048
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx \

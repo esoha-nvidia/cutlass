@@ -234,6 +234,11 @@ struct UnfusedAnsWorkspace {
       release();
       return err;
     }
+    err = cudaMemset(d_comp_sizes, 0, num_chunks * sizeof(size_t));
+    if (err != cudaSuccess) {
+      release();
+      return err;
+    }
     err = cudaMalloc(&d_uncomp_bytes, num_chunks * sizeof(size_t));
     if (err != cudaSuccess) {
       release();
@@ -534,13 +539,26 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
 
+// compress_chunk is inlined into gemm_fused_ans_kernel. Its CUB/defrag helpers
+// declare static __shared__ (~5 KiB; ANS_COMP_SCRATCH_SMEM_BYTES). That static
+// allocation reduces the dynamic-smem opt-in and, unless the extern buffer is
+// 128 B aligned, shifts the GEMM TMA tensors off alignment (misaligned address).
+// StageCountAutoCarveout already packs the GEMM to 227 KiB, so requesting
+// GemmKernel::SharedStorageSize on the fused kernel then fails with
+// cudaFuncSetAttribute(...): invalid argument. Extra 128 B covers static→dynamic
+// padding.
+static constexpr int kGemmSmemAlign = 128;
+static constexpr int kFusedAnsStaticSmemCarveout = 16384 + kGemmSmemAlign;
+
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     ElementA, LayoutA, AlignmentA,
     ElementB, LayoutB, AlignmentB,
     ElementAccumulator,
     MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage)) +
+        kFusedAnsStaticSmemCarveout>,
     cutlass::gemm::collective::KernelScheduleAuto
   >::CollectiveOp;
 
@@ -577,9 +595,18 @@ void fused_ans_compress_tiles(FusedAnsArgs const &ans, char *smem) {
     return;
   }
   int const tiles_m = (ans.M + kAnsTileM - 1) / kAnsTileM;
-  size_t const cta_stride = static_cast<size_t>(gridDim.x);
-  for (size_t tile_id = static_cast<size_t>(blockIdx.x); tile_id < ans.num_chunks;
-       tile_id += cta_stride) {
+  // SM100 persistent launch is often (SMs, 1, 1) or (1, SMs, 1) depending on
+  // raster order. AlongN (default when tiles_n <= tiles_m) is (1, SMs, 1); a
+  // loop on blockIdx.x / gridDim.x then makes every CTA compress every tile.
+  size_t const cta_id =
+      static_cast<size_t>(blockIdx.x) +
+      static_cast<size_t>(blockIdx.y) * static_cast<size_t>(gridDim.x) +
+      static_cast<size_t>(blockIdx.z) * static_cast<size_t>(gridDim.x) *
+          static_cast<size_t>(gridDim.y);
+  size_t const cta_stride = static_cast<size_t>(gridDim.x) *
+                            static_cast<size_t>(gridDim.y) *
+                            static_cast<size_t>(gridDim.z);
+  for (size_t tile_id = cta_id; tile_id < ans.num_chunks; tile_id += cta_stride) {
     int const tile_m = static_cast<int>(tile_id % static_cast<size_t>(tiles_m));
     int const tile_n = static_cast<int>(tile_id / static_cast<size_t>(tiles_m));
     int const m0 = tile_m * kAnsTileM;
@@ -601,13 +628,15 @@ void fused_ans_compress_tiles(FusedAnsArgs const &ans, char *smem) {
     }
     __syncthreads();
 
+    using Policy = ans_gpu_lib::detail::FP16EncodePolicy<ans_gpu_lib::detail::FP16X2EncodeImpl>;
+    using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
     uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(smem);
-    uintptr_t const align = static_cast<uintptr_t>(ans.smem_alignment);
+    uintptr_t const align = ans.smem_alignment > alignof(Workspace)
+        ? static_cast<uintptr_t>(ans.smem_alignment)
+        : static_cast<uintptr_t>(alignof(Workspace));
     if (align > 1) {
       scratch_addr = (scratch_addr + align - 1) & ~(align - 1);
     }
-    using Policy = ans_gpu_lib::detail::FP16EncodePolicy<ans_gpu_lib::detail::FP16X2EncodeImpl>;
-    using Workspace = ans_gpu_lib::detail::DeviceCompressSmem<Policy>;
     auto &workspace = *reinterpret_cast<Workspace *>(scratch_addr);
     ans_gpu_lib::detail::compress_chunk<Policy, /*Sampled=*/false>(
         ans.compressed + tile_id * ans.compressed_stride,
@@ -629,7 +658,9 @@ __launch_bounds__(GemmKernel::MaxThreadsPerBlock, GemmKernel::MinBlocksPerMultip
 void gemm_fused_ans_kernel(
     CUTLASS_GRID_CONSTANT typename GemmKernel::Params const gemm_params,
     FusedAnsArgs ans) {
-  extern __shared__ char fused_smem[];
+  // Dynamic SMEM follows the inlined ANS static __shared__. TMA tensors in
+  // SharedStorage are alignas(128); without this, the GEMM base is misaligned.
+  extern __shared__ __align__(128) char fused_smem[];
   GemmKernel gemm;
   gemm(gemm_params, fused_smem);
   __syncthreads();
@@ -866,13 +897,23 @@ int run(Options &options) {
   size_t const gemm_smem = static_cast<size_t>(GemmKernel::SharedStorageSize);
   size_t const dyn_smem = std::max(gemm_smem, ans.ans_smem_bytes + ans.ans_smem_alignment);
   if (options.fuse_nvcomp) {
+    cudaFuncAttributes fused_attr{};
+    int optin_smem = 0;
+    (void)cudaFuncGetAttributes(&fused_attr, gemm_fused_ans_kernel);
+    (void)cudaDeviceGetAttribute(
+        &optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
     cudaError_t attr_err = cudaFuncSetAttribute(
         gemm_fused_ans_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(dyn_smem));
     if (attr_err != cudaSuccess) {
       std::cerr << "cudaFuncSetAttribute(fused kernel smem) failed: "
-                << cudaGetErrorString(attr_err) << std::endl;
+                << cudaGetErrorString(attr_err)
+                << " (requested " << dyn_smem << " B dynamic, kernel static "
+                << fused_attr.sharedSizeBytes << " B, device opt-in max "
+                << optin_smem << " B; GEMM " << gemm_smem << " B, ANS "
+                << ans.ans_smem_bytes << " B + align "
+                << ans.ans_smem_alignment << " B)\n";
       ans.release();
       return -1;
     }

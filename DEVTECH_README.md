@@ -102,15 +102,15 @@ $NCU --set full --import-source yes \
 make 70_blackwell_fp16_gemm_nvcomp -j$(nproc)
 
 ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
-./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp
+./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1 --m=8192 --n=8192 --k=2048
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx \
   -o blackwell_gemm_nvcomp_unfused --force-overwrite true \
-  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048
+  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --m=8192 --n=8192 --k=2048 --iterations=1
 
 ../../nsight-systems-2026.4.1/bin/nsys profile -t cuda,nvtx \
   -o blackwell_gemm_nvcomp --force-overwrite true \
-  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp
+  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1 --m=8192 --n=8192 --k=2048
 
 $NCU --set full --import-source yes \
   -k regex:'device_kernel|compress_kernel' \
@@ -120,6 +120,6 @@ $NCU --set full --import-source yes \
 $NCU --set full --import-source yes \
   -k regex:'gemm_fused_ans_kernel' \
   -o blackwell_gemm_nvcomp_ncu --force-overwrite \
-  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1
+  ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm_nvcomp --fuse-nvcomp --iterations=1 --m=8192 --n=8192 --k=2048
 ```
 
